@@ -1,0 +1,14 @@
+# Ignore everything by default; allow only what belongs in the repo.
+# Rules are anchored to the root so they never match inside zig-pkg/.
+*
+!*/
+
+!/.gitignore
+!/README.md
+!/assets/**
+
+!/flake.nix
+!/flake.lock
+!/build.zig
+!/build.zig.zon
+!/src/**
