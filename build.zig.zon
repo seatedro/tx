@@ -8,6 +8,14 @@
             .url = "https://github.com/ghostty-org/ghostty/archive/cec8b92f1ecd176a20a56aa405021e7ae991b996.tar.gz",
             .hash = "ghostty-1.3.2-dev-5UdBC__whQXAL8QvZGz2l3tnrp1BTVI2yEQudaD4wgEw",
         },
+        .ngtcp2 = .{
+            .url = "https://github.com/ngtcp2/ngtcp2/archive/refs/tags/v1.25.0.tar.gz",
+            .hash = "N-V-__8AAGRJQwAAgW_SMRLhEwr1ZQaH-oJp4VWQTLZanCNf",
+        },
+        .picotls = .{
+            .url = "https://github.com/h2o/picotls/archive/4b8e8715a181ca560d1740ed391509f789158867.tar.gz",
+            .hash = "N-V-__8AAObiPAASJAqg7E-0VxYvYya1n_uwhPG2mzEtINoY",
+        },
     },
     .paths = .{
         "build.zig",
