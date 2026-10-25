@@ -23,6 +23,11 @@ pub fn init(io: std.Io) void {
     primitives.io = io;
 }
 
+/// Fill `buf` from the CSPRNG that TLS uses. Requires `init`.
+pub fn random(buf: []u8) void {
+    primitives.random(buf);
+}
+
 extern fn tx_crypto_test_known_answers() c_int;
 extern fn tx_crypto_test_backend_interop(secret_key: *const [64]u8, public_key: *const [32]u8) c_int;
 extern fn tx_crypto_test_cloudflare() c_int;

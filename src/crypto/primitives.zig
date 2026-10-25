@@ -37,10 +37,14 @@ fn slice(ptr: ?[*]const u8, len: usize) []const u8 {
 
 // --- Random ---------------------------------------------------------------
 
+pub fn random(buf: []u8) void {
+    getIo().random(buf);
+}
+
 export fn tx_random_bytes(buf: ?*anyopaque, len: usize) void {
     if (len == 0) return;
     const p: [*]u8 = @ptrCast(buf.?);
-    getIo().random(p[0..len]);
+    random(p[0..len]);
 }
 
 // --- AEAD -----------------------------------------------------------------
