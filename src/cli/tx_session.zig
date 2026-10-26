@@ -1,10 +1,14 @@
 //! tx-session: serves the user's sessions over QUIC.
 //!
-//! Usage: tx-session [--listen ADDRESS:PORT] [--key PATH]
+//! Usage: tx-session [--listen ADDRESS:PORT] [--key PATH] [--print-host-key]
 //!
 //! Personal mode: clients log in as the user running tx-session, with a key
 //! from `~/.config/tx/authorized_keys` if that file exists, or else from
 //! `~/.ssh/authorized_keys`. It listens on every address by default.
+//!
+//! `--print-host-key` prints the public host key as `ssh-ed25519 AAAA...`
+//! and exits, creating the key if there is none. `tx` runs it over ssh to
+//! learn a new host's key.
 const std = @import("std");
 const Io = std.Io;
 const xev = @import("xev");
@@ -25,10 +29,10 @@ pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
-    // Options. IPv6's any address takes IPv4 connections too, unless the
-    // system turns that off.
+    // Options. `::` covers every IPv4 and IPv6 address.
     var listen: Io.net.IpAddress = try .parseIp6("::", default_port);
     var key_path: ?[]const u8 = null;
+    var print_host_key = false;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -38,6 +42,8 @@ pub fn main(init: std.process.Init) !u8 {
         } else if (std.mem.eql(u8, arg, "--key") and i + 1 < args.len) {
             i += 1;
             key_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--print-host-key")) {
+            print_host_key = true;
         } else return usage("unknown argument");
     }
 
@@ -47,6 +53,14 @@ pub fn main(init: std.process.Init) !u8 {
     const path = key_path orelse try paths.state(gpa, init.environ_map, "host_key");
     defer if (key_path == null) gpa.free(path);
     const identity = try keyfile.loadOrCreate(io, path);
+
+    if (print_host_key) {
+        var buf: [256]u8 = undefined;
+        var w = Io.File.stdout().writerStreaming(io, &buf);
+        try w.interface.print("{s} {s}\n", .{ auth.ssh.ed25519, auth.ssh.KeyText.init(identity.public_key.toBytes()).slice() });
+        try w.interface.flush();
+        return 0;
+    }
 
     const user = paths.userName(init.environ_map) orelse {
         std.debug.print("tx-session: can't tell the user name\n", .{});
@@ -96,6 +110,6 @@ pub fn main(init: std.process.Init) !u8 {
 }
 
 fn usage(reason: []const u8) u8 {
-    std.debug.print("tx-session: {s}\nusage: tx-session [--listen ADDRESS:PORT] [--key PATH]\n", .{reason});
+    std.debug.print("tx-session: {s}\nusage: tx-session [--listen ADDRESS:PORT] [--key PATH] [--print-host-key]\n", .{reason});
     return 2;
 }
