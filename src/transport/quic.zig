@@ -17,8 +17,8 @@ pub const Error = error{
     OutOfMemory,
     /// The datagram is not a QUIC Initial packet a server can accept.
     NotInitial,
-    /// The TLS handshake failed, for example because the server's key is
-    /// not the pinned one.
+    /// The TLS handshake failed, for example because the client doesn't
+    /// accept the server's key.
     HandshakeFailed,
     /// The connection is closing or draining.
     Closed,
@@ -59,18 +59,42 @@ pub const Server = struct {
     }
 };
 
-/// Client TLS context that accepts one pinned server key.
+/// Client TLS context. Use it for one connection at a time: it keeps the
+/// key the server presented.
 pub const Client = struct {
     tls: *c.tx_tls_client,
 
-    pub fn init(pinned: [32]u8) Error!Client {
-        const tls = c.tx_tls_client_new(&pinned, @intFromBool(crypto.has_hardware_aes)) orelse
+    /// The server keys a client accepts.
+    pub const Accept = union(enum) {
+        /// Copied by `init`.
+        keys: []const [32]u8,
+        /// Any key, to learn a server's key on first contact. The handshake
+        /// still proves the server holds the key it presents.
+        any,
+    };
+
+    pub fn init(accept: Accept) Error!Client {
+        const keys: []const [32]u8 = switch (accept) {
+            .keys => |keys| keys,
+            .any => &.{},
+        };
+        // translate-c drops the const of `const uint8_t (*)[32]`. The keys
+        // are only read.
+        const tls = c.tx_tls_client_new(@constCast(keys.ptr), keys.len, @intFromBool(accept == .any), @intFromBool(crypto.has_hardware_aes)) orelse
             return error.OutOfMemory;
         return .{ .tls = tls };
     }
 
     pub fn deinit(self: *Client) void {
         c.tx_tls_client_free(self.tls);
+    }
+
+    /// The key the server presented in the last handshake, accepted or
+    /// not.
+    pub fn presentedKey(self: *const Client) ?[32]u8 {
+        var key: [32]u8 = undefined;
+        if (c.tx_tls_client_presented_key(self.tls, &key) == 0) return null;
+        return key;
     }
 };
 
@@ -414,6 +438,16 @@ pub const Connection = struct {
     pub fn consume(self: *Connection, stream_id: i64, n: usize) Error!void {
         try self.check(c.ngtcp2_conn_extend_max_stream_offset(self.conn, stream_id, n));
         c.ngtcp2_conn_extend_max_offset(self.conn, n);
+    }
+
+    /// Fills `out` from the TLS exporter (RFC 8446 §7.5) with `label` and
+    /// an empty context. Both ends derive the same bytes. Asserts the
+    /// handshake has completed.
+    pub fn exportSecret(self: *const Connection, out: []u8, label: [*:0]const u8) void {
+        std.debug.assert(self.isHandshakeComplete());
+        // picotls fails only before the handshake or on a label longer
+        // than the exporter's HKDF can take.
+        if (c.tx_tls_session_export(self.session, out.ptr, out.len, label) != 0) unreachable;
     }
 
     pub fn isHandshakeComplete(self: *const Connection) bool {

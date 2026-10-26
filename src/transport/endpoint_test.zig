@@ -76,7 +76,7 @@ const Keys = struct {
         const pinned = if (pin_other) Ed25519.KeyPair.generate(testing.io).public_key else identity.public_key;
         var server = try quic.Server.init(identity);
         errdefer server.deinit();
-        return .{ .server = server, .client = try quic.Client.init(pinned.toBytes()) };
+        return .{ .server = server, .client = try quic.Client.init(.{ .keys = &.{pinned.toBytes()} }) };
     }
 
     fn deinit(k: *Keys) void {
