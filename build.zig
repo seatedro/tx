@@ -80,6 +80,12 @@ pub fn build(b: *std.Build) void {
     });
     addTestRuns(b, proto_tests, test_step, test_network_step);
 
+    const auth_tests = b.addTest(.{
+        .name = "auth-test",
+        .root_module = authModule(b, target, optimize),
+    });
+    addTestRuns(b, auth_tests, test_step, test_network_step);
+
     // One instance of each module for the executables and the end-to-end
     // test, so that they share their dependencies' code and globals.
     const term = termModule(b, target, optimize, ghostty_vt);
@@ -179,6 +185,18 @@ fn protoModule(
 ) *std.Build.Module {
     return b.createModule(.{
         .root_source_file = b.path("src/proto/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+}
+
+fn authModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Module {
+    return b.createModule(.{
+        .root_source_file = b.path("src/auth/root.zig"),
         .target = target,
         .optimize = optimize,
     });
