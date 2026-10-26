@@ -155,6 +155,15 @@ pub const Endpoint = struct {
         self.cancel(&self.stop_c[1], &self.timer_c);
     }
 
+    /// Whether a stopped endpoint's completions have finished, so `deinit`
+    /// can run.
+    pub fn isStopped(self: *const Endpoint) bool {
+        if (!self.stopping or self.conns.items.len > 0) return false;
+        const completions = [_]*const xev.Completion{ &self.recv_c, &self.timer_c, &self.timer_cancel_c, &self.stop_c[0], &self.stop_c[1] };
+        for (completions) |comp| if (comp.state() == .active) return false;
+        return true;
+    }
+
     /// Client only: start a connection to `remote`. `Handler.connected` runs
     /// once the handshake completes.
     pub fn connect(self: *Endpoint, remote: IpAddress) !*Conn {
