@@ -1,9 +1,10 @@
-//! Terminal replication. A `Primary` is the libghostty-vt Terminal fed the
-//! program's output plus a `Log` of what it consumed. A `Replica` restores
-//! from its snapshot and replays the log to reach the same state.
+//! A session's terminal state on the server. A `Primary` is the
+//! libghostty-vt Terminal fed the program's output plus a `Log` of what it
+//! consumed; the client stream is built from the log. A `Replica` restores a
+//! primary's state from its snapshot and replays the log to catch up.
 //!
-//! replication_test.zig checks this at every cut point of its corpora and
-//! lists the libghostty-vt limitations that break it.
+//! replication_test.zig checks snapshot restore at every cut point of its
+//! corpora and lists the libghostty-vt limitations that break it.
 pub const log = @import("log.zig");
 pub const primary = @import("primary.zig");
 pub const replica = @import("replica.zig");

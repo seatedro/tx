@@ -1,10 +1,11 @@
-//! The ordered records that take a replica from a snapshot to the primary
-//! terminal's current state. A record holds bytes the primary consumed or
-//! an event outside the byte stream that changes terminal state.
+//! The ordered records of what the primary terminal consumed: output bytes,
+//! and events outside the byte stream that change terminal state. The client
+//! stream is built from them, and a replica restored from a snapshot applies
+//! them to reach the primary's current state.
 //!
 //! Seqs number records from 0 without gaps. A reader whose next seq has
-//! been dropped from the ring gets `error.Trimmed` and must resync from a
-//! snapshot.
+//! been dropped from the ring gets `error.Trimmed`: a client then needs a
+//! repaint, and a replica a new snapshot.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const vt = @import("ghostty-vt");

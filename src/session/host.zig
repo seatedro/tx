@@ -3,7 +3,9 @@
 //!
 //! Output read from the pty is logged and applied by the `Primary`. User
 //! input and the primary's query replies go to the pty through one queue, in
-//! the order they were produced.
+//! the order they were produced. The primary answers queries only while
+//! `answer_queries` is set; while a client is attached, its own terminal
+//! answers them.
 //!
 //! The caller runs the event loop. It polls `fd` for reading, and for
 //! writing while `wantsWrite`, and calls `readOutput` and `flushInput`.
@@ -47,6 +49,9 @@ pub const Host = struct {
     /// reading client input while the program isn't reading.
     input: std.ArrayList(u8) = .empty,
     input_start: usize = 0,
+    /// Clear while a client is attached. Queries then reach the client's
+    /// terminal in the client stream, and its replies arrive as input.
+    answer_queries: bool = true,
 
     /// Start the program. Heap-allocated because the primary's reply
     /// callback points to the host.
@@ -157,6 +162,7 @@ pub const Host = struct {
 
     fn writePty(h: *term.primary.Handler, data: []const u8) void {
         const self: *Host = @ptrCast(@alignCast(Primary.fromHandler(h).context.?));
+        if (!self.answer_queries) return;
         // A reply that can't be queued is dropped. To the program this
         // looks like a terminal that didn't answer.
         self.input.appendSlice(self.gpa, data) catch return;
@@ -273,6 +279,24 @@ test "primary answers queries through the pty" {
     try testing.expectEqual(pty_pkg.Term{ .exited = 0 }, try waitTest(host));
     // ESC [ 1 ; 3 R
     try testing.expect(screenContains(host, "reply:1b 5b 31 3b 33 52"));
+}
+
+test "primary stays silent while answer_queries is clear" {
+    var environ = try testEnviron();
+    defer environ.deinit();
+    // The read gives up after 0.3 s without input.
+    const host = try spawnTest(&environ,
+        \\stty -icanon -echo min 0 time 3
+        \\printf 'ab\033[6n'
+        \\reply=$(dd bs=1 count=6 2>/dev/null | od -An -tx1)
+        \\printf '\r\nreply:[%s]\r\n' "$(echo $reply)"
+    );
+    defer host.destroy();
+    host.answer_queries = false;
+
+    try run(host, null);
+    try testing.expectEqual(pty_pkg.Term{ .exited = 0 }, try waitTest(host));
+    try testing.expect(screenContains(host, "reply:[]"));
 }
 
 test "large input reaches the program intact" {
