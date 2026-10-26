@@ -7,7 +7,9 @@
 //! signed data starts with a session ID string.
 const std = @import("std");
 const Writer = std.Io.Writer;
+const Sha256 = std.crypto.hash.sha2.Sha256;
 const Sha512 = std.crypto.hash.sha2.Sha512;
+const rsa = std.crypto.Certificate.rsa;
 const Ed25519 = std.crypto.sign.Ed25519;
 const ssh = @import("ssh.zig");
 
@@ -48,10 +50,44 @@ pub const SignedData = struct {
 pub const VerifyError = ssh.ParseError || error{BadSignature};
 
 /// Checks `signature_blob`, an SSH signature blob, against `key`.
-pub fn verify(key: ssh.Key, signature_blob: []const u8, data: *const SignedData) VerifyError!void {
-    const sig = try ssh.parseSignatureBlob(signature_blob);
-    const public_key = Ed25519.PublicKey.fromBytes(key) catch return error.BadSignature;
-    Ed25519.Signature.fromBytes(sig).verify(data.slice(), public_key) catch return error.BadSignature;
+pub fn verify(key: *const ssh.PublicKey, signature_blob: []const u8, data: *const SignedData) VerifyError!void {
+    switch (key.kind) {
+        .ed25519 => {
+            const sig = try ssh.parseSignatureBlob(signature_blob);
+            const public_key = Ed25519.PublicKey.fromBytes(key.ed25519Key()) catch return error.BadSignature;
+            Ed25519.Signature.fromBytes(sig).verify(data.slice(), public_key) catch return error.BadSignature;
+        },
+        .rsa => try verifyRsa(key.rsaParts(), signature_blob, data.slice()),
+    }
+}
+
+/// RSASSA-PKCS1-v1_5 with SHA-512 or SHA-256 (RFC 8332). `ssh-rsa`
+/// signatures, which use SHA-1, are refused, as OpenSSH refuses them for
+/// SSHSIG.
+fn verifyRsa(key: ssh.PublicKey.RsaParts, signature_blob: []const u8, data: []const u8) VerifyError!void {
+    var r: ssh.Reader = .init(signature_blob);
+    const sig_type = try r.string();
+    const sig = try r.string();
+    try r.end();
+
+    const public_key = rsa.PublicKey.fromBytes(key.e, key.n) catch return error.BadSignature;
+    switch (key.n.len) {
+        inline 128, 256, 384, 512 => |len| {
+            // A signature is as long as the modulus. Some signers drop its
+            // leading zero bytes.
+            if (sig.len > len) return error.BadSignature;
+            var padded: [len]u8 = @splat(0);
+            @memcpy(padded[len - sig.len ..], sig);
+
+            if (std.mem.eql(u8, sig_type, "rsa-sha2-512")) {
+                rsa.PKCS1v1_5Signature.verify(len, &padded, data, public_key, Sha512) catch return error.BadSignature;
+            } else if (std.mem.eql(u8, sig_type, "rsa-sha2-256")) {
+                rsa.PKCS1v1_5Signature.verify(len, &padded, data, public_key, Sha256) catch return error.BadSignature;
+            } else return error.UnsupportedType;
+        },
+        // `PublicKey.parse` admits these sizes only.
+        else => unreachable,
+    }
 }
 
 /// The signature blob for an Ed25519 signature.
@@ -73,17 +109,46 @@ test "a signature from ssh-keygen -Y sign verifies" {
     _ = try std.fmt.hexToBytes(&sig, "d939b4aac26b13710399f6911c58b4c7459aea9b373e548d13b1fac75f5e5b025bb747754d575770bd9719695328b3f128d767f85f658bfef6af78b907f76201");
     const blob = signatureBlob(sig);
 
-    try verify(key, &blob, &.init("tx-auth-v1@tx", "tx sshsig test"));
-    try testing.expectError(error.BadSignature, verify(key, &blob, &.init("file", "tx sshsig test")));
-    try testing.expectError(error.BadSignature, verify(key, &blob, &.init("tx-auth-v1@tx", "tx sshsig test!")));
+    const pk: ssh.PublicKey = .fromEd25519(key);
+    try verify(&pk, &blob, &.init("tx-auth-v1@tx", "tx sshsig test"));
+    try testing.expectError(error.BadSignature, verify(&pk, &blob, &.init("file", "tx sshsig test")));
+    try testing.expectError(error.BadSignature, verify(&pk, &blob, &.init("tx-auth-v1@tx", "tx sshsig test!")));
+}
+
+test "an RSA signature from ssh-keygen -Y sign verifies" {
+    // As above, with `ssh-keygen -t rsa -b 2048`, which signs with
+    // rsa-sha2-512.
+    const pk = try ssh.parsePublicKeyText(ssh.rsa, ssh.test_rsa_text);
+    var sig: [256]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&sig, "6b9bb9bf225a4e2b0a2d4719ba12dbcf335b4c9b2603c896d3b9335b83e5d6ab03a9f23ec111bf5b6b7b7da16058103d36e7efdebf63a9cf836b997928b97212415bc3c2e3f222e76b0278b531ce5be00c51305806738891d3f1779ff83faf63f6e8235088726de9fbd83631d5b8006a242f23723b99b7d7ba1b3da75ed166c892142356086b13e44927b08a0ccf5bbdcd8dd1f37bb07fe69716df672bd1d25cb84f9b70c847ea5cffcb5b7fc089f5e6e85643c4c0c2f0b15ff1e506e4c955b2f8b55b25e4cbf9b8f749d9aa7b901e5224c398aee29150e554817c7e7878b7b8281ef5c0b55fea54580031c6dadfc0dcd5b7a037990b1582628fd18f1fe3a6d6");
+
+    var blob_buf: [512]u8 = undefined;
+    var w: Writer = .fixed(&blob_buf);
+    try ssh.writeString(&w, "rsa-sha2-512");
+    try ssh.writeString(&w, &sig);
+    const blob = w.buffered();
+
+    try verify(&pk, blob, &.init("tx-auth-v1@tx", "tx sshsig test"));
+    try testing.expectError(error.BadSignature, verify(&pk, blob, &.init("tx-auth-v1@tx", "tx sshsig test!")));
+
+    // The same bytes claiming SHA-1 are refused, and claiming SHA-256 don't
+    // verify.
+    w = .fixed(&blob_buf);
+    try ssh.writeString(&w, "ssh-rsa");
+    try ssh.writeString(&w, &sig);
+    try testing.expectError(error.UnsupportedType, verify(&pk, w.buffered(), &.init("tx-auth-v1@tx", "tx sshsig test")));
+    w = .fixed(&blob_buf);
+    try ssh.writeString(&w, "rsa-sha2-256");
+    try ssh.writeString(&w, &sig);
+    try testing.expectError(error.BadSignature, verify(&pk, w.buffered(), &.init("tx-auth-v1@tx", "tx sshsig test")));
 }
 
 test "a signature made here verifies" {
     const kp = Ed25519.KeyPair.generate(testing.io);
     const data: SignedData = .init("ns", "message");
     const blob = signatureBlob((try kp.sign(data.slice(), null)).toBytes());
-    try verify(kp.public_key.toBytes(), &blob, &data);
+    try verify(&.fromEd25519(kp.public_key.toBytes()), &blob, &data);
 
     const other = Ed25519.KeyPair.generate(testing.io);
-    try testing.expectError(error.BadSignature, verify(other.public_key.toBytes(), &blob, &data));
+    try testing.expectError(error.BadSignature, verify(&.fromEd25519(other.public_key.toBytes()), &blob, &data));
 }
