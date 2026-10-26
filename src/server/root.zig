@@ -236,8 +236,13 @@ pub const Server = struct {
             _ = self.endpoints.swapRemove(i);
         }
 
-        for ([_][]const IpAddress{ found, r.host_loopback }) |list| for (list) |local| {
-            if (self.endpointFor(local) != null) continue;
+        for ([_][]const IpAddress{ found, r.host_loopback }) |list| for (list) |found_address| {
+            if (self.endpointFor(found_address) != null) continue;
+
+            // The lists carry the port `wildcard` had when they were made,
+            // which is 0 until the first bind picks one.
+            var local = found_address;
+            local.setPort(r.wildcard.getPort());
 
             // An IPv6 address still being checked for duplicates can't be
             // bound yet. A later rescan tries again.
