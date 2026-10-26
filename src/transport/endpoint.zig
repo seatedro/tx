@@ -30,8 +30,8 @@ pub const CloseReason = union(enum) {
     /// The peer sent CONNECTION_CLOSE.
     peer: quic.Connection.CloseCode,
     idle_timeout,
-    /// The TLS handshake failed, for example on a key that isn't the pinned
-    /// one.
+    /// The TLS handshake failed, for example on a server key the client
+    /// doesn't accept.
     handshake_failed,
     /// Any other ngtcp2 error.
     failed,

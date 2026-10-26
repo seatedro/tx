@@ -32,6 +32,9 @@ pub const Error = error{
     Quic,
 };
 
+/// The ALPN protocol ID of tx connections. Both ends require it.
+pub const alpn: []const u8 = c.TX_TLS_ALPN;
+
 /// Minimum length of the buffers passed to `send` and `sendStream`. This is
 /// ngtcp2's default maximum UDP payload size.
 pub const max_datagram_size = 1452;

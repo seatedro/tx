@@ -2,13 +2,17 @@
 //!
 //! Usage: tx-session [--listen ADDRESS:PORT] [--key PATH]
 //!
-//! Revision 0 authenticates no one, so it listens on loopback addresses only.
+//! Personal mode: clients log in as the user running tx-session, with a key
+//! from `~/.config/tx/authorized_keys` if that file exists, or else from
+//! `~/.ssh/authorized_keys`. It listens on every address by default.
 const std = @import("std");
 const Io = std.Io;
 const xev = @import("xev");
 const server_pkg = @import("server");
 const transport = @import("transport");
+const auth = @import("auth");
 const keyfile = @import("keyfile.zig");
+const paths = @import("paths.zig");
 
 /// Below the ephemeral port ranges of Linux and macOS.
 pub const default_port = 8739;
@@ -21,8 +25,9 @@ pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
-    // Options.
-    var listen: Io.net.IpAddress = try .parseIp4("127.0.0.1", default_port);
+    // Options. IPv6's any address takes IPv4 connections too, unless the
+    // system turns that off.
+    var listen: Io.net.IpAddress = try .parseIp6("::", default_port);
     var key_path: ?[]const u8 = null;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -36,15 +41,21 @@ pub fn main(init: std.process.Init) !u8 {
         } else return usage("unknown argument");
     }
 
-    // Anyone who can reach the port gets a shell as this user.
-    if (!isLoopback(listen)) return usage("revision 0 listens on loopback addresses only");
-
     transport.crypto.init(io);
 
     // The first run creates the key.
-    const path = key_path orelse try keyfile.defaultPath(gpa, init.environ_map);
+    const path = key_path orelse try paths.state(gpa, init.environ_map, "host_key");
     defer if (key_path == null) gpa.free(path);
     const identity = try keyfile.loadOrCreate(io, path);
+
+    const user = paths.userName(init.environ_map) orelse {
+        std.debug.print("tx-session: can't tell the user name\n", .{});
+        return 1;
+    };
+    const tx_authorized_keys = try paths.config(gpa, init.environ_map, "authorized_keys");
+    defer gpa.free(tx_authorized_keys);
+    const ssh_authorized_keys = try paths.home(gpa, init.environ_map, ".ssh/authorized_keys");
+    defer gpa.free(ssh_authorized_keys);
 
     // Sessions get a small environment, like the one sshd gives: the
     // allowlist, the locale, and TX_SESSION. Each session adds TERM and
@@ -70,6 +81,8 @@ pub fn main(init: std.process.Init) !u8 {
     try server.init(gpa, io, &loop, .{
         .listen = listen,
         .identity = identity,
+        .user = user,
+        .authorized_keys = &.{ tx_authorized_keys, ssh_authorized_keys },
         .environ = &environ,
         .argv = &.{login_name},
         .program = shell,
@@ -77,23 +90,9 @@ pub fn main(init: std.process.Init) !u8 {
     });
     defer server.deinit();
 
-    std.log.info("listening on {f}", .{server.address()});
+    std.log.info("listening on {f} for {s}, host key {s}", .{ server.address(), user, auth.Fingerprint.init(identity.public_key.toBytes()).slice() });
     try loop.run(.until_done);
     return 0;
-}
-
-const ip6_loopback: [16]u8 = blk: {
-    var bytes: [16]u8 = @splat(0);
-    bytes[15] = 1;
-    break :blk bytes;
-};
-
-/// 127.0.0.0/8 or ::1.
-fn isLoopback(address: Io.net.IpAddress) bool {
-    return switch (address) {
-        .ip4 => |a| a.bytes[0] == 127,
-        .ip6 => |a| std.mem.eql(u8, &a.bytes, &ip6_loopback),
-    };
 }
 
 fn usage(reason: []const u8) u8 {
