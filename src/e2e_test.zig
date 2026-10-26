@@ -223,7 +223,7 @@ test "a session runs, detaches, reattaches and exits through tx-session and tx" 
     defer first.close();
     var a: ClientThread = .{ .options = .{
         .server = st.server.address(),
-        .pinned = pinned,
+        .host_keys = &.{pinned},
         .in_fd = first.slave,
         .out_fd = first.slave,
         .term = "xterm-256color",
@@ -245,7 +245,7 @@ test "a session runs, detaches, reattaches and exits through tx-session and tx" 
     defer second.close();
     var b: ClientThread = .{ .options = .{
         .server = st.server.address(),
-        .pinned = pinned,
+        .host_keys = &.{pinned},
         .session_id = session_id,
         .in_fd = second.slave,
         .out_fd = second.slave,
@@ -279,7 +279,7 @@ test "a client pinning another key is refused" {
     defer pty.close();
     var ct: ClientThread = .{ .options = .{
         .server = st.server.address(),
-        .pinned = Ed25519.KeyPair.generate(testing.io).public_key.toBytes(),
+        .host_keys = &.{Ed25519.KeyPair.generate(testing.io).public_key.toBytes()},
         .in_fd = pty.slave,
         .out_fd = pty.slave,
         .term = "xterm-256color",
@@ -304,7 +304,7 @@ const RawClient = struct {
     fn init(rc: *RawClient, server: Io.net.IpAddress, pinned: [32]u8, hello: proto.Hello) !void {
         rc.* = .{
             .loop = try .init(.{}),
-            .tls = try .init(pinned),
+            .tls = try .init(.{ .keys = &.{pinned} }),
             .endpoint = undefined,
             .decoder = .init(gpa, 1 << 20),
             .hello = hello,

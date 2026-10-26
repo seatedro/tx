@@ -58,7 +58,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     const outcome = client.session.run(gpa, io, .{
         .server = address,
-        .pinned = identity.public_key.toBytes(),
+        .host_keys = &.{identity.public_key.toBytes()},
         .session_id = session_id,
         .term = init.environ_map.get("TERM") orelse "xterm-256color",
         .colorterm = init.environ_map.get("COLORTERM"),

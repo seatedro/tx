@@ -103,15 +103,17 @@ fn flushPlain(conn: *quic.Connection, socket: *Socket, io: Io, buf: []u8) !void 
     while (try conn.send(buf)) |d| try socket.send(io, &d.to, buf[0..d.len]);
 }
 
-test "client pinning the server key connects and a stream echoes" {
+test "client accepting the server key connects and a stream echoes" {
     const io = testing.io;
     const gpa = testing.allocator;
     crypto.init(io);
 
+    // The client accepts either key.
     const identity = Ed25519.KeyPair.generate(io);
+    const other = Ed25519.KeyPair.generate(io);
     var server_tls = try quic.Server.init(identity);
     defer server_tls.deinit();
-    var client_tls = try quic.Client.init(identity.public_key.toBytes());
+    var client_tls = try quic.Client.init(.{ .keys = &.{ other.public_key.toBytes(), identity.public_key.toBytes() } });
     defer client_tls.deinit();
 
     var server: Peer = try .bind(io);
@@ -160,33 +162,38 @@ test "client pinning the server key connects and a stream echoes" {
 
     try testing.expect(client.conn.?.isHandshakeComplete());
     try testing.expectEqualSlices(u8, payload, sender.received.items);
+    try testing.expectEqual(identity.public_key.toBytes(), client_tls.presentedKey().?);
+
+    // Both ends derive the same exporter value, and another label gives
+    // another value.
+    var client_secret: [32]u8 = undefined;
+    var server_secret: [32]u8 = undefined;
+    var other_secret: [32]u8 = undefined;
+    client.conn.?.exportSecret(&client_secret, "EXPORTER-tx-test");
+    server.conn.?.exportSecret(&server_secret, "EXPORTER-tx-test");
+    client.conn.?.exportSecret(&other_secret, "EXPORTER-tx-other");
+    try testing.expectEqual(client_secret, server_secret);
+    try testing.expect(!std.mem.eql(u8, &client_secret, &other_secret));
     // Client and server each count one X25519MLKEM768 exchange.
     try testing.expect(c.tx_tls_mlkem_exchanges() >= mlkem_before + 2);
 }
 
-test "client pinning a different key fails the handshake" {
+/// Runs a handshake between fresh connections until it completes or fails.
+fn handshake(client_tls: *const quic.Client, server_tls: *const quic.Server) !void {
     const io = testing.io;
     const gpa = testing.allocator;
-    crypto.init(io);
-
-    const identity = Ed25519.KeyPair.generate(io);
-    const other = Ed25519.KeyPair.generate(io);
-    var server_tls = try quic.Server.init(identity);
-    defer server_tls.deinit();
-    var client_tls = try quic.Client.init(other.public_key.toBytes());
-    defer client_tls.deinit();
 
     var server: Peer = try .bind(io);
     defer server.deinit(io);
     var client: Peer = try .bind(io);
     defer client.deinit(io);
 
-    client.conn = try .connect(gpa, io, &client_tls, client.socket.address, server.socket.address, .{});
+    client.conn = try .connect(gpa, io, client_tls, client.socket.address, server.socket.address, .{});
 
     var buf: [quic.max_datagram_size]u8 = undefined;
     var rbuf: [65536]u8 = undefined;
     const deadline = Io.Clock.awake.now(io).nanoseconds + 5 * std.time.ns_per_s;
-    const result: anyerror!void = loop: while (true) {
+    while (!client.conn.?.isHandshakeComplete()) {
         if (Io.Clock.awake.now(io).nanoseconds > deadline) return error.TestTimedOut;
         try flushPlain(client.conn.?, &client.socket, io, &buf);
         if (server.conn) |conn| flushPlain(conn, &server.socket, io, &buf) catch {};
@@ -194,13 +201,48 @@ test "client pinning a different key fails the handshake" {
             if (server.conn) |conn| {
                 conn.receive(msg.from, msg.data) catch {};
             } else {
-                server.conn = try .accept(gpa, io, &server_tls, server.socket.address, msg.from, msg.data, .{});
+                server.conn = try .accept(gpa, io, server_tls, server.socket.address, msg.from, msg.data, .{});
             }
         }
-        while (try client.poll(io, &rbuf, 1)) |msg| {
-            client.conn.?.receive(msg.from, msg.data) catch |err| break :loop err;
-        }
-    };
-    try testing.expectError(error.HandshakeFailed, result);
-    try testing.expect(!client.conn.?.isHandshakeComplete());
+        while (try client.poll(io, &rbuf, 1)) |msg| try client.conn.?.receive(msg.from, msg.data);
+    }
+}
+
+test "client accepting another key fails the handshake and keeps the presented key" {
+    crypto.init(testing.io);
+
+    const identity = Ed25519.KeyPair.generate(testing.io);
+    const other = Ed25519.KeyPair.generate(testing.io);
+    var server_tls = try quic.Server.init(identity);
+    defer server_tls.deinit();
+    var client_tls = try quic.Client.init(.{ .keys = &.{other.public_key.toBytes()} });
+    defer client_tls.deinit();
+
+    try testing.expectEqual(null, client_tls.presentedKey());
+    try testing.expectError(error.HandshakeFailed, handshake(&client_tls, &server_tls));
+    try testing.expectEqual(identity.public_key.toBytes(), client_tls.presentedKey().?);
+}
+
+test "client accepting no keys fails the handshake" {
+    crypto.init(testing.io);
+
+    var server_tls = try quic.Server.init(Ed25519.KeyPair.generate(testing.io));
+    defer server_tls.deinit();
+    var client_tls = try quic.Client.init(.{ .keys = &.{} });
+    defer client_tls.deinit();
+
+    try testing.expectError(error.HandshakeFailed, handshake(&client_tls, &server_tls));
+}
+
+test "client accepting any key connects and keeps the presented key" {
+    crypto.init(testing.io);
+
+    const identity = Ed25519.KeyPair.generate(testing.io);
+    var server_tls = try quic.Server.init(identity);
+    defer server_tls.deinit();
+    var client_tls = try quic.Client.init(.any);
+    defer client_tls.deinit();
+
+    try handshake(&client_tls, &server_tls);
+    try testing.expectEqual(identity.public_key.toBytes(), client_tls.presentedKey().?);
 }

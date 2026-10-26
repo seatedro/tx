@@ -25,8 +25,8 @@ const log = std.log.scoped(.client);
 
 pub const Options = struct {
     server: IpAddress,
-    /// The server's Ed25519 public key.
-    pinned: [32]u8,
+    /// The server keys the client accepts.
+    host_keys: []const [32]u8,
     /// Null starts a new session.
     session_id: ?u64 = null,
     /// The user's terminal.
@@ -167,7 +167,7 @@ const Run = struct {
             .loop = loop,
             .options = options,
             .size = terminalSize(options),
-            .tls = try .init(options.pinned),
+            .tls = try .init(.{ .keys = options.host_keys }),
             .endpoint = undefined,
             .decoder = .init(gpa, max_message),
             .escape = .{ .char = options.escape_char },

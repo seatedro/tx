@@ -34,12 +34,20 @@ typedef struct tx_ed25519_signer {
 void tx_ed25519_signer_init(tx_ed25519_signer *signer, const uint8_t secret_key[64]);
 void tx_ed25519_signer_dispose(tx_ed25519_signer *signer);
 
-/* Accepts only the pinned Ed25519 key, and verifies CertificateVerify. */
+/* Accepts a peer presenting one of `count` Ed25519 keys, or any key if
+   `accept_any` is set, and verifies CertificateVerify with it. `keys` must
+   outlive the verifier. The last key presented is kept in `presented`, also
+   when it is refused. */
 typedef struct tx_ed25519_verifier {
   ptls_verify_certificate_t super;
-  uint8_t pinned[32];
+  const uint8_t (*keys)[32];
+  size_t count;
+  int accept_any;
+  uint8_t presented[32];
+  int has_presented;
 } tx_ed25519_verifier;
 
-void tx_ed25519_verifier_init(tx_ed25519_verifier *verifier, const uint8_t pinned[32]);
+void tx_ed25519_verifier_init(tx_ed25519_verifier *verifier, const uint8_t (*keys)[32],
+                              size_t count, int accept_any);
 
 #endif
