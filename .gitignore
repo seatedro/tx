@@ -4,6 +4,7 @@
 !*/
 
 !/.gitignore
+!/.clang-format
 !/README.md
 !/assets/**
 
