@@ -234,18 +234,12 @@ pub const Endpoint = struct {
 
     fn receive(self: *Endpoint) void {
         self.udp.read(self.loop, &self.recv_c, &self.recv_state, .{ .slice = &self.recv_buf }, Endpoint, self, onReceive);
-
-        // libxev's kqueue backend (819ffa18) converts the sender's address
-        // when it calls back, even for a canceled receive. Before the first
-        // datagram the address is uninitialized, and a family other than
-        // IPv4 or IPv6 reaches `unreachable`.
-        if (xev.backend == .kqueue) self.recv_c.op.recvfrom.addr.family = std.posix.AF.INET;
     }
 
     fn onReceive(
         self_: ?*Endpoint,
         _: *xev.Loop,
-        recv_c: *xev.Completion,
+        _: *xev.Completion,
         _: *xev.UDP.State,
         from: IpAddress,
         _: xev.UDP,
@@ -257,31 +251,13 @@ pub const Endpoint = struct {
         // A failed receive is retried, except after `stop` cancels it.
         const n = result catch |err| {
             if (err != error.Canceled) log.warn("receive failed: {t}", .{err});
-            return self.receiveAgain(recv_c);
+            return if (self.stopping) .disarm else .rearm;
         };
 
         self.begin();
         defer self.end();
         self.dispatch(from, self.recv_buf[0..n]);
-        return self.receiveAgain(recv_c);
-    }
-
-    /// The action that ends `onReceive`: wait for the next datagram unless
-    /// stopping.
-    ///
-    /// libxev's kqueue backend (819ffa18) mistracks a receive whose datagram
-    /// was waiting when it registered. It keeps that result in the
-    /// completion, and after `.rearm` leaves it marked dead while kqueue
-    /// still watches the socket. A cancel then does nothing, and the loop
-    /// never finishes. The completion is put back in the state a rearmed
-    /// receive has otherwise.
-    fn receiveAgain(self: *Endpoint, recv_c: *xev.Completion) xev.CallbackAction {
-        if (self.stopping) return .disarm;
-        if (xev.backend == .kqueue) {
-            recv_c.result = null;
-            recv_c.flags.state = .active;
-        }
-        return .rearm;
+        return if (self.stopping) .disarm else .rearm;
     }
 
     /// Hands a datagram to its connection. On a server, a datagram for no
