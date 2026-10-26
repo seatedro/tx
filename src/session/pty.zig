@@ -332,6 +332,24 @@ pub const Pty = struct {
         return self.reapChild(posix.W.NOHANG);
     }
 
+    /// Blocks until the child has exited, without reaping it. `kill` stays
+    /// safe to call from another thread meanwhile, since the pid can't be
+    /// reused before the child is reaped. Reap it with `tryWait` afterwards.
+    pub fn waitExited(self: *const Pty) WaitError!void {
+        const pid = self.pid orelse return;
+
+        // Larger than siginfo_t on every supported platform. Only the
+        // return value is used.
+        var info: [128]u8 align(8) = undefined;
+
+        // WNOWAIT leaves the child a zombie. Its pid stays reserved.
+        while (libc.waitid(p_pid, @intCast(pid), &info, w_exited | w_nowait) == -1) switch (posix.errno(-1)) {
+            .INTR => {},
+            .CHILD => return error.ProcessNotFound,
+            else => |err| return posix.unexpectedErrno(err),
+        };
+    }
+
     fn reapChild(self: *Pty, flags: c_int) WaitError!?Term {
         const pid = self.pid orelse return self.term orelse error.ProcessNotFound;
         const term = reap(pid, flags) catch |err| {
@@ -681,7 +699,14 @@ const libc = struct {
     extern "c" fn ptsname_r(fd: posix.fd_t, buf: [*]u8, len: usize) c_int;
     extern "c" fn getsid(pid: posix.pid_t) posix.pid_t;
     extern "c" fn tcgetsid(fd: posix.fd_t) posix.pid_t;
+    extern "c" fn waitid(idtype: c_int, id: c_uint, info: *anyopaque, options: c_int) c_int;
 };
+
+// waitid's arguments. P_PID is 1 on Linux, macOS and the BSDs. std.c has no
+// WEXITED or WNOWAIT for macOS; these are from XNU's sys/wait.h.
+const p_pid = 1;
+const w_exited: c_int = if (native_os.isDarwin()) 0x4 else c.W.EXITED;
+const w_nowait: c_int = if (native_os.isDarwin()) 0x20 else c.W.NOWAIT;
 
 const testing = std.testing;
 

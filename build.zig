@@ -22,7 +22,13 @@ pub fn build(b: *std.Build) void {
     });
     b.getInstallStep().dependOn(&ngtcp2_crypto.step);
 
+    const xev = b.dependency("libxev", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("xev");
+
     const transport_libs: TransportLibs = .{
+        .xev = xev,
         .ngtcp2 = ngtcp2,
         .ngtcp2_crypto = ngtcp2_crypto,
         .picotls = picotls,
@@ -54,11 +60,147 @@ pub fn build(b: *std.Build) void {
     });
     addTestRuns(b, term_tests, test_step, test_network_step);
 
+    // The wake pipe, shared by the client's threads and the session host.
+    const wake = b.createModule(.{
+        .root_source_file = b.path("src/wake.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
     const session_tests = b.addTest(.{
         .name = "session-test",
-        .root_module = sessionModule(b, target, optimize, termModule(b, target, optimize, ghostty_vt)),
+        .root_module = sessionModule(b, target, optimize, termModule(b, target, optimize, ghostty_vt), wake),
     });
     addTestRuns(b, session_tests, test_step, test_network_step);
+
+    const proto_tests = b.addTest(.{
+        .name = "proto-test",
+        .root_module = protoModule(b, target, optimize),
+    });
+    addTestRuns(b, proto_tests, test_step, test_network_step);
+
+    // One instance of each module for the executables and the end-to-end
+    // test, so that they share their dependencies' code and globals.
+    const term = termModule(b, target, optimize, ghostty_vt);
+    const transport = transportModule(b, target, optimize, transport_libs);
+    const proto = protoModule(b, target, optimize);
+    const session = sessionModule(b, target, optimize, term, wake);
+    const client = clientModule(b, target, optimize, .{ .xev = xev, .transport = transport, .proto = proto, .wake = wake });
+    const server = serverModule(b, target, optimize, .{
+        .xev = xev,
+        .transport = transport,
+        .proto = proto,
+        .session = session,
+        .term = term,
+    });
+
+    const client_tests = b.addTest(.{
+        .name = "client-test",
+        .root_module = clientModule(b, target, optimize, .{ .xev = xev, .transport = transport, .proto = proto, .wake = wake }),
+    });
+    addTestRuns(b, client_tests, test_step, test_network_step);
+
+    // The end-to-end tests run a server and clients in one process.
+    const e2e = b.createModule(.{
+        .root_source_file = b.path("src/e2e_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    e2e.addImport("xev", xev);
+    e2e.addImport("transport", transport);
+    e2e.addImport("server", server);
+    e2e.addImport("client", client);
+    e2e.addImport("term", term);
+    e2e.addImport("proto", proto);
+    addTestRuns(b, b.addTest(.{ .name = "e2e-test", .root_module = e2e }), test_step, test_network_step);
+
+    const tx = b.createModule(.{
+        .root_source_file = b.path("src/cli/tx.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    tx.addImport("client", client);
+    b.installArtifact(b.addExecutable(.{ .name = "tx", .root_module = tx }));
+
+    const tx_session = b.createModule(.{
+        .root_source_file = b.path("src/cli/tx_session.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    tx_session.addImport("xev", xev);
+    tx_session.addImport("server", server);
+    tx_session.addImport("transport", transport);
+    b.installArtifact(b.addExecutable(.{ .name = "tx-session", .root_module = tx_session }));
+}
+
+const ServerDeps = struct {
+    xev: *std.Build.Module,
+    transport: *std.Build.Module,
+    proto: *std.Build.Module,
+    session: *std.Build.Module,
+    term: *std.Build.Module,
+};
+
+fn serverModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    deps: ServerDeps,
+) *std.Build.Module {
+    const mod = b.createModule(.{
+        .root_source_file = b.path("src/server/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    mod.addImport("xev", deps.xev);
+    mod.addImport("transport", deps.transport);
+    mod.addImport("proto", deps.proto);
+    mod.addImport("session", deps.session);
+    mod.addImport("term", deps.term);
+    return mod;
+}
+
+const ClientDeps = struct {
+    xev: *std.Build.Module,
+    transport: *std.Build.Module,
+    proto: *std.Build.Module,
+    wake: *std.Build.Module,
+};
+
+fn protoModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Module {
+    return b.createModule(.{
+        .root_source_file = b.path("src/proto/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+}
+
+fn clientModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    deps: ClientDeps,
+) *std.Build.Module {
+    const mod = b.createModule(.{
+        .root_source_file = b.path("src/client/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    mod.addImport("xev", deps.xev);
+    mod.addImport("transport", deps.transport);
+    mod.addImport("proto", deps.proto);
+    mod.addImport("wake", deps.wake);
+    return mod;
 }
 
 fn sessionModule(
@@ -66,6 +208,7 @@ fn sessionModule(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     term: *std.Build.Module,
+    wake: *std.Build.Module,
 ) *std.Build.Module {
     const mod = b.createModule(.{
         .root_source_file = b.path("src/session/root.zig"),
@@ -74,6 +217,7 @@ fn sessionModule(
         .link_libc = true,
     });
     mod.addImport("term", term);
+    mod.addImport("wake", wake);
     return mod;
 }
 
@@ -127,6 +271,7 @@ fn addTestRuns(
 }
 
 const TransportLibs = struct {
+    xev: *std.Build.Module,
     ngtcp2: *std.Build.Step.Compile,
     ngtcp2_crypto: *std.Build.Step.Compile,
     picotls: *std.Build.Step.Compile,
@@ -157,6 +302,7 @@ fn transportModule(
         .link_libc = true,
     });
     mod.addImport("c", c.createModule());
+    mod.addImport("xev", libs.xev);
     mod.addImport("crypto", cryptoModule(b, target, optimize, libs.picotls));
     mod.addIncludePath(b.path("src/transport/include"));
     mod.addIncludePath(b.path("src/crypto/include"));
