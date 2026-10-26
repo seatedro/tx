@@ -1,6 +1,6 @@
-//! Replication tests: a mirror restored from a snapshot cut anywhere in an
-//! authority's output, then given the rest of the log, must reach exactly
-//! the authority's state, not just right after the restore but at every
+//! Replication tests: a replica restored from a snapshot cut anywhere in a
+//! primary's output, then given the rest of the log, must reach exactly
+//! the primary's state, not just right after the restore but at every
 //! later point we look.
 //!
 //! Every random choice uses a fixed seed, so a failure reproduces.
@@ -8,9 +8,9 @@ const std = @import("std");
 const testing = std.testing;
 const vt = @import("ghostty-vt");
 const log = @import("log.zig");
-const Authority = @import("authority.zig").Authority;
-const Handler = @import("authority.zig").Handler;
-const Mirror = @import("mirror.zig").Mirror;
+const Primary = @import("primary.zig").Primary;
+const Handler = @import("primary.zig").Handler;
+const Replica = @import("replica.zig").Replica;
 const state = @import("state.zig");
 
 const gpa = testing.allocator;
@@ -37,10 +37,10 @@ const Config = struct {
     rows: u16 = 6,
     max_scrollback_bytes: ?usize = 10_000_000,
     max_scrollback_lines: ?usize = null,
-    /// Install effect callbacks on the authority, as a host would. They
+    /// Install effect callbacks on the primary, as a host would. They
     /// answer queries, which must not change state.
     effects: bool = true,
-    /// Records the authority's output is split into are 1 to this many
+    /// Records the primary's output is split into are 1 to this many
     /// bytes long.
     max_chunk: usize = 24,
     /// How many times to compare after the restore, the last at the end of
@@ -48,7 +48,7 @@ const Config = struct {
     checkpoints: usize = 3,
     /// Print the dumps' first difference when they diverge.
     report: bool = true,
-    /// Run the authority and mirror on the leak-checking allocator. It
+    /// Run the primary and replica on the leak-checking allocator. It
     /// records a stack trace for every allocation, which makes the tests
     /// that run thousands of cuts several times slower, so those use the
     /// plain allocator and others cover leaks.
@@ -121,8 +121,8 @@ const Effects = struct {
 const kitty_limit = 1024 * 1024;
 const continuation_limit = 64 * 1024;
 
-fn createAuthority(config: Config) !*Authority {
-    const a: *Authority = try .create(config.allocator(), io, .{
+fn createPrimary(config: Config) !*Primary {
+    const a: *Primary = try .create(config.allocator(), io, .{
         .cols = config.cols,
         .rows = config.rows,
         .max_scrollback_bytes = config.max_scrollback_bytes,
@@ -135,24 +135,24 @@ fn createAuthority(config: Config) !*Authority {
     return a;
 }
 
-/// Feed `atoms` to the authority, output in randomly sized records.
-fn feed(a: *Authority, atoms: []const Atom, rng: std.Random, max_chunk: usize) !void {
+/// Feed `atoms` to the primary, output in randomly sized records.
+fn feed(a: *Primary, atoms: []const Atom, rng: std.Random, max_chunk: usize) !void {
     var i: usize = 0;
     while (i < atoms.len) i += try feedRecord(a, atoms[i..], rng, max_chunk);
 }
 
-/// Apply every record the mirror hasn't seen yet.
-fn catchUp(m: *Mirror, a: *Authority) !void {
+/// Apply every record the replica hasn't seen yet.
+fn catchUp(m: *Replica, a: *Primary) !void {
     var it = try a.log.iterator(m.next_seq);
     while (it.next()) |record| try m.apply(record);
 }
 
-fn restore(a: *Authority) !*Mirror {
+fn restore(a: *Primary) !*Replica {
     var snapshot: std.Io.Writer.Allocating = .init(a.gpa);
     defer snapshot.deinit();
     const seq = try a.snapshot(a.gpa, &snapshot.writer);
     var reader: std.Io.Reader = .fixed(snapshot.written());
-    const m = try Mirror.restore(a.gpa, io, &reader, seq, .{
+    const m = try Replica.restore(a.gpa, io, &reader, seq, .{
         .kitty_image_storage_limit = kitty_limit,
         .max_continuation_bytes = continuation_limit,
     });
@@ -189,16 +189,16 @@ const Expected = struct {
     }
 };
 
-/// Compare the mirror with what the authority looked like at `at`.
-fn compare(expected: Expected, m: *Mirror, cut: Cut, at: usize, config: Config) !void {
+/// Compare the replica with what the primary looked like at `at`.
+fn compare(expected: Expected, m: *Replica, cut: Cut, at: usize, config: Config) !void {
     const actual: Expected = try .of(&m.terminal, &m.stream);
     defer actual.deinit();
     if (!std.mem.eql(u8, expected.dump, actual.dump)) {
         if (config.report) reportDiff(cut, at, expected.dump, actual.dump);
         return error.Diverged;
     }
-    // The authority's sequence can be too long to track. The mirror's
-    // can't be, since the mirror only replays what fit in the snapshot.
+    // The primary's sequence can be too long to track. The replica's
+    // can't be, since the replica only replays what fit in the snapshot.
     const e = expected.continuation orelse return;
     if (actual.continuation == null or !std.mem.eql(u8, e, actual.continuation.?)) {
         if (config.report) std.debug.print("{s}: cut {d}, at {d}: continuations differ: \"{f}\" and \"{f}\"\n", .{
@@ -213,7 +213,7 @@ fn compare(expected: Expected, m: *Mirror, cut: Cut, at: usize, config: Config) 
 }
 
 fn reportDiff(cut: Cut, at: usize, expected: []const u8, actual: []const u8) void {
-    std.debug.print("{s}: cut {d} (seed {d}), compared at {d}: the mirror diverged\n", .{ cut.name, cut.at, cut.seed, at });
+    std.debug.print("{s}: cut {d} (seed {d}), compared at {d}: the replica diverged\n", .{ cut.name, cut.at, cut.seed, at });
     // The first difference, then a few lines of each side, since a line
     // missing from one side shifts everything after it.
     var e_lines = std.mem.splitScalar(u8, expected, '\n');
@@ -223,22 +223,22 @@ fn reportDiff(cut: Cut, at: usize, expected: []const u8, actual: []const u8) voi
         const l = a_lines.next();
         if (e == null and l == null) return;
         if (e != null and l != null and std.mem.eql(u8, e.?, l.?)) continue;
-        std.debug.print("  authority: {s}\n", .{e orelse "(end)"});
+        std.debug.print("  primary: {s}\n", .{e orelse "(end)"});
         for (0..3) |_| std.debug.print("             {s}\n", .{e_lines.next() orelse break});
-        std.debug.print("  mirror:    {s}\n", .{l orelse "(end)"});
+        std.debug.print("  replica:    {s}\n", .{l orelse "(end)"});
         for (0..3) |_| std.debug.print("             {s}\n", .{a_lines.next() orelse break});
         return;
     }
 }
 
-/// Run one cut: feed an authority up to `cut.at`, restore a mirror from
-/// its snapshot, then keep both going to the end, comparing the mirror
-/// with the authority right after the restore and at each checkpoint.
+/// Run one cut: feed a primary up to `cut.at`, restore a replica from
+/// its snapshot, then keep both going to the end, comparing the replica
+/// with the primary right after the restore and at each checkpoint.
 fn checkCut(atoms: []const Atom, cut: Cut, config: Config) !void {
     var prng: std.Random.DefaultPrng = .init(cut.seed);
     const rng = prng.random();
 
-    const a = try createAuthority(config);
+    const a = try createPrimary(config);
     defer a.destroy();
     try feed(a, atoms[0..cut.at], rng, config.max_chunk);
     const m = try restore(a);
@@ -261,10 +261,10 @@ fn checkCut(atoms: []const Atom, cut: Cut, config: Config) !void {
 }
 
 /// Replay a diverged cut one atom at a time and print the first atom
-/// after which the mirror differs, with the bytes leading up to it.
+/// after which the replica differs, with the bytes leading up to it.
 fn findFirstDivergence(atoms: []const Atom, cut: Cut, config: Config) !void {
     var prng: std.Random.DefaultPrng = .init(cut.seed);
-    const a = try createAuthority(config);
+    const a = try createPrimary(config);
     defer a.destroy();
     try feed(a, atoms[0..cut.at], prng.random(), config.max_chunk);
     const m = try restore(a);
@@ -291,10 +291,10 @@ fn findFirstDivergence(atoms: []const Atom, cut: Cut, config: Config) !void {
 /// Check a cut at every atom of a script, and at every record boundary of
 /// a second run in records of random sizes.
 ///
-/// Running a new authority to each of thousands of cuts is slow in Debug,
-/// so each run uses one authority, snapshots it after every record, and
-/// keeps its whole log. Each snapshot then restores a mirror that applies
-/// the log from there. The mirrors are compared with the state after each
+/// Running a new primary to each of thousands of cuts is slow in Debug,
+/// so each run uses one primary, snapshots it after every record, and
+/// keeps its whole log. Each snapshot then restores a replica that applies
+/// the log from there. The replicas are compared with the state after each
 /// atom, recorded from the first run.
 fn checkEveryCut(name: []const u8, steps: []const Step, config: Config) !void {
     const atoms = try flatten(steps);
@@ -307,7 +307,7 @@ fn checkEveryCut(name: []const u8, steps: []const Step, config: Config) !void {
     }
     for ([_]usize{ 1, config.max_chunk }) |max_chunk| {
         var prng: std.Random.DefaultPrng = .init(max_chunk);
-        const a = try createAuthority(config);
+        const a = try createPrimary(config);
         defer a.destroy();
         var snapshots: std.ArrayList(Snapshot) = .empty;
         defer {
@@ -335,7 +335,7 @@ fn checkEveryCut(name: []const u8, steps: []const Step, config: Config) !void {
         for (snapshots.items) |s| {
             const cut: Cut = .{ .name = name, .at = s.at, .seed = max_chunk };
             var reader: std.Io.Reader = .fixed(s.bytes);
-            const m = try Mirror.restore(a.gpa, io, &reader, s.seq, .{
+            const m = try Replica.restore(a.gpa, io, &reader, s.seq, .{
                 .kitty_image_storage_limit = kitty_limit,
                 .max_continuation_bytes = continuation_limit,
             });
@@ -360,13 +360,13 @@ fn checkEveryCut(name: []const u8, steps: []const Step, config: Config) !void {
 const Snapshot = struct {
     bytes: []u8,
     seq: u64,
-    /// Atoms the authority had consumed.
+    /// Atoms the primary had consumed.
     at: usize,
 };
 
-/// Feed the authority one record from the start of `atoms`: a resize, or
+/// Feed the primary one record from the start of `atoms`: a resize, or
 /// up to `max_chunk` bytes of output. Returns the atoms consumed.
-fn feedRecord(a: *Authority, atoms: []const Atom, rng: std.Random, max_chunk: usize) !usize {
+fn feedRecord(a: *Primary, atoms: []const Atom, rng: std.Random, max_chunk: usize) !usize {
     switch (atoms[0]) {
         .resize => |r| {
             try a.resize(r);
@@ -507,13 +507,13 @@ const corpora = [_]struct { []const u8, []const Step }{
     } },
 };
 
-test "a mirror restored at every cut point matches the authority" {
+test "a replica restored at every cut point matches the primary" {
     testing.log_level = .err;
     for (corpora) |corpus| try checkEveryCut(corpus[0], corpus[1], .{ .leak_check = false });
 }
 
-test "a mirror matches an authority without effect callbacks" {
-    // A read-only authority, so the effects can't be hiding anything.
+test "a replica matches a primary without effect callbacks" {
+    // A read-only primary, so the effects can't be hiding anything.
     testing.log_level = .err;
     for (corpora) |corpus| {
         const atoms = try flatten(corpus[1]);
@@ -525,29 +525,29 @@ test "a mirror matches an authority without effect callbacks" {
     }
 }
 
-test "only the authority answers queries" {
+test "only the primary answers queries" {
     testing.log_level = .err;
     const queries = corpora[15];
     try testing.expectEqualStrings("queries", queries[0]);
 
-    const a = try createAuthority(.{});
+    const a = try createPrimary(.{});
     defer a.destroy();
     const before = Effects.replies;
     try a.output(queries[1][0].out);
     try testing.expect(Effects.replies > before);
 
-    // The mirror has no callbacks at all, so it can't reply or fire an
+    // The replica has no callbacks at all, so it can't reply or fire an
     // effect.
     const m = try restore(a);
     defer m.destroy();
     try testing.expect(std.meta.eql(Handler.Effects.readonly, m.stream.handler.effects));
 }
 
-test "a mirror loads Kitty images only from inline data" {
-    // Whatever the authority allows, on screens restored from the snapshot
-    // and on one the mirror creates later.
+test "a replica loads Kitty images only from inline data" {
+    // Whatever the primary allows, on screens restored from the snapshot
+    // and on one the replica creates later.
     for ([_][]const u8{ "\x1b[?1049h\x1b[?1049l", "" }) |before| {
-        const a = try createAuthority(.{});
+        const a = try createPrimary(.{});
         defer a.destroy();
         a.terminal.setKittyGraphicsLoadingLimits(.allWithTempDir("/tmp"));
         try a.output(before);
@@ -577,7 +577,7 @@ test "the same bytes in different records reach the same state" {
         // One record per step, records of up to 4 KiB, and random sizes.
         for ([_]usize{ 4096, 1, 3, 17, 4096 }, 0..) |max_chunk, seed| {
             var prng: std.Random.DefaultPrng = .init(seed);
-            const a = try createAuthority(.{});
+            const a = try createPrimary(.{});
             defer a.destroy();
             if (seed == 0) {
                 for (corpus[1]) |step| switch (step) {
@@ -600,8 +600,8 @@ test "the same bytes in different records reach the same state" {
     }
 }
 
-test "a mirror applies records in order only" {
-    const a = try createAuthority(.{});
+test "a replica applies records in order only" {
+    const a = try createPrimary(.{});
     defer a.destroy();
     try a.output("one");
     const m = try restore(a);
@@ -629,8 +629,8 @@ test "a mirror applies records in order only" {
     try compare(expected, m, .{ .name = "in order", .at = 0, .seed = 0 }, 0, .{});
 }
 
-test "a mirror that falls behind a trimmed log resyncs from a snapshot" {
-    const a: *Authority = try .create(gpa, io, .{
+test "a replica that falls behind a trimmed log resyncs from a snapshot" {
+    const a: *Primary = try .create(gpa, io, .{
         .cols = 20,
         .rows = 4,
         .kitty_image_storage_limit = kitty_limit,
@@ -641,7 +641,7 @@ test "a mirror that falls behind a trimmed log resyncs from a snapshot" {
     const m = try restore(a);
     defer m.destroy();
 
-    // More than the ring holds, so the mirror's next record is dropped.
+    // More than the ring holds, so the replica's next record is dropped.
     for (0..100) |i| {
         var buf: [32]u8 = undefined;
         try a.output(try std.fmt.bufPrint(&buf, "line {d}\r\n", .{i}));
@@ -843,7 +843,7 @@ test "Kitty ID counters are lost with the last image" {
     // placement IDs, is only in the snapshot while the screen has an image
     // or a load in progress. Here a transmission without an ID takes the
     // next automatic ID and then fails (too few pixels), leaving no image,
-    // so the restored mirror starts its counter over and gives the next
+    // so the restored replica starts its counter over and gives the next
     // such image another ID. Deleting the last image does the same.
     const script = "\x1b_Ga=T,f=32,s=2,v=2,q=2;" ++ pixel_1x1 ++ "\x1b\\";
     try expectKnownDivergence(
@@ -855,7 +855,7 @@ test "Kitty ID counters are lost with the last image" {
 }
 
 test "Glyph Protocol registrations are not in the snapshot" {
-    // Terminal.glyph_glossary is not encoded, so a mirror restored after a
+    // Terminal.glyph_glossary is not encoded, so a replica restored after a
     // registration renders the codepoint with the font instead of the
     // registered glyph.
     const script = "\x1b_25a1;r;cp=e0a0;AAAAAAAAAAAAAA==\x1b\\";
@@ -863,7 +863,7 @@ test "Glyph Protocol registrations are not in the snapshot" {
 }
 
 test "a Kitty drag and drop registration is not in the snapshot" {
-    // Terminal.kitty_dnd (OSC 72) is not encoded, so a mirror restored
+    // Terminal.kitty_dnd (OSC 72) is not encoded, so a replica restored
     // after a program registered to accept drops doesn't know it does.
     const script = "\x1b]72;t=a;text/plain\x1b\\";
     try expectKnownDivergence("drag and drop registration", out(script ++ "x"), script.len, .{});
@@ -873,8 +873,8 @@ test "scrollback is pruned at different rows after a restore" {
     // Scrollback past its limit is pruned a whole page at a time. A
     // restored page has room for exactly the rows it holds (the snapshot
     // PAGE header carries the used rows, not the row capacity), so after a
-    // restore the mirror's later rows land on pages that start and end at
-    // other rows than the authority's, and pruning drops a different
+    // restore the replica's later rows land on pages that start and end at
+    // other rows than the primary's, and pruning drops a different
     // number of the oldest rows. The screen itself still matches; only the
     // depth of history differs. Byte limits prune by page the same way.
     var buf: std.Io.Writer.Allocating = .init(gpa);
@@ -895,8 +895,8 @@ test "an implicit hyperlink is renumbered when the cursor changes page" {
     // the cursor moves onto another page while such a link is open, the
     // link is started again on the new page (Screen.cursorChangePin), which
     // takes a new implicit ID. A restored page has room for exactly its
-    // rows, so the mirror's cursor changes page on the first scroll where
-    // the authority's doesn't, and the rest of the link gets another ID.
+    // rows, so the replica's cursor changes page on the first scroll where
+    // the primary's doesn't, and the rest of the link gets another ID.
     const script = "\x1b]8;;https://a.example\x1b\\";
     try expectKnownDivergence("implicit hyperlink ID", out(script ++ "\x1b[6;1Hlink\r\nmore"), script.len, .{});
 }
@@ -908,7 +908,7 @@ test "a resize without reflow drops wrap flags on a restored page" {
     // rows' soft-wrap flags; widening past it moves the rows to wider
     // pages, which drops the flags. A restored page is exactly as wide as
     // the screen was at the cut, so after a narrowing, a restore and a
-    // widening, the mirror has dropped flags that the authority kept.
+    // widening, the replica has dropped flags that the primary kept.
     const steps: []const Step = &.{
         .{ .out = "\x1b[?1049ha line that wraps on the alternate screen" },
         .{ .resize = .{ .cols = 10, .rows = 6 } },

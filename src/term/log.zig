@@ -1,9 +1,9 @@
-//! The output log: the ordered records that take a mirror from a snapshot
-//! to the authoritative terminal's current state.
+//! The output log: the ordered records that take a replica from a snapshot
+//! to the primary terminal's current state.
 //!
-//! A record is either bytes the authoritative terminal consumed or one of
+//! A record is either bytes the primary terminal consumed or one of
 //! the few events outside the byte stream that change terminal state. Seq
-//! numbers count records from 0 with no gaps, so a mirror that has applied
+//! numbers count records from 0 with no gaps, so a replica that has applied
 //! seq n needs exactly n + 1 next, and a reader that asks for a seq the
 //! ring has already dropped knows it needs a full resync instead.
 const std = @import("std");
@@ -18,7 +18,7 @@ pub const Record = struct {
 /// What a record carries. Default colors from the host will be added as
 /// another kind.
 pub const Payload = union(enum) {
-    /// Bytes fed to the authoritative terminal's stream, in order. How the
+    /// Bytes fed to the primary terminal's stream, in order. How the
     /// bytes are split into records doesn't matter to the terminal state.
     output: []const u8,
 

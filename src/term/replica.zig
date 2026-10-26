@@ -1,8 +1,8 @@
-//! A mirror: a Terminal restored from an authority's snapshot and kept in
+//! A replica: a Terminal restored from a primary's snapshot and kept in
 //! step by applying its log.
 //!
-//! The mirror only reproduces state. Its handler has every effect callback
-//! null, so it never answers a query (the authority does) and never fires
+//! The replica only reproduces state. Its handler has every effect callback
+//! null, so it never answers a query (the primary does) and never fires
 //! an external effect from restored or replayed bytes. It loads Kitty
 //! images only from inline data, so no byte it is given can make it open a
 //! file or shared memory.
@@ -14,10 +14,10 @@ const log = @import("log.zig");
 pub const Stream = vt.TerminalStream;
 
 pub const Options = struct {
-    /// Must equal the authority's, which the snapshot doesn't carry.
+    /// Must equal the primary's, which the snapshot doesn't carry.
     kitty_image_storage_limit: usize = 320 * 1000 * 1000,
     /// The longest unfinished sequence accepted from a snapshot. Should be
-    /// at least the authority's `continuation_max_bytes`.
+    /// at least the primary's `continuation_max_bytes`.
     max_continuation_bytes: usize = 1024 * 1024,
 };
 
@@ -29,20 +29,20 @@ pub const RestoreError = vt.snapshot.DecodeError || error{
 
 pub const ApplyError = vt.Terminal.ResizeError || error{
     /// The record isn't the next one. Records must be applied in seq order
-    /// without gaps; a mirror that missed one needs a new snapshot.
+    /// without gaps; a replica that missed one needs a new snapshot.
     OutOfOrder,
 };
 
-pub const Mirror = struct {
+pub const Replica = struct {
     gpa: Allocator,
     terminal: vt.Terminal,
-    /// Points at `terminal`, which is why a Mirror never moves.
+    /// Points at `terminal`, which is why a Replica never moves.
     stream: Stream,
     /// The seq of the next record to apply.
     next_seq: u64,
 
     /// Restore from one snapshot read from `reader`, cut at `seq` (the value
-    /// `Authority.snapshot` returned). Reads exactly the snapshot, leaving
+    /// `Primary.snapshot` returned). Reads exactly the snapshot, leaving
     /// whatever follows it in `reader`.
     pub fn restore(
         gpa: Allocator,
@@ -50,14 +50,14 @@ pub const Mirror = struct {
         reader: *std.Io.Reader,
         seq: u64,
         options: Options,
-    ) (RestoreError || Allocator.Error)!*Mirror {
+    ) (RestoreError || Allocator.Error)!*Replica {
         var decoded = try vt.snapshot.decode(gpa, io, reader, .{
             .max_continuation_bytes = options.max_continuation_bytes,
             .kitty_image_storage_limit = options.kitty_image_storage_limit,
         });
         defer decoded.deinit(gpa);
 
-        const self = try gpa.create(Mirror);
+        const self = try gpa.create(Replica);
         errdefer gpa.destroy(self);
         // The stream must point at the Terminal's final address, so it is
         // moved into place before the stream exists.
@@ -73,7 +73,7 @@ pub const Mirror = struct {
         }
         // libghostty-vt gives an alternate screen it creates no line limit,
         // but one it restores a limit of zero lines. The alternate screen
-        // keeps no scrollback either way, but match the authority's.
+        // keeps no scrollback either way, but match the primary's.
         if (self.terminal.screens.get(.alternate)) |alt| alt.pages.setMaxLines(null);
         self.stream = .init(.{
             .allocator = gpa,
@@ -97,15 +97,15 @@ pub const Mirror = struct {
         return self;
     }
 
-    pub fn destroy(self: *Mirror) void {
+    pub fn destroy(self: *Replica) void {
         const gpa = self.gpa;
         self.stream.deinit();
         self.terminal.deinit(gpa);
         gpa.destroy(self);
     }
 
-    /// Apply the next record of the authority's log.
-    pub fn apply(self: *Mirror, record: log.Record) ApplyError!void {
+    /// Apply the next record of the primary's log.
+    pub fn apply(self: *Replica, record: log.Record) ApplyError!void {
         if (record.seq != self.next_seq) return error.OutOfOrder;
         switch (record.payload) {
             .output => |bytes| self.stream.nextSlice(bytes),

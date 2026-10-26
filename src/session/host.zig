@@ -1,11 +1,11 @@
-//! A session host: one program on a pseudo-terminal, and the authoritative
+//! A session host: one program on a pseudo-terminal, and the primary
 //! terminal fed everything it writes.
 //!
 //! The host is the only place the program's output enters tx. Each read
-//! from the pty goes to the `Authority`, which logs it and applies it, so
-//! mirrors attached at any point can catch up from a snapshot and the log.
+//! from the pty goes to the `Primary`, which logs it and applies it, so
+//! replicas attached at any point can catch up from a snapshot and the log.
 //! It is also the only place the program's input leaves: the user's input
-//! and the authority's replies to queries share one queue to the pty, in
+//! and the primary's replies to queries share one queue to the pty, in
 //! the order they were produced.
 //!
 //! The host doesn't own an event loop. The caller polls `fd` for reading,
@@ -16,7 +16,7 @@ const Allocator = std.mem.Allocator;
 const term = @import("term");
 const pty_pkg = @import("pty.zig");
 
-const Authority = term.Authority;
+const Primary = term.Primary;
 const Pty = pty_pkg.Pty;
 
 pub const Options = struct {
@@ -45,9 +45,9 @@ pub const ReadError = pty_pkg.ReadError || term.log.AppendError;
 pub const Host = struct {
     gpa: Allocator,
     pty: Pty,
-    authority: *Authority,
+    primary: *Primary,
     /// Bytes for the program that the pty hasn't taken yet: the user's
-    /// input and the authority's replies. `input_start` is how much of
+    /// input and the primary's replies. `input_start` is how much of
     /// `input` has been written. Nothing bounds it here; the transport's
     /// flow control has to stop reading input from a client while the
     /// program isn't reading it.
@@ -55,13 +55,13 @@ pub const Host = struct {
     input_start: usize = 0,
 
     /// Start the program. The host is heap-allocated because the
-    /// authority's reply callback points back at it.
+    /// primary's reply callback points back at it.
     pub fn create(gpa: Allocator, io: std.Io, options: Options) !*Host {
         const self = try gpa.create(Host);
         errdefer gpa.destroy(self);
 
         const t = options.terminal;
-        const authority: *Authority = try .create(gpa, io, .{
+        const primary: *Primary = try .create(gpa, io, .{
             .cols = options.size.cols,
             .rows = options.size.rows,
             .max_scrollback_bytes = t.max_scrollback_bytes,
@@ -70,10 +70,10 @@ pub const Host = struct {
             .log_capacity = t.log_capacity,
             .continuation_max_bytes = t.continuation_max_bytes,
         });
-        errdefer authority.destroy();
+        errdefer primary.destroy();
         // The size the terminal starts with isn't a record, so a cell size
         // has to be applied (and logged) like any later resize.
-        if (options.size.cell_size_px != null) try authority.resize(options.size);
+        if (options.size.cell_size_px != null) try primary.resize(options.size);
 
         self.* = .{
             .gpa = gpa,
@@ -85,10 +85,10 @@ pub const Host = struct {
                 .size = ptySize(options.size),
                 .diagnostic = options.diagnostic,
             }),
-            .authority = authority,
+            .primary = primary,
         };
-        authority.context = self;
-        authority.handler().effects.write_pty = &writePty;
+        primary.context = self;
+        primary.handler().effects.write_pty = &writePty;
         return self;
     }
 
@@ -97,7 +97,7 @@ pub const Host = struct {
     pub fn destroy(self: *Host) void {
         const gpa = self.gpa;
         self.pty.deinit();
-        self.authority.destroy();
+        self.primary.destroy();
         self.input.deinit(gpa);
         gpa.destroy(self);
     }
@@ -108,11 +108,11 @@ pub const Host = struct {
     }
 
     /// Read what the program wrote, at most `buf.len` bytes, and feed it
-    /// to the authority. Returns the number of bytes read, 0 at end of
+    /// to the primary. Returns the number of bytes read, 0 at end of
     /// file. Replies the output asked for are queued; flush them.
     pub fn readOutput(self: *Host, buf: []u8) ReadError!usize {
         const n = try self.pty.read(buf);
-        if (n > 0) try self.authority.output(buf[0..n]);
+        if (n > 0) try self.primary.output(buf[0..n]);
         return n;
     }
 
@@ -158,14 +158,14 @@ pub const Host = struct {
 
     /// Resize the terminal, then the pty. In that order, the program's
     /// redraw after SIGWINCH is output the log records after the resize,
-    /// so mirrors see it at the same size the authority did.
+    /// so replicas see it at the same size the primary did.
     pub fn resize(self: *Host, size: term.log.Resize) !void {
-        try self.authority.resize(size);
+        try self.primary.resize(size);
         try self.pty.resize(ptySize(size));
     }
 
-    fn writePty(h: *term.authority.Handler, data: []const u8) void {
-        const self: *Host = @ptrCast(@alignCast(Authority.fromHandler(h).context.?));
+    fn writePty(h: *term.primary.Handler, data: []const u8) void {
+        const self: *Host = @ptrCast(@alignCast(Primary.fromHandler(h).context.?));
         // A reply that can't be queued is lost, like one the program
         // never read. The program sees the same as from a slow terminal.
         self.input.appendSlice(self.gpa, data) catch return;
@@ -239,7 +239,7 @@ fn waitTest(host: *Host) !pty_pkg.Term {
 }
 
 fn screenText(host: *Host) ![]const u8 {
-    return host.authority.terminal.plainString(testing.allocator);
+    return host.primary.terminal.plainString(testing.allocator);
 }
 
 fn screenContains(host: *Host, needle: []const u8) bool {
@@ -261,12 +261,12 @@ test "the program's output reaches the terminal and the log" {
     // The log holds exactly what the terminal consumed.
     var logged: std.ArrayList(u8) = .empty;
     defer logged.deinit(testing.allocator);
-    var it = try host.authority.log.iterator(0);
+    var it = try host.primary.log.iterator(0);
     while (it.next()) |record| try logged.appendSlice(testing.allocator, record.payload.output);
     try testing.expectEqualStrings("hello \x1b[1mbold\x1b[m", logged.items);
 }
 
-test "the authority answers the program's queries through the pty" {
+test "the primary answers the program's queries through the pty" {
     var environ = try testEnviron();
     defer environ.deinit();
     // Ask for the cursor position (DSR 6) and print the 6-byte reply in
@@ -325,7 +325,7 @@ test "input reaches the program in order, however much it is" {
     try testing.expect(screenContains(host, try std.fmt.bufPrint(&want, "{d} {d}", .{ ~crc, len })));
 }
 
-test "a mirror attached partway through a session ends in the same state" {
+test "a replica attached partway through a session ends in the same state" {
     var environ = try testEnviron();
     defer environ.deinit();
     // Some history, the alternate screen, a pause for input, a resize the
@@ -350,10 +350,10 @@ test "a mirror attached partway through a session ends in the same state" {
     // Attach: snapshot now, then apply everything logged after it.
     var snapshot: std.Io.Writer.Allocating = .init(testing.allocator);
     defer snapshot.deinit();
-    const seq = try host.authority.snapshot(testing.allocator, &snapshot.writer);
+    const seq = try host.primary.snapshot(testing.allocator, &snapshot.writer);
     var reader: std.Io.Reader = .fixed(snapshot.written());
-    const mirror: *term.Mirror = try .restore(testing.allocator, testing.io, &reader, seq, .{});
-    defer mirror.destroy();
+    const replica: *term.Replica = try .restore(testing.allocator, testing.io, &reader, seq, .{});
+    defer replica.destroy();
 
     try host.resize(.{ .cols = 100, .rows = 30, .cell_size_px = .{ .width = 9, .height = 18 } });
     try host.sendInput("yes\r");
@@ -362,12 +362,12 @@ test "a mirror attached partway through a session ends in the same state" {
     try testing.expect(screenContains(host, "got yes, size 30 100"));
     try testing.expect(screenContains(host, "back on the primary screen"));
 
-    var it = try host.authority.log.iterator(seq);
-    while (it.next()) |record| try mirror.apply(record);
+    var it = try host.primary.log.iterator(seq);
+    while (it.next()) |record| try replica.apply(record);
 
-    const want = try term.state.dumpAlloc(testing.allocator, &host.authority.terminal);
+    const want = try term.state.dumpAlloc(testing.allocator, &host.primary.terminal);
     defer testing.allocator.free(want);
-    const got = try term.state.dumpAlloc(testing.allocator, &mirror.terminal);
+    const got = try term.state.dumpAlloc(testing.allocator, &replica.terminal);
     defer testing.allocator.free(got);
     try testing.expectEqualStrings(want, got);
 }

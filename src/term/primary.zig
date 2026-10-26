@@ -1,16 +1,16 @@
-//! The authoritative terminal: the one Terminal fed the program's real
-//! output, and the log that lets mirrors reproduce it.
+//! The primary terminal: the one Terminal fed the program's real
+//! output, and the log that lets replicas reproduce it.
 //!
 //! Everything that changes terminal state goes through `output` or
 //! `resize`, which append to the log before applying, so the log is
 //! always exactly the history of this Terminal since it was created. A
-//! mirror restored from `snapshot` and given the log from the returned seq
+//! replica restored from `snapshot` and given the log from the returned seq
 //! on reaches the same state.
 //!
 //! This is also the only terminal that answers the program. Query replies
 //! (DA, DSR, DECRQM and so on) and external effects come from the stream
 //! handler's effect callbacks, which the host installs through `handler`.
-//! The mirror leaves all of them null.
+//! The replica leaves all of them null.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const vt = @import("ghostty-vt");
@@ -24,11 +24,11 @@ pub const Handler = Stream.Handler;
 pub const Options = struct {
     cols: u16,
     rows: u16,
-    /// Scrollback limits. They travel in the snapshot, so mirrors match.
+    /// Scrollback limits. They travel in the snapshot, so replicas match.
     max_scrollback_bytes: ?usize = 10_000_000,
     max_scrollback_lines: ?usize = null,
-    /// Not carried by the snapshot: the mirror must be given the same value
-    /// (`mirror.Options.kitty_image_storage_limit`).
+    /// Not carried by the snapshot: the replica must be given the same value
+    /// (`replica.Options.kitty_image_storage_limit`).
     kitty_image_storage_limit: usize = 320 * 1000 * 1000,
     /// The log's capacity in bytes.
     log_capacity: usize = 8 * 1024 * 1024,
@@ -44,18 +44,18 @@ pub const SnapshotError = vt.snapshot.EncodeError || Allocator.Error || error{
     ContinuationUnavailable,
 };
 
-pub const Authority = struct {
+pub const Primary = struct {
     gpa: Allocator,
     terminal: vt.Terminal,
-    /// Points at `terminal`, which is why an Authority never moves.
+    /// Points at `terminal`, which is why a Primary never moves.
     stream: Stream,
     log: Log,
     /// For the host's effect callbacks, which get only the handler; see
     /// `fromHandler`.
     context: ?*anyopaque = null,
 
-    pub fn create(gpa: Allocator, io: std.Io, options: Options) !*Authority {
-        const self = try gpa.create(Authority);
+    pub fn create(gpa: Allocator, io: std.Io, options: Options) !*Primary {
+        const self = try gpa.create(Primary);
         errdefer gpa.destroy(self);
         self.* = .{
             .gpa = gpa,
@@ -77,7 +77,7 @@ pub const Authority = struct {
         return self;
     }
 
-    pub fn destroy(self: *Authority) void {
+    pub fn destroy(self: *Primary) void {
         const gpa = self.gpa;
         self.stream.deinit();
         self.terminal.deinit(gpa);
@@ -88,12 +88,12 @@ pub const Authority = struct {
     /// The stream handler, for installing effect callbacks such as
     /// `write_pty`. Callbacks may also set `title_report` and the other
     /// reply policies; none of them change terminal state.
-    pub fn handler(self: *Authority) *Handler {
+    pub fn handler(self: *Primary) *Handler {
         return &self.stream.handler;
     }
 
-    /// The Authority whose handler an effect callback was called with.
-    pub fn fromHandler(h: *Handler) *Authority {
+    /// The Primary whose handler an effect callback was called with.
+    pub fn fromHandler(h: *Handler) *Primary {
         const stream: *Stream = @fieldParentPtr("handler", h);
         return @fieldParentPtr("stream", stream);
     }
@@ -101,7 +101,7 @@ pub const Authority = struct {
     /// Feed program output: append it to the log and apply it. Output
     /// longer than one record allows is split, which the terminal can't
     /// tell apart from one record.
-    pub fn output(self: *Authority, bytes: []const u8) log_pkg.AppendError!void {
+    pub fn output(self: *Primary, bytes: []const u8) log_pkg.AppendError!void {
         var rest = bytes;
         while (rest.len > 0) {
             const chunk = rest[0..@min(rest.len, self.log.maxOutputLen())];
@@ -113,7 +113,7 @@ pub const Authority = struct {
 
     /// Resize: append it to the log and apply it. The host resizes the PTY
     /// at the same point.
-    pub fn resize(self: *Authority, size: log_pkg.Resize) (log_pkg.AppendError || vt.Terminal.ResizeError)!void {
+    pub fn resize(self: *Primary, size: log_pkg.Resize) (log_pkg.AppendError || vt.Terminal.ResizeError)!void {
         // Rejected before logging, so the log never holds a record that
         // fails to apply.
         if (size.cols == 0 or size.rows == 0) return error.InvalidValue;
@@ -123,8 +123,8 @@ pub const Authority = struct {
 
     /// Encode a snapshot of the current state, including the stream's
     /// unfinished sequence, and return the seq of the first record a
-    /// mirror restored from it must apply.
-    pub fn snapshot(self: *Authority, gpa: Allocator, writer: *std.Io.Writer) SnapshotError!u64 {
+    /// replica restored from it must apply.
+    pub fn snapshot(self: *Primary, gpa: Allocator, writer: *std.Io.Writer) SnapshotError!u64 {
         var continuation: std.Io.Writer.Allocating = .init(gpa);
         defer continuation.deinit();
         self.stream.writeContinuation(&continuation.writer) catch |err| switch (err) {
@@ -143,68 +143,68 @@ pub const Authority = struct {
 const testing = std.testing;
 
 test "output and resize are logged in order" {
-    const authority: *Authority = try .create(testing.allocator, testing.io, .{ .cols = 10, .rows = 3 });
-    defer authority.destroy();
+    const primary: *Primary = try .create(testing.allocator, testing.io, .{ .cols = 10, .rows = 3 });
+    defer primary.destroy();
 
-    try authority.output("hi");
-    try authority.resize(.{ .cols = 12, .rows = 4 });
-    try authority.output("\x1b[1m");
-    try testing.expectError(error.InvalidValue, authority.resize(.{ .cols = 0, .rows = 4 }));
+    try primary.output("hi");
+    try primary.resize(.{ .cols = 12, .rows = 4 });
+    try primary.output("\x1b[1m");
+    try testing.expectError(error.InvalidValue, primary.resize(.{ .cols = 0, .rows = 4 }));
 
-    try testing.expectEqual(3, authority.log.nextSeq());
-    try testing.expectEqualStrings("hi", (try authority.log.get(0)).payload.output);
-    try testing.expectEqual(12, (try authority.log.get(1)).payload.resize.cols);
-    try testing.expectEqual(12, authority.terminal.cols);
-    try testing.expect(authority.terminal.screens.active.cursor.style.flags.bold);
+    try testing.expectEqual(3, primary.log.nextSeq());
+    try testing.expectEqualStrings("hi", (try primary.log.get(0)).payload.output);
+    try testing.expectEqual(12, (try primary.log.get(1)).payload.resize.cols);
+    try testing.expectEqual(12, primary.terminal.cols);
+    try testing.expect(primary.terminal.screens.active.cursor.style.flags.bold);
 }
 
 test "output longer than a record is split" {
-    const authority: *Authority = try .create(testing.allocator, testing.io, .{
+    const primary: *Primary = try .create(testing.allocator, testing.io, .{
         .cols = 10,
         .rows = 3,
         .log_capacity = 4 * (Log.record_overhead + 8),
     });
-    defer authority.destroy();
+    defer primary.destroy();
 
-    const max = authority.log.maxOutputLen();
+    const max = primary.log.maxOutputLen();
     const bytes = try testing.allocator.alloc(u8, 2 * max + 1);
     defer testing.allocator.free(bytes);
     @memset(bytes, 'x');
-    try authority.output(bytes);
-    try testing.expectEqual(3, authority.log.nextSeq());
-    try testing.expectEqual(1, (try authority.log.get(authority.log.nextSeq() - 1)).payload.output.len);
+    try primary.output(bytes);
+    try testing.expectEqual(3, primary.log.nextSeq());
+    try testing.expectEqual(1, (try primary.log.get(primary.log.nextSeq() - 1)).payload.output.len);
 }
 
-test "effect callbacks reach the authority" {
-    const authority: *Authority = try .create(testing.allocator, testing.io, .{ .cols = 10, .rows = 3 });
-    defer authority.destroy();
+test "effect callbacks reach the primary" {
+    const primary: *Primary = try .create(testing.allocator, testing.io, .{ .cols = 10, .rows = 3 });
+    defer primary.destroy();
 
     const Replies = struct {
         bytes: std.ArrayList(u8) = .empty,
 
         fn writePty(h: *Handler, data: []const u8) void {
-            const self: *@This() = @ptrCast(@alignCast(Authority.fromHandler(h).context.?));
+            const self: *@This() = @ptrCast(@alignCast(Primary.fromHandler(h).context.?));
             self.bytes.appendSlice(testing.allocator, data) catch @panic("OOM");
         }
     };
     var replies: Replies = .{};
     defer replies.bytes.deinit(testing.allocator);
-    authority.context = &replies;
-    authority.handler().effects.write_pty = &Replies.writePty;
+    primary.context = &replies;
+    primary.handler().effects.write_pty = &Replies.writePty;
 
     // DSR 6, a cursor position report.
-    try authority.output("ab\x1b[6n");
+    try primary.output("ab\x1b[6n");
     try testing.expectEqualStrings("\x1b[1;3R", replies.bytes.items);
 }
 
 test "a snapshot cut inside a sequence carries it" {
-    const authority: *Authority = try .create(testing.allocator, testing.io, .{ .cols = 10, .rows = 3 });
-    defer authority.destroy();
+    const primary: *Primary = try .create(testing.allocator, testing.io, .{ .cols = 10, .rows = 3 });
+    defer primary.destroy();
 
-    try authority.output("a\x1b]2;ti");
+    try primary.output("a\x1b]2;ti");
     var encoded: std.Io.Writer.Allocating = .init(testing.allocator);
     defer encoded.deinit();
-    try testing.expectEqual(1, try authority.snapshot(testing.allocator, &encoded.writer));
+    try testing.expectEqual(1, try primary.snapshot(testing.allocator, &encoded.writer));
 
     var reader: std.Io.Reader = .fixed(encoded.written());
     var decoded = try vt.snapshot.decode(testing.allocator, testing.io, &reader, .{
@@ -215,17 +215,17 @@ test "a snapshot cut inside a sequence carries it" {
 }
 
 test "a snapshot inside a sequence too long to carry waits for it to end" {
-    const authority: *Authority = try .create(testing.allocator, testing.io, .{
+    const primary: *Primary = try .create(testing.allocator, testing.io, .{
         .cols = 10,
         .rows = 3,
         .continuation_max_bytes = 8,
     });
-    defer authority.destroy();
+    defer primary.destroy();
 
     var encoded: std.Io.Writer.Allocating = .init(testing.allocator);
     defer encoded.deinit();
-    try authority.output("\x1b]2;a long title");
-    try testing.expectError(error.ContinuationUnavailable, authority.snapshot(testing.allocator, &encoded.writer));
-    try authority.output("\x07");
-    try testing.expectEqual(2, try authority.snapshot(testing.allocator, &encoded.writer));
+    try primary.output("\x1b]2;a long title");
+    try testing.expectError(error.ContinuationUnavailable, primary.snapshot(testing.allocator, &encoded.writer));
+    try primary.output("\x07");
+    try testing.expectEqual(2, try primary.snapshot(testing.allocator, &encoded.writer));
 }

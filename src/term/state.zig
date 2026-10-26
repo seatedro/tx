@@ -1,5 +1,5 @@
-//! A canonical text dump of a Terminal's state, for checking that a mirror
-//! matches its authority.
+//! A canonical text dump of a Terminal's state, for checking that a replica
+//! matches its primary.
 //!
 //! Two terminals that will behave the same for every later byte, resize
 //! and render must dump the same text, and the dump must not depend on how
