@@ -1,6 +1,6 @@
 /*
- * A picotls crypto backend backed by Zig's std.crypto (primitives.zig), and
- * Ed25519 raw public key (RFC 7250) authentication for it.
+ * picotls crypto backend on Zig's std.crypto (primitives.zig), with Ed25519 raw
+ * public key (RFC 7250) authentication.
  */
 #ifndef TX_PICOTLS_BACKEND_H
 #define TX_PICOTLS_BACKEND_H
@@ -20,7 +20,7 @@ extern int tx_mlkem_exchanges;
 
 /* --- Ed25519 raw public keys ------------------------------------------- */
 
-/* DER SubjectPublicKeyInfo of an Ed25519 key: what RFC 7250 sends. */
+/* DER SubjectPublicKeyInfo of an Ed25519 key, the certificate sent under RFC 7250. */
 #define TX_ED25519_SPKI_LEN 44
 void tx_ed25519_spki(uint8_t out[TX_ED25519_SPKI_LEN], const uint8_t public_key[32]);
 

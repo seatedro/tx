@@ -1,17 +1,12 @@
-//! Cryptographic primitives for picotls_backend.c, from Zig's standard
-//! library.
-//!
-//! Every function is a thin C-ABI wrapper around `std.crypto`; none of them
-//! implements a primitive itself.
+//! C-ABI wrappers around `std.crypto` for picotls_backend.c.
 const std = @import("std");
 const crypto = std.crypto;
 
-/// Set by `crypto.init`. picotls asks for random bytes through a callback
-/// with no context, so the Io handle is process-global.
+/// Set by `crypto.init`.
 pub var io: ?std.Io = null;
 
-// Must match the sizes in picotls_backend.c. Software AES (used when the
-// target CPU has no AES instructions) needs about 4 KiB of key schedule.
+// Must match the sizes in picotls_backend.c. Software AES, used when the
+// target CPU has no AES instructions, needs about 4 KiB of key schedule.
 const aes_state_size = 4096;
 const hash_state_size = 128;
 const state_align = 16;

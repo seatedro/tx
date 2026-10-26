@@ -7,7 +7,6 @@ const version_num = 0x011900;
 
 const flags = &[_][]const u8{ "-std=gnu11", "-fno-sanitize=undefined" };
 
-/// The QUIC library itself.
 pub fn core(
     b: *std.Build,
     dep: *std.Build.Dependency,
@@ -40,10 +39,9 @@ pub fn core(
 pub const CryptoOptions = struct {
     /// picotls's public headers.
     picotls_include: std.Build.LazyPath,
-    /// A directory providing `picotls/openssl.h`, searched before
-    /// `picotls_include`. ngtcp2's picotls adapter names picotls's OpenSSL
-    /// backend objects directly; tx's header maps those names onto its own
-    /// backend, so the adapter compiles unmodified.
+    /// Directory containing tx's `picotls/openssl.h`, which maps the OpenSSL
+    /// backend names used by ngtcp2's picotls adapter onto tx's backend.
+    /// Searched before `picotls_include`.
     backend_include: std.Build.LazyPath,
 };
 

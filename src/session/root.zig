@@ -1,5 +1,5 @@
-//! tx's session side: programs on pseudo-terminals, each feeding a
-//! primary terminal that clients replicate.
+//! Programs on pseudo-terminals, each feeding a primary terminal that
+//! clients replicate.
 pub const pty = @import("pty.zig");
 pub const host = @import("host.zig");
 

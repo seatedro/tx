@@ -1,9 +1,8 @@
-//! Replication tests: a replica restored from a snapshot cut anywhere in a
-//! primary's output, then given the rest of the log, must reach exactly
-//! the primary's state, not just right after the restore but at every
-//! later point we look.
+//! Checks that a replica restored from a snapshot cut anywhere in a
+//! primary's output, then given the rest of the log, matches the primary
+//! right after the restore and at later checkpoints.
 //!
-//! Every random choice uses a fixed seed, so a failure reproduces.
+//! All randomness uses fixed seeds.
 const std = @import("std");
 const testing = std.testing;
 const vt = @import("ghostty-vt");
@@ -16,17 +15,17 @@ const state = @import("state.zig");
 const gpa = testing.allocator;
 const io = testing.io;
 
-/// Dumps are large and there are many of them, so they skip the
-/// leak-checking allocator, which scans every freed byte in Debug.
+/// The leak-checking allocator scans freed bytes in Debug, which is slow
+/// for the many large dumps.
 const dump_gpa = std.heap.smp_allocator;
 
-/// A script step: output from the program, or a resize from the client.
+/// Output from the program or a resize from the client.
 const Step = union(enum) {
     out: []const u8,
     resize: log.Resize,
 };
 
-/// What a cut can fall between: one byte of output, or one resize.
+/// The unit a cut falls between.
 const Atom = union(enum) {
     byte: u8,
     resize: log.Resize,
@@ -37,21 +36,19 @@ const Config = struct {
     rows: u16 = 6,
     max_scrollback_bytes: ?usize = 10_000_000,
     max_scrollback_lines: ?usize = null,
-    /// Install effect callbacks on the primary, as a host would. They
-    /// answer queries, which must not change state.
+    /// Install effect callbacks on the primary as a host would. Answering
+    /// queries must not change state.
     effects: bool = true,
-    /// Records the primary's output is split into are 1 to this many
-    /// bytes long.
+    /// Output records are 1 to `max_chunk` bytes long.
     max_chunk: usize = 24,
-    /// How many times to compare after the restore, the last at the end of
-    /// the script. The first comparison is right after the restore.
+    /// Comparisons after the one right after the restore. The last is at
+    /// the end of the script.
     checkpoints: usize = 3,
     /// Print the dumps' first difference when they diverge.
     report: bool = true,
     /// Run the primary and replica on the leak-checking allocator. It
-    /// records a stack trace for every allocation, which makes the tests
-    /// that run thousands of cuts several times slower, so those use the
-    /// plain allocator and others cover leaks.
+    /// records a stack trace per allocation, so tests that run thousands of
+    /// cuts turn it off and leave leaks to the other tests.
     leak_check: bool = true,
 
     fn allocator(config: Config) std.mem.Allocator {
@@ -135,13 +132,12 @@ fn createPrimary(config: Config) !*Primary {
     return a;
 }
 
-/// Feed `atoms` to the primary, output in randomly sized records.
+/// Output is split into records of random size up to `max_chunk`.
 fn feed(a: *Primary, atoms: []const Atom, rng: std.Random, max_chunk: usize) !void {
     var i: usize = 0;
     while (i < atoms.len) i += try feedRecord(a, atoms[i..], rng, max_chunk);
 }
 
-/// Apply every record the replica hasn't seen yet.
 fn catchUp(m: *Replica, a: *Primary) !void {
     var it = try a.log.iterator(m.next_seq);
     while (it.next()) |record| try m.apply(record);
@@ -162,8 +158,8 @@ fn restore(a: *Primary) !*Replica {
     return m;
 }
 
-/// What a terminal and its stream look like at one point: the state dump,
-/// and the unfinished sequence or null if it is too long to track.
+/// A terminal's state dump and its stream's unfinished sequence.
+/// `continuation` is null when the sequence is too long to track.
 const Expected = struct {
     dump: []u8,
     continuation: ?[]u8,
@@ -189,7 +185,7 @@ const Expected = struct {
     }
 };
 
-/// Compare the replica with what the primary looked like at `at`.
+/// `at` is the atom position of `expected`, for reports.
 fn compare(expected: Expected, m: *Replica, cut: Cut, at: usize, config: Config) !void {
     const actual: Expected = try .of(&m.terminal, &m.stream);
     defer actual.deinit();
@@ -198,7 +194,7 @@ fn compare(expected: Expected, m: *Replica, cut: Cut, at: usize, config: Config)
         return error.Diverged;
     }
     // The primary's sequence can be too long to track. The replica's
-    // can't be, since the replica only replays what fit in the snapshot.
+    // can't, because it replays what fit in the snapshot.
     const e = expected.continuation orelse return;
     if (actual.continuation == null or !std.mem.eql(u8, e, actual.continuation.?)) {
         if (config.report) std.debug.print("{s}: cut {d}, at {d}: continuations differ: \"{f}\" and \"{f}\"\n", .{
@@ -214,8 +210,8 @@ fn compare(expected: Expected, m: *Replica, cut: Cut, at: usize, config: Config)
 
 fn reportDiff(cut: Cut, at: usize, expected: []const u8, actual: []const u8) void {
     std.debug.print("{s}: cut {d} (seed {d}), compared at {d}: the replica diverged\n", .{ cut.name, cut.at, cut.seed, at });
-    // The first difference, then a few lines of each side, since a line
-    // missing from one side shifts everything after it.
+    // Prints a few lines of each side past the first difference, since a
+    // line missing from one side shifts the rest.
     var e_lines = std.mem.splitScalar(u8, expected, '\n');
     var a_lines = std.mem.splitScalar(u8, actual, '\n');
     while (true) {
@@ -231,9 +227,9 @@ fn reportDiff(cut: Cut, at: usize, expected: []const u8, actual: []const u8) voi
     }
 }
 
-/// Run one cut: feed a primary up to `cut.at`, restore a replica from
-/// its snapshot, then keep both going to the end, comparing the replica
-/// with the primary right after the restore and at each checkpoint.
+/// Feeds a primary up to `cut.at`, restores a replica from its snapshot,
+/// and feeds both to the end, comparing after the restore and at each
+/// checkpoint.
 fn checkCut(atoms: []const Atom, cut: Cut, config: Config) !void {
     var prng: std.Random.DefaultPrng = .init(cut.seed);
     const rng = prng.random();
@@ -260,8 +256,8 @@ fn checkCut(atoms: []const Atom, cut: Cut, config: Config) !void {
     }
 }
 
-/// Replay a diverged cut one atom at a time and print the first atom
-/// after which the replica differs, with the bytes leading up to it.
+/// Replays a diverged cut one atom at a time and prints the first atom
+/// after which the replica differs, with the bytes before it.
 fn findFirstDivergence(atoms: []const Atom, cut: Cut, config: Config) !void {
     var prng: std.Random.DefaultPrng = .init(cut.seed);
     const a = try createPrimary(config);
@@ -288,14 +284,13 @@ fn findFirstDivergence(atoms: []const Atom, cut: Cut, config: Config) !void {
     }
 }
 
-/// Check a cut at every atom of a script, and at every record boundary of
-/// a second run in records of random sizes.
+/// Checks a cut at each atom of a script, then at each record boundary of
+/// a second run with records of random size.
 ///
-/// Running a new primary to each of thousands of cuts is slow in Debug,
-/// so each run uses one primary, snapshots it after every record, and
-/// keeps its whole log. Each snapshot then restores a replica that applies
-/// the log from there. The replicas are compared with the state after each
-/// atom, recorded from the first run.
+/// Each run feeds one primary, snapshots it after each record, and keeps
+/// the full log. Each snapshot restores a replica that applies the log
+/// from its seq and is compared with the per-atom states recorded in the
+/// first run.
 fn checkEveryCut(name: []const u8, steps: []const Step, config: Config) !void {
     const atoms = try flatten(steps);
     defer gpa.free(atoms);
@@ -314,7 +309,7 @@ fn checkEveryCut(name: []const u8, steps: []const Step, config: Config) !void {
             for (snapshots.items) |s| a.gpa.free(s.bytes);
             snapshots.deinit(gpa);
         }
-        // Atoms consumed by the end of each record, by seq.
+        // `ends[seq]` is the atom count after record `seq`.
         var ends: std.ArrayList(usize) = .empty;
         defer ends.deinit(gpa);
 
@@ -364,8 +359,8 @@ const Snapshot = struct {
     at: usize,
 };
 
-/// Feed the primary one record from the start of `atoms`: a resize, or
-/// up to `max_chunk` bytes of output. Returns the atoms consumed.
+/// Feeds one record from the start of `atoms`, a resize or up to
+/// `max_chunk` bytes of output, and returns the number of atoms consumed.
 fn feedRecord(a: *Primary, atoms: []const Atom, rng: std.Random, max_chunk: usize) !usize {
     switch (atoms[0]) {
         .resize => |r| {
@@ -420,7 +415,7 @@ const corpora = [_]struct { []const u8, []const Step }{
         "scrolling regions and origin mode",
         out("\x1b[2;5r\x1b[?6h\x1b[1;1Htop\r\n1\r\n2\r\n3\r\n4\r\n5\r\n6" ++
             "\x1b[3;1H\x1b[2M\x1b[L\x1bM\x1bM\x1bM\x1bD\x1bE\x1b[?6l\x1b[1;1Hout\x1b[r" ++
-            // Text stays clear of the right margin: see "pending wrap at a
+            // Text stays clear of the right margin. See "pending wrap at a
             // right margin is lost".
             "\x1b[?69h\x1b[3;8s\x1b[?6h\x1b[1;1Hmar\x1b[2;1Hgin\x1b[1;2H\x1b[2@\x1b[S\x1b[1;1H\x1b[P" ++
             "\x1b[?6l\x1b[s\x1b[?69l\x1b[2;3r"),
@@ -513,7 +508,7 @@ test "a replica restored at every cut point matches the primary" {
 }
 
 test "a replica matches a primary without effect callbacks" {
-    // A read-only primary, so the effects can't be hiding anything.
+    // Without callbacks the primary's handler is the same as the replica's.
     testing.log_level = .err;
     for (corpora) |corpus| {
         const atoms = try flatten(corpus[1]);
@@ -536,16 +531,14 @@ test "only the primary answers queries" {
     try a.output(queries[1][0].out);
     try testing.expect(Effects.replies > before);
 
-    // The replica has no callbacks at all, so it can't reply or fire an
-    // effect.
     const m = try restore(a);
     defer m.destroy();
     try testing.expect(std.meta.eql(Handler.Effects.readonly, m.stream.handler.effects));
 }
 
 test "a replica loads Kitty images only from inline data" {
-    // Whatever the primary allows, on screens restored from the snapshot
-    // and on one the replica creates later.
+    // The primary allows files and temporary files. Covers screens restored
+    // from the snapshot and one the replica creates afterward.
     for ([_][]const u8{ "\x1b[?1049h\x1b[?1049l", "" }) |before| {
         const a = try createPrimary(.{});
         defer a.destroy();
@@ -574,7 +567,8 @@ test "the same bytes in different records reach the same state" {
 
         var expected: ?Expected = null;
         defer if (expected) |e| e.deinit();
-        // One record per step, records of up to 4 KiB, and random sizes.
+        // Seed 0 feeds one record per step. The others use random record
+        // sizes up to `max_chunk`.
         for ([_]usize{ 4096, 1, 3, 17, 4096 }, 0..) |max_chunk, seed| {
             var prng: std.Random.DefaultPrng = .init(seed);
             const a = try createPrimary(.{});
@@ -600,7 +594,7 @@ test "the same bytes in different records reach the same state" {
     }
 }
 
-test "a replica applies records in order only" {
+test "a replica refuses records out of order" {
     const a = try createPrimary(.{});
     defer a.destroy();
     try a.output("one");
@@ -612,8 +606,8 @@ test "a replica applies records in order only" {
 
     const before: Expected = try .of(&m.terminal, &m.stream);
     defer before.deinit();
-    // A record it already has, one past a gap, and one far ahead are all
-    // refused without touching the terminal.
+    // An applied record, a record past a gap and one far ahead are refused
+    // and leave the terminal unchanged.
     try testing.expectError(error.OutOfOrder, m.apply(try a.log.get(0)));
     try testing.expectError(error.OutOfOrder, m.apply(try a.log.get(2)));
     try testing.expectError(error.OutOfOrder, m.apply(.{ .seq = 99, .payload = .{ .output = "x" } }));
@@ -641,7 +635,7 @@ test "a replica that falls behind a trimmed log resyncs from a snapshot" {
     const m = try restore(a);
     defer m.destroy();
 
-    // More than the ring holds, so the replica's next record is dropped.
+    // Overflows the ring and drops the replica's next record.
     for (0..100) |i| {
         var buf: [32]u8 = undefined;
         try a.output(try std.fmt.bufPrint(&buf, "line {d}\r\n", .{i}));
@@ -659,7 +653,7 @@ test "a replica that falls behind a trimmed log resyncs from a snapshot" {
     try compare(expected, resynced, .{ .name = "resync", .at = 0, .seed = 0 }, 0, .{});
 }
 
-/// Random scripts mixing all of the above, cut and chunked at random.
+/// Pieces of random scripts.
 const fragments = [_][]const u8{
     "hello",
     " world ",
@@ -697,7 +691,7 @@ const fragments = [_][]const u8{
     "\x1b[4l",
     "\x1b]4;3;rgb:10/20/30\x1b\\",
     "\x1b]104\x07",
-    // Links have IDs: see "an implicit hyperlink is renumbered...".
+    // Links have IDs. See "an implicit hyperlink is renumbered...".
     "\x1b]8;id=x;https://x.example\x1b\\",
     "\x1b]8;id=k;https://k.example\x07",
     "\x1b]8;;\x1b\\",
@@ -726,8 +720,8 @@ const fragments = [_][]const u8{
     "\x1b[5b",
     "\x1b[?2027l",
     "\x1b[?2027h",
-    // Wraparound is never left off across a resize: see "a resize without
-    // reflow drops wrap flags...".
+    // Wraparound is re-enabled within the fragment so no resize happens with
+    // it off. See "a resize without reflow drops wrap flags...".
     "\x1b[?7lthe end of the line is overwritten\x1b[?7h",
     "\x1b]133;A\x07",
     "\x1b]133;C\x07",
@@ -738,13 +732,13 @@ const fragments = [_][]const u8{
     "\x1b[5 q",
     "\x1b[!p",
     "\x1b#8",
-    // Images and placements all have IDs, so the automatic ID counters
-    // never move: see "Kitty ID counters are lost with the last image".
+    // Images and placements have explicit IDs so the automatic ID counters
+    // stay put. See "Kitty ID counters are lost with the last image".
     "\x1b_Ga=T,f=32,s=1,v=1,i=3,p=1,q=2;" ++ pixel_1x1 ++ "\x1b\\",
     "\x1b_Ga=T,f=32,s=2,v=2,i=4,p=1,q=2;" ++ pixels_2x2 ++ "\x1b\\",
     "\x1b_Ga=p,i=3,p=2,c=2,r=1,q=2\x1b\\",
-    // A chunked load, finished or left in progress. A lone last chunk would
-    // be a transmission without an ID.
+    // Chunked loads, one finished and one left in progress. A lone final
+    // chunk would be a transmission without an ID.
     "\x1b_Ga=t,f=32,s=1,v=1,i=6,m=1,q=2;/wAA\x1b\\\x1b_Gm=0;/w==\x1b\\",
     "\x1b_Ga=T,f=32,s=1,v=1,i=7,p=1,m=1,q=2;/wAA\x1b\\",
     "\x1b_Ga=d,d=i,i=3,q=2\x1b\\",
@@ -753,8 +747,9 @@ const fragments = [_][]const u8{
     "\x1bc",
 };
 
-/// A random script for a terminal `cols` wide. The alternate screen is
-/// never widened: see "a resize without reflow drops wrap flags...".
+/// Appends a random script for a terminal `cols` wide to `steps`. The
+/// alternate screen is not widened. See "a resize without reflow drops wrap
+/// flags...".
 fn randomScript(rng: std.Random, cols: u16, steps: *std.ArrayList(Step)) !void {
     var width = cols;
     var alternate = false;
@@ -808,11 +803,11 @@ test "random scripts, chunkings and cut points" {
     }
 }
 
-// Known divergences: libghostty-vt limitations these tests found. Each is
-// a minimal script whose cut still diverges. Once one stops diverging, its
-// test fails, so the script can move into the corpora.
+// Known divergences caused by libghostty-vt limitations. Each test is a
+// minimal script whose cut diverges, and fails once it stops diverging.
+// Then move the script into the corpora.
 
-/// Check that a cut at `at` still diverges, then skip.
+/// Skips the test if the cut at `at` diverges and fails it otherwise.
 fn expectKnownDivergence(name: []const u8, steps: []const Step, at: usize, config: Config) !void {
     testing.log_level = .err;
     const atoms = try flatten(steps);
@@ -829,22 +824,21 @@ fn expectKnownDivergence(name: []const u8, steps: []const Step, at: usize, confi
 
 test "pending wrap at a right margin is lost" {
     // With left and right margins (DECLRMM, DECSLRM), printing up to the
-    // right margin sets pending wrap there, so the next character wraps to
-    // the next line. The snapshot decoder keeps pending wrap only in the
-    // last column (snapshot/screen.zig: "pending_wrap = ... and
-    // x == cols - 1"), so the restored cursor overwrites the margin column
-    // instead. The saved cursor has the same rule.
+    // right margin sets pending wrap there. The snapshot decoder keeps
+    // pending wrap only in the last column, for the cursor and the saved
+    // cursor (snapshot/screen.zig:431 and :844), so the replica overwrites
+    // the margin column where the primary wraps.
     const script = "\x1b[?69h\x1b[1;4s\x1b[1;1Habcd";
     try expectKnownDivergence("pending wrap at a right margin", out(script ++ "e"), script.len, .{});
 }
 
 test "Kitty ID counters are lost with the last image" {
-    // A screen's Kitty storage, including its next automatic image and
-    // placement IDs, is only in the snapshot while the screen has an image
-    // or a load in progress. Here a transmission without an ID takes the
-    // next automatic ID and then fails (too few pixels), leaving no image,
-    // so the restored replica starts its counter over and gives the next
-    // such image another ID. Deleting the last image does the same.
+    // A screen's Kitty storage, with its next automatic image and placement
+    // IDs, is encoded only while the screen has an image or a load in
+    // progress. Here a transmission without an ID takes an automatic ID and
+    // fails (too few pixels), leaving no image. The replica's counter
+    // restarts and the next such image gets a different ID. Deleting the
+    // last image has the same effect.
     const script = "\x1b_Ga=T,f=32,s=2,v=2,q=2;" ++ pixel_1x1 ++ "\x1b\\";
     try expectKnownDivergence(
         "Kitty image ID counter",
@@ -855,28 +849,26 @@ test "Kitty ID counters are lost with the last image" {
 }
 
 test "Glyph Protocol registrations are not in the snapshot" {
-    // Terminal.glyph_glossary is not encoded, so a replica restored after a
-    // registration renders the codepoint with the font instead of the
-    // registered glyph.
+    // Terminal.glyph_glossary is not encoded. A replica restored after a
+    // registration renders the codepoint from the font.
     const script = "\x1b_25a1;r;cp=e0a0;AAAAAAAAAAAAAA==\x1b\\";
     try expectKnownDivergence("glyph registration", out(script ++ "\u{E0A0}"), script.len, .{});
 }
 
 test "a Kitty drag and drop registration is not in the snapshot" {
-    // Terminal.kitty_dnd (OSC 72) is not encoded, so a replica restored
-    // after a program registered to accept drops doesn't know it does.
+    // Terminal.kitty_dnd (OSC 72) is not encoded, so a replica loses the
+    // program's registration to accept drops.
     const script = "\x1b]72;t=a;text/plain\x1b\\";
     try expectKnownDivergence("drag and drop registration", out(script ++ "x"), script.len, .{});
 }
 
 test "scrollback is pruned at different rows after a restore" {
-    // Scrollback past its limit is pruned a whole page at a time. A
-    // restored page has room for exactly the rows it holds (the snapshot
-    // PAGE header carries the used rows, not the row capacity), so after a
-    // restore the replica's later rows land on pages that start and end at
-    // other rows than the primary's, and pruning drops a different
-    // number of the oldest rows. The screen itself still matches; only the
-    // depth of history differs. Byte limits prune by page the same way.
+    // Scrollback over its limit is pruned a page at a time. The snapshot
+    // PAGE header carries a page's used rows and omits its row capacity, so
+    // a restored page has no spare rows. Later rows land on pages with
+    // different boundaries than the primary's, and pruning drops a
+    // different number of old rows. Only scrollback depth differs. Byte
+    // limits prune by page too.
     var buf: std.Io.Writer.Allocating = .init(gpa);
     defer buf.deinit();
     for (0..600) |i| try buf.writer.print("line {d} of scrollback\r\n", .{i});
@@ -891,24 +883,23 @@ test "scrollback is pruned at different rows after a restore" {
 }
 
 test "an implicit hyperlink is renumbered when the cursor changes page" {
-    // A hyperlink without an id= gets the screen's next implicit ID. When
-    // the cursor moves onto another page while such a link is open, the
-    // link is started again on the new page (Screen.cursorChangePin), which
-    // takes a new implicit ID. A restored page has room for exactly its
-    // rows, so the replica's cursor changes page on the first scroll where
-    // the primary's doesn't, and the rest of the link gets another ID.
+    // A hyperlink without id= takes the screen's next implicit ID. When the
+    // cursor moves to another page with such a link open,
+    // Screen.cursorChangePin starts the link again there with a new
+    // implicit ID. A restored page has no spare rows, so the replica's
+    // cursor changes page on the first scroll and the primary's doesn't.
     const script = "\x1b]8;;https://a.example\x1b\\";
     try expectKnownDivergence("implicit hyperlink ID", out(script ++ "\x1b[6;1Hlink\r\nmore"), script.len, .{});
 }
 
 test "a resize without reflow drops wrap flags on a restored page" {
-    // The alternate screen never reflows, and neither does the primary
-    // with wraparound off. Narrowing such a screen leaves its pages as
-    // wide as they were, and widening it back within that width keeps the
-    // rows' soft-wrap flags; widening past it moves the rows to wider
-    // pages, which drops the flags. A restored page is exactly as wide as
-    // the screen was at the cut, so after a narrowing, a restore and a
-    // widening, the replica has dropped flags that the primary kept.
+    // The alternate screen does not reflow, nor does the primary screen
+    // with wraparound off. Narrowing such a screen keeps its pages' width.
+    // Widening back within that width keeps the rows' soft-wrap flags;
+    // widening past it moves rows to wider pages and drops the flags. A
+    // restored page is as wide as the screen at the cut, so after a
+    // narrowing, a restore and a widening, the replica drops flags the
+    // primary keeps.
     const steps: []const Step = &.{
         .{ .out = "\x1b[?1049ha line that wraps on the alternate screen" },
         .{ .resize = .{ .cols = 10, .rows = 6 } },

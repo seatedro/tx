@@ -1,20 +1,15 @@
 //! A canonical text dump of a Terminal's state, for checking that a replica
 //! matches its primary.
 //!
-//! Two terminals that will behave the same for every later byte, resize
-//! and render must dump the same text, and the dump must not depend on how
-//! that state is stored. So it reads values, not representation: styles
-//! and hyperlinks are resolved out of the page that holds them and
-//! numbered by first appearance, rows are numbered from the top of the
-//! scrollback whatever pages hold them, and Kitty images are sorted by ID.
-//! Process-local stamps (image generations, dirty counters) and client
-//! presentation that no byte changes (viewport, animation clocks) are left
-//! out.
+//! Terminals in the same state produce the same dump however their pages
+//! are laid out. Styles and hyperlinks are numbered by first appearance,
+//! rows from the top of scrollback, and Kitty images are sorted by ID.
+//! Process-local stamps (image generations, dirty counters) and client-side
+//! presentation (viewport, animation clocks) are omitted.
 //!
-//! This walks the structures rather than using libghostty-vt's formatter.
-//! The formatter covers less (the active screen, no Kitty images), and its
-//! VT output isn't canonical: it tracks hyperlinks by page-local ID, so
-//! the same cells on differently split pages format differently.
+//! libghostty-vt's formatter covers only the active screen, skips Kitty
+//! images, and numbers hyperlinks per page, so the same cells split across
+//! pages differently format differently.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
@@ -27,7 +22,6 @@ const Style = vt.Style;
 
 pub const Error = Allocator.Error || Writer.Error;
 
-/// Write the dump of `t` to `w`.
 pub fn dump(gpa: Allocator, w: *Writer, t: *const Terminal) Error!void {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
@@ -35,7 +29,7 @@ pub fn dump(gpa: Allocator, w: *Writer, t: *const Terminal) Error!void {
     try d.terminal(t);
 }
 
-/// The dump of `t`, owned by the caller.
+/// Caller owns the returned memory.
 pub fn dumpAlloc(gpa: Allocator, t: *const Terminal) Error![]u8 {
     var out: Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -59,7 +53,7 @@ const Dumper = struct {
     gpa: Allocator,
     arena: Allocator,
     w: *Writer,
-    /// Every distinct style and hyperlink, numbered by first appearance.
+    /// Numbered by first appearance.
     styles: std.ArrayHashMapUnmanaged(Style, void, StyleContext, true) = .empty,
     links: std.StringArrayHashMapUnmanaged(void) = .empty,
 
@@ -67,9 +61,8 @@ const Dumper = struct {
         try d.w.print(fmt, args);
     }
 
-    /// Print any plain value field by field. Only for types without
-    /// pointers or allocated lists, whose addresses and capacities
-    /// aren't state.
+    /// For types without pointers or allocated lists. Addresses and
+    /// capacities aren't state.
     fn any(d: *Dumper, value: anytype) Error!void {
         try d.w.printValue("any", .{}, value, 16);
     }
@@ -120,7 +113,7 @@ const Dumper = struct {
     }
 
     fn flags(d: *Dumper, t: *const Terminal) Error!void {
-        // Every flag except the renderer's and search thread's dirty bits.
+        // Skips the renderer's and search thread's dirty bits.
         const f = t.flags;
         try d.print("flags", .{});
         inline for (@typeInfo(@TypeOf(f)).@"struct".field_names) |name| {
@@ -136,8 +129,8 @@ const Dumper = struct {
         try d.line("background", t.colors.background);
         try d.line("foreground", t.colors.foreground);
         try d.line("cursor_color", t.colors.cursor);
-        // The two 256-entry tables are hashed to keep the dump short; the
-        // overridden entries, which are what bytes change, are listed.
+        // The 256-entry tables are hashed to keep the dump short. Bytes
+        // change the overridden entries, which are listed.
         const palette = &t.colors.palette;
         try d.print("palette original {x} current {x} overridden", .{
             paletteHash(palette.original),
@@ -213,9 +206,9 @@ const Dumper = struct {
         try d.line("  charset", s.charset);
         try d.line("  protected_mode", s.protected_mode);
         try d.line("  kitty_keyboard", s.kitty_keyboard);
-        // Not `semantic_prompt.seen`: libghostty-vt sets it but never reads
-        // it, and the snapshot rederives it differently (a prompt cursor
-        // carried onto the alternate screen counts there).
+        // `semantic_prompt.seen` is omitted. libghostty-vt never reads it,
+        // and the snapshot rederives it differently (a prompt cursor carried
+        // onto the alternate screen sets it there).
         try d.line("  semantic_click", s.semantic_prompt.click);
         if (s.selection) |sel| {
             try d.print("  selection rectangle={} ", .{sel.rectangle});
@@ -251,7 +244,7 @@ const Dumper = struct {
     }
 
     fn row(d: *Dumper, page: *const Page, r: *vt.page.Row, y: usize) Error!void {
-        // Only rows that differ from a blank row are written.
+        // Blank rows are skipped.
         var started = false;
         if (r.wrap or r.wrap_continuation or r.semantic_prompt != .none or r.kitty_virtual_placeholder) {
             try d.print("  y{d} wrap={} cont={} prompt={t} placeholder={}", .{
@@ -375,8 +368,7 @@ const Dumper = struct {
             try d.print(" response ", .{});
             try d.any(loading.response);
             try d.print(" frame ", .{});
-            // The image generation a frame load started against is a
-            // process-local stamp, so only its command is state.
+            // The frame load's image generation is a process-local stamp.
             try d.any(if (loading.frame) |f| f.cmd else null);
             try d.w.writeByte('\n');
         }
@@ -398,7 +390,7 @@ const Dumper = struct {
             .pending => |len| try d.print(" data pending {d}", .{len}),
         }
         if (img.animation) |a| {
-            // When the shown frame last changed is the client's clock.
+            // Omits when the shown frame last changed, which is client state.
             try d.print(" animation state={t} loops={d}/{d} frame={d} root_gap={d}", .{
                 a.state,
                 a.current_loop,
@@ -422,8 +414,8 @@ fn testDump(t: *const Terminal) ![]u8 {
     return dumpAlloc(testing.allocator, t);
 }
 
-/// Each entry changes one piece of state from a terminal that has already
-/// been through `base`, and the dump must notice.
+/// Each entry changes one piece of state of a terminal that has been fed
+/// `base`.
 const changes = [_]struct { []const u8, []const u8 }{
     .{ "primary text", "x" },
     .{ "a wide character", "\u{4E2D}" },
@@ -483,7 +475,7 @@ const changes = [_]struct { []const u8, []const u8 }{
     .{ "a drag and drop registration", "\x1b]72;t=a;text/plain\x1b\\" },
 };
 
-test "the dump changes with every piece of state" {
+test "each state change shows in the dump" {
     testing.log_level = .err;
     const base = "ab\r\n";
     var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 20, .rows = 5 });
@@ -510,7 +502,7 @@ test "the dump changes with every piece of state" {
     }
 }
 
-test "the dump changes with a resize and pixel size" {
+test "a resize and a cell pixel size show in the dump" {
     var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 20, .rows = 5 });
     defer t.deinit(testing.allocator);
     const before = try testDump(&t);
@@ -527,9 +519,9 @@ test "the dump changes with a resize and pixel size" {
     try testing.expect(!std.mem.eql(u8, pixels, cols));
 }
 
-test "the dump ignores how state is stored" {
-    // The same text through different paths: a print, and an erase and
-    // reprint that leaves a freed style and hyperlink behind in the page.
+test "freed styles and hyperlinks in a page don't show in the dump" {
+    // `b` erases and reprints the row, leaving a freed style and hyperlink
+    // in the page.
     var a: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 20, .rows = 5 });
     defer a.deinit(testing.allocator);
     var a_stream = a.vtStream();
