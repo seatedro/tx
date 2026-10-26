@@ -104,7 +104,7 @@ const Login = struct {
     fn clientOptions(l: *Login, st: *const ServerThread, pty: *const TestPty, keys: []const auth.Key) client.session.Options {
         for (keys, 0..) |key, i| l.identities[i] = .{ .key = .fromEd25519(key), .source = .agent };
         return .{
-            .server = st.server.address(),
+            .servers = &st.addresses,
             .host_keys = &st.host_keys,
             .user = test_user,
             .agent = l.agent_path,
@@ -133,6 +133,8 @@ const ServerThread = struct {
     stopping: bool = false,
     /// The server's public key, for clients to accept.
     host_keys: [1][32]u8 = undefined,
+    /// The server's address, for clients to connect to.
+    addresses: [1]Io.net.IpAddress = undefined,
 
     const Request = struct {
         run: *const fn (req: *Request, st: *ServerThread) void,
@@ -143,6 +145,7 @@ const ServerThread = struct {
         st.* = .{ .loop = try .init(.{}), .server = undefined, .wake = try .init() };
         try st.server.init(gpa, testing.io, &st.loop, options);
         st.host_keys = .{options.identity.public_key.toBytes()};
+        st.addresses = .{st.server.address()};
         st.wake.wait(&st.loop, &st.wake_c, ServerThread, st, onWake);
         st.thread = try std.Thread.spawn(.{}, run, .{st});
     }
@@ -381,6 +384,59 @@ test "a client accepting another server key is refused" {
     try ct.start();
     const outcome = try ct.join(&pty);
     try testing.expectEqual(st.host_keys[0], outcome.host_key_refused);
+}
+
+test "a client tries the next address when the first doesn't answer" {
+    transport.crypto.init(testing.io);
+    var environ = try testEnviron();
+    defer environ.deinit();
+    var login: Login = undefined;
+    try login.init(null);
+    defer login.deinit();
+    var st: ServerThread = undefined;
+    try st.init(try login.serverOptions(&environ, &.{ "/bin/sh", "-c", "printf 'ready\\r\\n'" }));
+    defer st.deinit();
+
+    // The server listens on 127.0.0.1 only. Nothing answers on ::1.
+    const port = st.server.address().getPort();
+    const servers = [_]Io.net.IpAddress{ try .parseIp6("::1", port), st.server.address() };
+
+    var pty: TestPty = try .open();
+    defer pty.close();
+    var ct: ClientThread = .{ .options = login.clientOptions(&st, &pty, &.{login.key.public_key.toBytes()}) };
+    ct.options.servers = &servers;
+    const start = nowMs();
+    try ct.start();
+    const outcome = try ct.join(&pty);
+    try testing.expectEqual(0, outcome.exited.status);
+
+    // The second attempt starts 250 ms after the first, long before the
+    // first times out.
+    try testing.expect(nowMs() - start < 5000);
+}
+
+test "a client whose addresses all fail reports the failure" {
+    transport.crypto.init(testing.io);
+    var environ: std.process.Environ.Map = .init(gpa);
+    defer environ.deinit();
+    var login: Login = undefined;
+    try login.init(null);
+    defer login.deinit();
+    var st: ServerThread = undefined;
+    try st.init(try login.serverOptions(&environ, &.{ "/bin/sh", "-c", "sleep 10" }));
+    defer st.deinit();
+
+    // Ports nothing listens on.
+    const servers = [_]Io.net.IpAddress{ try .parseIp6("::1", 9), try .parseIp4("127.0.0.1", 9) };
+
+    var pty: TestPty = try .open();
+    defer pty.close();
+    var ct: ClientThread = .{ .options = login.clientOptions(&st, &pty, &.{login.key.public_key.toBytes()}) };
+    ct.options.servers = &servers;
+    ct.options.idle_timeout_ns = std.time.ns_per_s;
+    try ct.start();
+    const outcome = try ct.join(&pty);
+    try testing.expectEqual(transport.endpoint.CloseReason.idle_timeout, outcome.disconnected);
 }
 
 test "the agent's keys are probed in order and only the accepted one signs" {

@@ -79,7 +79,8 @@ pub fn main(init: std.process.Init) !u8 {
     const login_user = user orelse paths.userName(environ) orelse return fail("can't tell the local user name; use -l", .{});
     if (login_user.len == 0 or login_user.len > auth.login.max_user_len) return fail("invalid user name", .{});
 
-    const address = resolve(io, host, port) catch |err| return fail("can't resolve {s}: {t}", .{ host, err });
+    var address_buf: [max_addresses]IpAddress = undefined;
+    const addresses = resolve(io, host, port, &address_buf) catch |err| return fail("can't resolve {s}: {t}", .{ host, err });
 
     // The keys, before the network: without one there's no login.
     const agent_path = environ.get("SSH_AUTH_SOCK");
@@ -96,7 +97,7 @@ pub fn main(init: std.process.Init) !u8 {
     const known_name = auth.known_hosts.hostName(&name_buf, host, port, default_port) catch return fail("host name too long", .{});
     const tx_known_hosts = try paths.config(gpa, environ, "known_hosts");
     defer gpa.free(tx_known_hosts);
-    const host_keys = trustedKeys(gpa, io, environ, tx_known_hosts, known_name, address, .{
+    const host_keys = trustedKeys(gpa, io, environ, tx_known_hosts, known_name, addresses, .{
         .ssh = ssh_path,
         .destination = ssh_destination,
         .server_command = server_command,
@@ -107,7 +108,7 @@ pub fn main(init: std.process.Init) !u8 {
     defer gpa.free(host_keys);
 
     const outcome = client.session.run(gpa, io, .{
-        .server = address,
+        .servers = addresses,
         .host_keys = host_keys,
         .user = login_user,
         .agent = agent_path,
@@ -144,22 +145,42 @@ pub fn main(init: std.process.Init) !u8 {
     }
 }
 
-/// The first address `host` resolves to.
-fn resolve(io: Io, host: []const u8, port: u16) !IpAddress {
-    if (IpAddress.parse(host, port)) |address| return address else |_| {}
+/// The most addresses of a host tx tries.
+const max_addresses = 8;
+
+/// The addresses `host` resolves to, in the order to try them: the
+/// resolver's order, with the two families alternating.
+fn resolve(io: Io, host: []const u8, port: u16, out: *[max_addresses]IpAddress) ![]IpAddress {
+    if (IpAddress.parse(host, port)) |address| {
+        out[0] = address;
+        return out[0..1];
+    } else |_| {}
 
     const name: Io.net.HostName = try .init(host);
     // With room for 16 results, the lookup doesn't block on the queue.
     var buf: [16]Io.net.HostName.LookupResult = undefined;
     var results: Io.Queue(Io.net.HostName.LookupResult) = .init(&buf);
     try name.lookup(io, &results, .{ .port = port });
+
+    // The resolver can list an address more than once.
+    var found: [max_addresses]IpAddress = undefined;
+    var n: usize = 0;
     while (results.getOne(io)) |result| switch (result) {
-        .address => |address| return address,
+        .address => |address| {
+            for (found[0..n]) |f| {
+                if (std.meta.eql(f, address)) break;
+            } else if (n < found.len) {
+                found[n] = address;
+                n += 1;
+            }
+        },
         .canonical_name => {},
     } else |err| switch (err) {
-        error.Closed => return error.UnknownHostName,
+        error.Closed => {},
         error.Canceled => |e| return e,
     }
+    if (n == 0) return error.UnknownHostName;
+    return client.connect.interleave(out, found[0..n]);
 }
 
 const Identities = struct {
@@ -295,7 +316,7 @@ fn trustedKeys(
     environ: *const std.process.Environ.Map,
     tx_known_hosts: []const u8,
     name: []const u8,
-    address: IpAddress,
+    addresses: []const IpAddress,
     ssh: SshSource,
 ) ![]auth.Key {
     var known: auth.known_hosts.Known = .{};
@@ -327,19 +348,20 @@ fn trustedKeys(
     }
 
     // Otherwise the server's own word, checked by the user.
-    const key = switch (try client.scan.hostKey(gpa, io, address, 10 * std.time.ns_per_s)) {
-        .key => |key| key,
+    const found = switch (try client.scan.hostKey(gpa, io, addresses, 10 * std.time.ns_per_s)) {
+        .found => |found| found,
         .failed => |reason| {
             std.debug.print("tx: can't reach {s}: {t}\n", .{ name, reason });
             return error.Declined;
         },
     };
+    const key = found.key;
     if (known.isRevoked(key)) {
         std.debug.print("tx: {s} presented a revoked key, {s}\n", .{ name, auth.Fingerprint.init(key).slice() });
         return error.Declined;
     }
 
-    if (!try confirm(io, name, address, key)) {
+    if (!try confirm(io, name, found.address, key)) {
         std.debug.print("tx: host key verification failed\n", .{});
         return error.Declined;
     }
