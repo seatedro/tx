@@ -8,7 +8,8 @@
 //! it. If that fails, tx asks, as ssh does. The key is added to the first
 //! file.
 //!
-//! The login uses the SSH agent's Ed25519 keys, then `~/.ssh/id_ed25519`.
+//! The login uses the SSH agent's Ed25519 and RSA keys, then
+//! `~/.ssh/id_ed25519`.
 //!
 //! Exits with the program's exit status, or 255 for tx's own failures, as
 //! ssh does.
@@ -84,7 +85,7 @@ pub fn main(init: std.process.Init) !u8 {
     const agent_path = environ.get("SSH_AUTH_SOCK");
     var identities = try findIdentities(gpa, io, environ, agent_path);
     defer identities.deinit(gpa);
-    if (identities.list.items.len == 0) return fail("no keys to log in with: the SSH agent has no Ed25519 keys, and there is no ~/.ssh/id_ed25519", .{});
+    if (identities.list.items.len == 0) return fail("no keys to log in with: the SSH agent has no Ed25519 or RSA keys, and there is no ~/.ssh/id_ed25519", .{});
 
     // ssh logs in to the same account, unless its config says otherwise.
     var ssh_buf: [512]u8 = undefined;
@@ -172,8 +173,8 @@ const Identities = struct {
         ids.list.deinit(gpa);
     }
 
-    fn has(ids: *const Identities, key: auth.Key) bool {
-        for (ids.list.items) |id| if (std.mem.eql(u8, &id.key, &key)) return true;
+    fn has(ids: *const Identities, key: *const auth.ssh.PublicKey) bool {
+        for (ids.list.items) |*id| if (id.key.eql(key)) return true;
         return false;
     }
 };
@@ -197,7 +198,8 @@ fn findIdentities(gpa: Allocator, io: Io, environ: *const std.process.Environ.Ma
         };
         defer agent_ids.deinit(gpa);
         for (agent_ids.blobs) |blob| {
-            const key = auth.ssh.parseKeyBlob(blob) catch continue;
+            // Types tx doesn't verify, such as ECDSA, are left out.
+            const key = auth.ssh.PublicKey.parse(blob) catch continue;
             try ids.list.append(gpa, .{ .key = key, .source = .agent });
         }
     }
@@ -211,7 +213,7 @@ fn findIdentities(gpa: Allocator, io: Io, environ: *const std.process.Environ.Ma
         };
 
         // The agent may hold the same key.
-        if (ids.has(key)) {
+        if (ids.has(&key)) {
             gpa.free(path);
             continue;
         }
@@ -230,7 +232,7 @@ fn findIdentities(gpa: Allocator, io: Io, environ: *const std.process.Environ.Ma
     return ids;
 }
 
-fn keyFilePublicKey(gpa: Allocator, io: Io, path: []const u8) !auth.Key {
+fn keyFilePublicKey(gpa: Allocator, io: Io, path: []const u8) !auth.ssh.PublicKey {
     const text = try Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 << 10));
     defer {
         std.crypto.secureZero(u8, text);
@@ -238,7 +240,7 @@ fn keyFilePublicKey(gpa: Allocator, io: Io, path: []const u8) !auth.Key {
     }
     var file = try auth.private_key.PrivateKeyFile.parse(gpa, text);
     defer file.deinit(gpa);
-    return file.public_key;
+    return .fromEd25519(file.public_key);
 }
 
 /// Where to read the host key over ssh.

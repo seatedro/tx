@@ -358,10 +358,10 @@ pub const Server = struct {
     fn accepts(self: *Server, user: []const u8, key_blob: []const u8) bool {
         if (!std.mem.eql(u8, user, self.options.user)) return false;
 
-        // Only Ed25519 keys for now.
-        const key = auth.ssh.parseKeyBlob(key_blob) catch return false;
+        // Ed25519 and RSA keys.
+        const key = auth.ssh.PublicKey.parse(key_blob) catch return false;
 
-        const match = auth.authorized_keys.check(self.io, self.gpa, self.options.authorized_keys, key) catch |err| {
+        const match = auth.authorized_keys.check(self.io, self.gpa, self.options.authorized_keys, &key) catch |err| {
             log.warn("reading authorized_keys failed: {t}", .{err});
             return false;
         };
@@ -369,7 +369,7 @@ pub const Server = struct {
             .allowed => true,
             .absent => false,
             .restricted => {
-                log.info("refused key {s}: its authorized_keys line has options, which tx doesn't implement yet", .{auth.Fingerprint.init(key).slice()});
+                log.info("refused key {s}: its authorized_keys line has options, which tx doesn't implement yet", .{auth.Fingerprint.ofBlob(key.blob()).slice()});
                 return false;
             },
         };
@@ -503,7 +503,8 @@ const Client = struct {
 
         // `accepts` checked the user name and the key's type.
         if (!server.accepts(m.user, m.key)) return client.fail(.auth, "login refused");
-        const key = auth.ssh.parseKeyBlob(m.key) catch unreachable;
+        const key = auth.ssh.PublicKey.parse(m.key) catch unreachable;
+        const fingerprint = auth.Fingerprint.ofBlob(key.blob());
 
         // The transcript as the server sees the connection. A signature
         // made for another connection or server doesn't match it.
@@ -516,12 +517,12 @@ const Client = struct {
         };
         client.conn.quic.exportSecret(&transcript.exporter, auth.login.exporter_label);
 
-        transcript.verify(key, m.signature) catch {
-            log.info("bad signature from {f} for {s} with key {s}", .{ client.conn.remote, m.user, auth.Fingerprint.init(key).slice() });
+        transcript.verify(&key, m.signature) catch {
+            log.info("bad signature from {f} for {s} with key {s}", .{ client.conn.remote, m.user, fingerprint.slice() });
             return client.fail(.auth, "login refused");
         };
 
-        log.info("{f} logged in as {s} with key {s}", .{ client.conn.remote, m.user, auth.Fingerprint.init(key).slice() });
+        log.info("{f} logged in as {s} with key {s}", .{ client.conn.remote, m.user, fingerprint.slice() });
         client.logged_in = true;
         client.decoder.max_body_len = max_message;
         client.send(.{ .auth_ok = .{} });
