@@ -55,6 +55,28 @@ pub fn build(b: *std.Build) void {
         .root_module = termModule(b, target, optimize, ghostty_vt),
     });
     addTestRuns(b, term_tests, test_step, test_network_step);
+
+    const session_tests = b.addTest(.{
+        .name = "session-test",
+        .root_module = sessionModule(b, target, optimize, termModule(b, target, optimize, ghostty_vt)),
+    });
+    addTestRuns(b, session_tests, test_step, test_network_step);
+}
+
+fn sessionModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    term: *std.Build.Module,
+) *std.Build.Module {
+    const mod = b.createModule(.{
+        .root_source_file = b.path("src/session/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    mod.addImport("term", term);
+    return mod;
 }
 
 fn termModule(
