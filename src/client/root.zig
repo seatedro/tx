@@ -3,6 +3,7 @@ pub const tty = @import("tty.zig");
 pub const escape = @import("escape.zig");
 pub const session = @import("session.zig");
 pub const scan = @import("scan.zig");
+pub const connect = @import("connect.zig");
 pub const passphrase = @import("passphrase.zig");
 
 pub const RawMode = tty.RawMode;
@@ -16,6 +17,7 @@ test {
     _ = escape;
     _ = session;
     _ = scan;
+    _ = connect;
     _ = passphrase;
     // Analyzes the transport and crypto modules, whose exports the linked
     // C code needs.
