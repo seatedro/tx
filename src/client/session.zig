@@ -1,5 +1,11 @@
 //! The `tx` client's connection to one session.
 //!
+//! After the handshake, the client logs in with a key from the SSH agent:
+//! it probes the keys in turn, and signs the login transcript with the
+//! first one the server accepts. Signing runs on its own thread, since the
+//! agent may wait for the user to approve it. The signature and `Attach`
+//! go out together.
+//!
 //! Like the ssh client, it writes the session's output to the user's
 //! terminal unchanged and forwards what the user types. Output written to
 //! the terminal is acknowledged to QUIC flow control only while the
@@ -13,6 +19,7 @@ const posix = std.posix;
 const xev = @import("xev");
 const transport = @import("transport");
 const proto = @import("proto");
+const auth = @import("auth");
 const tty = @import("tty.zig");
 const escape = @import("escape.zig");
 
@@ -25,8 +32,16 @@ const log = std.log.scoped(.client);
 
 pub const Options = struct {
     server: IpAddress,
-    /// The server's Ed25519 public key.
-    pinned: [32]u8,
+    /// The server keys the client accepts.
+    host_keys: []const [32]u8,
+    /// The account to log in as.
+    user: []const u8,
+    /// The SSH agent's socket.
+    agent: []const u8,
+    /// The agent's Ed25519 keys, probed in order. At least one.
+    keys: []const auth.Key,
+    /// Print the session's ID once attached.
+    show_session_id: bool = false,
     /// Null starts a new session.
     session_id: ?u64 = null,
     /// The user's terminal.
@@ -48,6 +63,8 @@ pub const Outcome = union(enum) {
     detached: ?u64,
     /// The connection closed before the session ended.
     disconnected: CloseReason,
+    /// The server presented a key that isn't in `Options.host_keys`.
+    host_key_refused: [32]u8,
     /// The server answered with `proto.Error`.
     refused: Refusal,
 
@@ -62,11 +79,13 @@ pub const Outcome = union(enum) {
     };
 
     pub const Name = struct {
-        buf: [256]u8 = undefined,
+        buf: [max_len]u8 = undefined,
         len: usize = 0,
 
+        pub const max_len = 256;
+
         fn init(text: []const u8) Name {
-            var name: Name = .{ .len = @min(text.len, 256) };
+            var name: Name = .{ .len = @min(text.len, max_len) };
             @memcpy(name.buf[0..name.len], text[0..name.len]);
             return name;
         }
@@ -95,6 +114,7 @@ const max_message = 1 << 20;
 /// Runs one session until it exits or detaches. The user's terminal is in
 /// raw mode for the duration.
 pub fn run(gpa: Allocator, io: Io, options: Options) !Outcome {
+    std.debug.assert(options.keys.len > 0);
     transport.crypto.init(io);
 
     const raw: tty.RawMode = try .enter(options.in_fd);
@@ -147,7 +167,19 @@ const Run = struct {
     session_id: ?u64 = null,
     /// Input typed before the server confirmed the attach.
     early_input: std.ArrayList(u8) = .empty,
+    /// The key in `options.keys` being probed or signed with.
+    key_index: usize = 0,
+    /// Set while the agent signs.
+    signer: ?Signer = null,
     outcome: ?Outcome = null,
+
+    /// The agent connection and request of a signature in progress.
+    const Signer = struct {
+        agent: auth.Agent,
+        thread: std.Thread,
+        key_blob: [auth.ssh.key_blob_len]u8,
+        data: auth.sshsig.SignedData,
+    };
 
     /// What the reader, writer and signal threads pass to the loop thread.
     const Inbox = struct {
@@ -158,6 +190,8 @@ const Run = struct {
         input_ended: bool = false,
         below_low_water: bool = false,
         output_failed: bool = false,
+        /// The agent's signature blob, owned, or why it gave none.
+        signature: ?(auth.agent.Error![]u8) = null,
     };
 
     fn init(r: *Run, gpa: Allocator, io: Io, loop: *xev.Loop, options: Options, raw: *const tty.RawMode) !void {
@@ -167,7 +201,7 @@ const Run = struct {
             .loop = loop,
             .options = options,
             .size = terminalSize(options),
-            .tls = try .init(options.pinned),
+            .tls = try .init(.{ .keys = options.host_keys }),
             .endpoint = undefined,
             .decoder = .init(gpa, max_message),
             .escape = .{ .char = options.escape_char },
@@ -218,6 +252,14 @@ const Run = struct {
         r.reader.stop();
         r.signals.stop();
         r.writer.stop(.drain);
+
+        // Shutting the agent socket down ends a sign request the user
+        // hasn't answered.
+        if (r.signer) |*signer| {
+            signer.agent.stream.shutdown(r.io, .both) catch {};
+            r.finishSigning();
+        }
+        if (r.inbox.signature) |result| if (result) |sig| r.gpa.free(sig) else |_| {};
 
         // Stop the endpoint, then run the loop until its completions finish.
         r.endpoint.stop();
@@ -274,7 +316,8 @@ const Run = struct {
         const r = fromCtx(ctx);
         r.stream = conn.openStream(.bidi) catch return r.finish(.{ .disconnected = .failed });
 
-        // Hello and Attach go together. The server answers both, in order.
+        // Hello and the first probe go together. The server answers both,
+        // in order.
         const cell_w, const cell_h = cellSize(r.size);
         r.send(.{ .hello = .{
             .revision = proto.revision,
@@ -285,7 +328,97 @@ const Run = struct {
             .cell_width_px = cell_w,
             .cell_height_px = cell_h,
         } });
+        r.probe();
+    }
+
+    /// Asks whether the server accepts the current key.
+    fn probe(r: *Run) void {
+        const blob = auth.ssh.keyBlob(r.options.keys[r.key_index]);
+        r.send(.{ .auth_probe = .{ .user = r.options.user, .key = &blob } });
+    }
+
+    fn onProbeReply(r: *Run, m: proto.AuthProbeReply) void {
+        const blob = auth.ssh.keyBlob(r.options.keys[r.key_index]);
+        if (r.signer != null or !std.mem.eql(u8, m.key, &blob)) return r.refuse("unexpected probe reply");
+
+        if (m.accepted) return r.startSigning();
+
+        r.key_index += 1;
+        if (r.key_index == r.options.keys.len) {
+            // `Name` truncates a message longer than it holds.
+            var buf: [512]u8 = undefined;
+            return r.refuse(std.fmt.bufPrint(&buf, "the server accepted none of the agent's keys for {s}", .{r.options.user}) catch unreachable);
+        }
+        r.probe();
+    }
+
+    /// Starts the agent signing the transcript with the current key.
+    fn startSigning(r: *Run) void {
+        const conn = r.conn orelse return;
+
+        // The transcript as this end sees the connection.
+        var transcript: auth.login.Transcript = .{
+            .exporter = undefined,
+            .host_key = r.tls.presentedKey().?,
+            .user = r.options.user,
+            .alpn = transport.quic.alpn,
+            .revision = proto.revision,
+        };
+        conn.quic.exportSecret(&transcript.exporter, auth.login.exporter_label);
+
+        const agent: auth.Agent = auth.Agent.connect(r.io, r.options.agent) catch return r.refuse("can't connect to the SSH agent");
+        r.signer = .{
+            .agent = agent,
+            .thread = undefined,
+            .key_blob = auth.ssh.keyBlob(r.options.keys[r.key_index]),
+            .data = transcript.signedData(),
+        };
+        r.signer.?.thread = std.Thread.spawn(.{}, signMain, .{r}) catch {
+            r.signer.?.agent.close();
+            r.signer = null;
+            return r.finish(.{ .disconnected = .failed });
+        };
+    }
+
+    /// Runs on the signer's thread.
+    fn signMain(r: *Run) void {
+        const signer = &r.signer.?;
+        const result = signer.agent.sign(r.gpa, &signer.key_blob, signer.data.slice());
+        {
+            r.inbox.mutex.lockUncancelable(r.io);
+            defer r.inbox.mutex.unlock(r.io);
+            r.inbox.signature = result;
+        }
+        r.wake.notify() catch {};
+    }
+
+    /// Joins the signer's thread, which has finished or is about to.
+    fn finishSigning(r: *Run) void {
+        const signer = &r.signer.?;
+        signer.thread.join();
+        signer.agent.close();
+        r.signer = null;
+    }
+
+    /// Sends the signature and the attach together. The server attaches
+    /// only if the login succeeds.
+    fn onSignature(r: *Run, result: auth.agent.Error![]u8) void {
+        const key_blob = r.signer.?.key_blob;
+        r.finishSigning();
+
+        const sig = result catch |err| return r.refuse(switch (err) {
+            error.Refused => "the SSH agent refused to sign",
+            else => "the SSH agent failed",
+        });
+        defer r.gpa.free(sig);
+
+        r.send(.{ .auth_signature = .{ .user = r.options.user, .key = &key_blob, .signature = sig } });
         r.send(.{ .attach = .{ .session_id = r.options.session_id } });
+    }
+
+    /// Ends the run for a reason of the client's own, with code 0.
+    fn refuse(r: *Run, message: []const u8) void {
+        r.finish(.{ .refused = .{ .code = 0, .message = .init(message) } });
     }
 
     fn onData(ctx: ?*anyopaque, stream: *Stream, bytes: []const u8, fin: bool) void {
@@ -307,11 +440,18 @@ const Run = struct {
 
     fn handle(r: *Run, message: proto.Message) void {
         switch (message) {
-            .hello_reply => |m| if (m.revision != proto.revision) r.finish(.{ .refused = .{ .code = 0, .message = .init("the server speaks another protocol revision") } }),
+            .hello_reply => |m| if (m.revision != proto.revision) r.refuse("the server speaks another protocol revision"),
+            .auth_probe_reply => |m| r.onProbeReply(m),
+            .auth_ok => {},
             // Input typed before this was held, since the server had no
             // session to give it to.
             .attached => |m| {
                 r.session_id = m.session_id;
+                if (r.options.show_session_id) {
+                    var buf: [64]u8 = undefined;
+                    const line = std.fmt.bufPrint(&buf, "tx: session {d}\r\n", .{m.session_id}) catch unreachable;
+                    r.writer.write(line) catch {};
+                }
                 if (r.early_input.items.len > 0) r.send(.{ .input = .{ .bytes = r.early_input.items } });
                 r.early_input.clearAndFree(r.gpa);
             },
@@ -338,7 +478,15 @@ const Run = struct {
             r.conn = null;
             r.stream = null;
         }
-        if (r.outcome == null) r.outcome = .{ .disconnected = reason };
+        if (r.outcome != null) return;
+
+        // A refused key fails the handshake after the server presented it.
+        if (reason == .handshake_failed) if (r.tls.presentedKey()) |key| {
+            for (r.options.host_keys) |k| {
+                if (std.mem.eql(u8, &k, &key)) break;
+            } else return r.finish(.{ .host_key_refused = key });
+        };
+        r.outcome = .{ .disconnected = reason };
     }
 
     // The next three run on the reader, writer and signal threads. Each
@@ -393,12 +541,15 @@ const Run = struct {
         // lock. Notifications may have been coalesced.
         var input: std.ArrayList(u8) = .empty;
         defer input.deinit(r.gpa);
+        var signature: ?(auth.agent.Error![]u8) = null;
         const resize, const terminate, const input_ended, const below_low_water, const output_failed = taken: {
             r.inbox.mutex.lockUncancelable(r.io);
             defer r.inbox.mutex.unlock(r.io);
             const box = &r.inbox;
             input = box.input;
             box.input = .empty;
+            signature = box.signature;
+            box.signature = null;
             defer {
                 box.resize = null;
                 box.terminate = false;
@@ -408,6 +559,8 @@ const Run = struct {
             }
             break :taken .{ box.resize, box.terminate, box.input_ended, box.below_low_water, box.output_failed };
         };
+
+        if (signature) |sig| r.onSignature(sig);
 
         r.forwardInput(input.items);
 

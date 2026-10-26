@@ -1,20 +1,8 @@
 //! The server's Ed25519 identity, stored as its 32-byte seed in a file
 //! readable only by its owner.
-//!
-//! Revision 0 has no known_hosts: a client on the same machine reads the
-//! server's public key from this file. Remote hosts need the user
-//! authentication and host key checks that come next.
 const std = @import("std");
-const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Ed25519 = std.crypto.sign.Ed25519;
-
-/// `$XDG_STATE_HOME/tx/host_key`, or `~/.local/state/tx/host_key`.
-pub fn defaultPath(gpa: Allocator, environ: *const std.process.Environ.Map) ![]u8 {
-    if (environ.get("XDG_STATE_HOME")) |state| return std.fs.path.join(gpa, &.{ state, "tx", "host_key" });
-    const home = environ.get("HOME") orelse return error.NoHome;
-    return std.fs.path.join(gpa, &.{ home, ".local", "state", "tx", "host_key" });
-}
 
 pub fn load(io: Io, path: []const u8) !Ed25519.KeyPair {
     // The seed is the secret: wiped once the key pair is derived.

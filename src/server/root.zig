@@ -1,10 +1,17 @@
 //! tx-session's server: QUIC connections attached to sessions.
 //!
-//! A client opens one bidirectional stream and sends `Hello`, then `Attach`.
-//! The server answers with `HelloReply` and `Attached`, then streams the
-//! session's output records and applies the client's `Input` and `Resize`.
+//! A client opens one bidirectional stream and sends `Hello`, then logs in:
+//! `AuthProbe` for each key it might sign with, and `AuthSignature` with
+//! one the server accepts. Keys come from `authorized_keys`, for the
+//! server's own user only. Once logged in, the client sends `Attach`. The
+//! server answers with `HelloReply`, `AuthProbeReply`, `AuthOk` and
+//! `Attached`, then streams the session's output records and applies the
+//! client's `Input` and `Resize`.
 //! A connection that closes leaves its session running, detached. A
 //! session ends when its program exits; the attached client gets `Exit`.
+//!
+//! Listening on a wildcard address binds each address it covers, and
+//! follows addresses as they come and go (see `addresses`).
 //!
 //! Revision 0 replays a session's log from seq 0 on attach, so a session
 //! whose log has been trimmed can't be reattached yet.
@@ -18,6 +25,8 @@ const transport = @import("transport");
 const proto = @import("proto");
 const session = @import("session");
 const term = @import("term");
+const auth = @import("auth");
+const addresses = @import("addresses.zig");
 
 const Endpoint = transport.endpoint.Endpoint;
 const Conn = transport.endpoint.Conn;
@@ -29,6 +38,11 @@ const log = std.log.scoped(.server);
 pub const Options = struct {
     listen: IpAddress,
     identity: Ed25519.KeyPair,
+    /// The account clients log in as. No other user name is accepted.
+    user: []const u8,
+    /// `authorized_keys` files. The first one that exists is read, at each
+    /// login attempt.
+    authorized_keys: []const []const u8,
     /// The environment of new sessions. `TERM` and `COLORTERM` come from the
     /// client.
     environ: *const std.process.Environ.Map,
@@ -46,6 +60,8 @@ pub const ErrorCode = enum(u32) {
     no_session = 3,
     log_trimmed = 4,
     spawn = 5,
+    /// The login failed. The message doesn't say why.
+    auth = 6,
 };
 
 /// Output buffered on a stream above which the server stops reading the
@@ -55,6 +71,14 @@ const low_water = 256 << 10;
 
 /// The longest message body accepted from a client.
 const max_message = 1 << 20;
+
+/// The longest message body accepted before login. Login messages carry
+/// a user name, a key and a signature.
+const max_login_message = 16 << 10;
+
+/// Probes and signatures a client may send before the server gives up, as
+/// sshd's MaxAuthTries.
+const max_login_attempts = 6;
 
 /// Bounds on a client's terminal size. libghostty-vt asserts on zero, and
 /// the size sets how much memory the primary terminal allocates.
@@ -71,15 +95,36 @@ fn boundedSize(cols: u16, rows: u16, cell: ?term.log.Resize.CellSize) ?term.log.
 /// still running then are killed by `Server.deinit`.
 const stop_grace_ms = 1000;
 
+/// How often a server listening on a wildcard address looks for addresses
+/// that came or went.
+const rescan_ms = 5000;
+
 pub const Server = struct {
     gpa: Allocator,
     io: Io,
     loop: *xev.Loop,
     options: Options,
     tls: transport.quic.Server,
-    endpoint: Endpoint,
+    /// One per address listened on. They don't move.
+    endpoints: std.ArrayList(*Endpoint) = .empty,
+    /// Endpoints whose address went away, freed once stopped.
+    retired: std.ArrayList(*Endpoint) = .empty,
+    /// Set when `Options.listen` is a wildcard address.
+    rescan: ?Rescan = null,
+    stopping: bool = false,
     sessions: std.AutoArrayHashMapUnmanaged(u64, *Session) = .empty,
     next_id: u64 = 1,
+
+    const Rescan = struct {
+        /// `Options.listen`, with the port the first bind got if it asked
+        /// for 0.
+        wildcard: IpAddress,
+        /// Loopback addresses for the host name, found once at startup.
+        host_loopback: []IpAddress,
+        timer: xev.Timer,
+        c: xev.Completion = .{},
+        cancel_c: xev.Completion = .{},
+    };
 
     /// The server must not move while the loop runs.
     pub fn init(self: *Server, gpa: Allocator, io: Io, loop: *xev.Loop, options: Options) !void {
@@ -89,13 +134,66 @@ pub const Server = struct {
             .loop = loop,
             .options = options,
             .tls = try .init(options.identity),
-            .endpoint = undefined,
         };
-        errdefer self.tls.deinit();
-        try self.endpoint.init(gpa, io, loop, .{
-            .local = options.listen,
+        errdefer self.deinit();
+
+        if (!addresses.isWildcard(options.listen)) {
+            _ = try self.listen(options.listen);
+            return;
+        }
+
+        // A wildcard: each address it covers, and again as they change.
+        self.rescan = .{
+            .wildcard = options.listen,
+            .host_loopback = try addresses.hostLoopback(gpa, io, options.listen),
+            .timer = try .init(),
+        };
+        try self.updateAddresses(.initial);
+        if (self.endpoints.items.len == 0) return error.NoAddresses;
+        self.rescan.?.timer.run(loop, &self.rescan.?.c, rescan_ms, Server, self, onRescan);
+    }
+
+    /// The first bound address, with the port the kernel picked.
+    pub fn address(self: *const Server) IpAddress {
+        return self.endpoints.items[0].local;
+    }
+
+    /// Closes every connection and sends every session's program SIGHUP.
+    /// Run the loop until it has no active completions, which takes at most
+    /// `stop_grace_ms`, then call `deinit`. It kills programs still running.
+    pub fn stop(self: *Server) void {
+        self.stopping = true;
+        for (self.endpoints.items) |e| e.stop();
+        if (self.rescan) |*r| if (r.c.state() == .active) {
+            r.cancel_c = .{ .op = .{ .cancel = .{ .c = &r.c } } };
+            self.loop.add(&r.cancel_c);
+        };
+        for (self.sessions.values()) |s| s.stop();
+    }
+
+    pub fn deinit(self: *Server) void {
+        for (self.sessions.values()) |s| s.destroy();
+        self.sessions.deinit(self.gpa);
+        for (self.endpoints.items) |e| self.destroyEndpoint(e);
+        self.endpoints.deinit(self.gpa);
+        for (self.retired.items) |e| self.destroyEndpoint(e);
+        self.retired.deinit(self.gpa);
+        if (self.rescan) |*r| {
+            self.gpa.free(r.host_loopback);
+            r.timer.deinit();
+        }
+        self.tls.deinit();
+        self.* = undefined;
+    }
+
+    /// Binds an endpoint to `local`.
+    fn listen(self: *Server, local: IpAddress) !*Endpoint {
+        const e = try self.gpa.create(Endpoint);
+        errdefer self.gpa.destroy(e);
+        try e.init(self.gpa, self.io, self.loop, .{
+            .local = local,
             .role = .{ .server = &self.tls },
-            .idle_timeout_ns = options.idle_timeout_ns,
+            .idle_timeout_ns = self.options.idle_timeout_ns,
             .handler = .{
                 .ctx = self,
                 .connected = onConnected,
@@ -106,27 +204,86 @@ pub const Server = struct {
                 .closed = onClosed,
             },
         });
+        errdefer e.deinit();
+        try self.endpoints.append(self.gpa, e);
+        return e;
     }
 
-    /// The bound address, with the port the kernel picked.
-    pub fn address(self: *const Server) IpAddress {
-        return self.endpoint.local;
+    fn destroyEndpoint(self: *Server, e: *Endpoint) void {
+        e.deinit();
+        self.gpa.destroy(e);
     }
 
-    /// Closes every connection and sends every session's program SIGHUP.
-    /// Run the loop until it has no active completions, which takes at most
-    /// `stop_grace_ms`, then call `deinit`. It kills programs still running.
-    pub fn stop(self: *Server) void {
-        self.endpoint.stop();
-        for (self.sessions.values()) |s| s.stop();
+    /// Binds the wildcard's addresses that have no endpoint, and stops the
+    /// endpoints of addresses that went away.
+    fn updateAddresses(self: *Server, when: enum { initial, rescan }) !void {
+        const r = &self.rescan.?;
+        const found = try addresses.interfaces(self.gpa, r.wildcard);
+        defer self.gpa.free(found);
+
+        // Bound endpoints whose address is gone. Their connections can't
+        // reach the server any more.
+        var i: usize = 0;
+        while (i < self.endpoints.items.len) {
+            const e = self.endpoints.items[i];
+            if (contains(found, e.local) or contains(r.host_loopback, e.local)) {
+                i += 1;
+                continue;
+            }
+            log.info("{f} went away", .{e.local});
+            e.stop();
+            try self.retired.append(self.gpa, e);
+            _ = self.endpoints.swapRemove(i);
+        }
+
+        for ([_][]const IpAddress{ found, r.host_loopback }) |list| for (list) |local| {
+            if (self.endpointFor(local) != null) continue;
+
+            // An IPv6 address still being checked for duplicates can't be
+            // bound yet. A later rescan tries again.
+            const e = self.listen(local) catch |err| {
+                if (when == .initial) log.warn("can't listen on {f}: {t}", .{ local, err });
+                continue;
+            };
+            log.info("listening on {f}", .{e.local});
+
+            // A port of 0 lets the first bind pick one. The others use it.
+            if (r.wildcard.getPort() == 0) r.wildcard.setPort(e.local.getPort());
+        };
     }
 
-    pub fn deinit(self: *Server) void {
-        for (self.sessions.values()) |s| s.destroy();
-        self.sessions.deinit(self.gpa);
-        self.endpoint.deinit();
-        self.tls.deinit();
-        self.* = undefined;
+    fn endpointFor(self: *const Server, local: IpAddress) ?*Endpoint {
+        for (self.endpoints.items) |e| if (addresses.eql(e.local, local)) return e;
+        return null;
+    }
+
+    fn contains(list: []const IpAddress, wanted: IpAddress) bool {
+        for (list) |a| if (addresses.eql(a, wanted)) return true;
+        return false;
+    }
+
+    fn onRescan(self_: ?*Server, _: *xev.Loop, _: *xev.Completion, result: xev.Timer.RunError!void) xev.CallbackAction {
+        const self = self_.?;
+        result catch return .disarm;
+        if (self.stopping) return .disarm;
+
+        self.updateAddresses(.rescan) catch |err| log.warn("looking for addresses failed: {t}", .{err});
+
+        // Retired endpoints are freed once the loop has finished with them.
+        var i: usize = 0;
+        while (i < self.retired.items.len) {
+            const e = self.retired.items[i];
+            if (!e.isStopped()) {
+                i += 1;
+                continue;
+            }
+            self.destroyEndpoint(e);
+            _ = self.retired.swapRemove(i);
+        }
+
+        const r = &self.rescan.?;
+        r.timer.run(self.loop, &r.c, rescan_ms, Server, self, onRescan);
+        return .disarm;
     }
 
     fn fromCtx(ctx: ?*anyopaque) *Server {
@@ -139,7 +296,7 @@ pub const Server = struct {
     fn onConnected(ctx: ?*anyopaque, conn: *Conn) void {
         const self = fromCtx(ctx);
         const client = self.gpa.create(Client) catch return conn.close(0);
-        client.* = .{ .server = self, .conn = conn, .decoder = .init(self.gpa, max_message) };
+        client.* = .{ .server = self, .conn = conn, .decoder = .init(self.gpa, max_login_message) };
         conn.context = client;
     }
 
@@ -163,8 +320,9 @@ pub const Server = struct {
         while (true) {
             const message = client.decoder.next() catch return client.fail(.protocol, "malformed message");
             client.handle(message orelse break);
-            // `handle` may have closed the connection.
-            if (stream.conn.closing != null) return;
+            // `handle` may have closed the connection, or sent `Error` and
+            // finished the stream.
+            if (stream.conn.closing != null or stream.fin) return;
         }
 
         // The client finished its side: it is gone.
@@ -189,6 +347,27 @@ pub const Server = struct {
         const client = Client.of(conn) orelse return;
         client.destroy();
         conn.context = null;
+    }
+
+    /// Whether `key_blob` may log in as `user`.
+    fn accepts(self: *Server, user: []const u8, key_blob: []const u8) bool {
+        if (!std.mem.eql(u8, user, self.options.user)) return false;
+
+        // Only Ed25519 keys for now.
+        const key = auth.ssh.parseKeyBlob(key_blob) catch return false;
+
+        const match = auth.authorized_keys.check(self.io, self.gpa, self.options.authorized_keys, key) catch |err| {
+            log.warn("reading authorized_keys failed: {t}", .{err});
+            return false;
+        };
+        return switch (match) {
+            .allowed => true,
+            .absent => false,
+            .restricted => {
+                log.info("refused key {s}: its authorized_keys line has options, which tx doesn't implement yet", .{auth.Fingerprint.init(key).slice()});
+                return false;
+            },
+        };
     }
 
     fn startSession(self: *Server, hello: *const Hello) !*Session {
@@ -250,6 +429,9 @@ const Client = struct {
     stream: ?*Stream = null,
     decoder: proto.Decoder,
     hello: ?Hello = null,
+    logged_in: bool = false,
+    /// Probes and signatures received.
+    login_attempts: u32 = 0,
     session: ?*Session = null,
     /// The highest seq the client reported written to its terminal.
     acked: ?u64 = null,
@@ -266,11 +448,19 @@ const Client = struct {
         gpa.destroy(client);
     }
 
-    /// Hello, then Attach, then Input, Resize, Ack and Detach. Unknown
-    /// message types are ignored, for newer clients.
+    /// Hello, then the login, then Attach, then Input, Resize, Ack and
+    /// Detach. Unknown message types are ignored, for newer clients.
     fn handle(client: *Client, message: proto.Message) void {
+        // Before login, a client can say hello, log in and leave.
+        if (!client.logged_in) switch (message) {
+            .hello, .auth_probe, .auth_signature, .detach, .unknown => {},
+            else => return client.fail(.protocol, "not logged in"),
+        };
+
         switch (message) {
             .hello => |m| client.onHello(m),
+            .auth_probe => |m| client.onAuthProbe(m),
+            .auth_signature => |m| client.onAuthSignature(m),
             .attach => |m| client.onAttach(m),
             .input => |m| if (client.session) |s| s.input(m.bytes),
             .resize => |m| if (client.session) |s| {
@@ -295,6 +485,61 @@ const Client = struct {
         hello.colorterm.appendSlice(gpa, m.colorterm orelse "") catch return client.fail(.protocol, "out of memory");
         client.hello = hello;
         client.send(.{ .hello_reply = .{ .revision = proto.revision } });
+    }
+
+    fn onAuthProbe(client: *Client, m: proto.AuthProbe) void {
+        if (!client.startLoginAttempt()) return;
+        client.send(.{ .auth_probe_reply = .{ .key = m.key, .accepted = client.server.accepts(m.user, m.key) } });
+    }
+
+    fn onAuthSignature(client: *Client, m: proto.AuthSignature) void {
+        if (!client.startLoginAttempt()) return;
+        const server = client.server;
+
+        // `accepts` checked the user name and the key's type.
+        if (!server.accepts(m.user, m.key)) return client.fail(.auth, "login refused");
+        const key = auth.ssh.parseKeyBlob(m.key) catch unreachable;
+
+        // The transcript as the server sees the connection. A signature
+        // made for another connection or server doesn't match it.
+        var transcript: auth.login.Transcript = .{
+            .exporter = undefined,
+            .host_key = server.options.identity.public_key.toBytes(),
+            .user = m.user,
+            .alpn = transport.quic.alpn,
+            .revision = proto.revision,
+        };
+        client.conn.quic.exportSecret(&transcript.exporter, auth.login.exporter_label);
+
+        transcript.verify(key, m.signature) catch {
+            log.info("bad signature from {f} for {s} with key {s}", .{ client.conn.remote, m.user, auth.Fingerprint.init(key).slice() });
+            return client.fail(.auth, "login refused");
+        };
+
+        log.info("{f} logged in as {s} with key {s}", .{ client.conn.remote, m.user, auth.Fingerprint.init(key).slice() });
+        client.logged_in = true;
+        client.decoder.max_body_len = max_message;
+        client.send(.{ .auth_ok = .{} });
+    }
+
+    /// Counts a probe or signature. False if the client has used up its
+    /// attempts, or is logged in already.
+    fn startLoginAttempt(client: *Client) bool {
+        if (client.hello == null) {
+            client.fail(.protocol, "login before hello");
+            return false;
+        }
+        if (client.logged_in) {
+            client.fail(.protocol, "second login");
+            return false;
+        }
+
+        client.login_attempts += 1;
+        if (client.login_attempts > max_login_attempts) {
+            client.fail(.auth, "too many login attempts");
+            return false;
+        }
+        return true;
     }
 
     fn onAttach(client: *Client, m: proto.Attach) void {
@@ -331,6 +576,8 @@ const Client = struct {
     /// the connection.
     fn send(client: *Client, message: proto.Message) void {
         const stream = client.stream orelse return;
+        // Nothing follows `Error` or `Exit`.
+        if (stream.fin) return;
         const gpa = client.server.gpa;
         const buf = gpa.alloc(u8, proto.encodedLen(message)) catch return client.conn.close(0);
         defer gpa.free(buf);
@@ -529,3 +776,9 @@ const Session = struct {
         s.server.gpa.destroy(s);
     }
 };
+
+test {
+    _ = addresses;
+    // Analyzes the crypto module, whose exports the linked C code needs.
+    _ = &transport.crypto.init;
+}

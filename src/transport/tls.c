@@ -57,6 +57,7 @@ tx_tls_server *tx_tls_server_new(const uint8_t secret_key[64], const uint8_t pub
   s->ctx.sign_certificate = &s->signer.super;
   s->ctx.on_client_hello = &client_hello_cb;
   s->ctx.use_raw_public_keys = 1;
+  s->ctx.use_exporter = 1;
   s->ctx.server_cipher_preference = 1;
   if (ngtcp2_crypto_picotls_configure_server_context(&s->ctx) != 0) {
     tx_tls_server_free(s);
@@ -75,19 +76,30 @@ void tx_tls_server_free(tx_tls_server *s) {
 struct tx_tls_client {
   ptls_context_t ctx;
   tx_ed25519_verifier verifier;
+  uint8_t (*keys)[32];
 };
 
-tx_tls_client *tx_tls_client_new(const uint8_t pinned[32], int prefer_aes) {
+tx_tls_client *tx_tls_client_new(const uint8_t (*keys)[32], size_t count, int accept_any,
+                                 int prefer_aes) {
   tx_tls_client *c = calloc(1, sizeof(*c));
   if (c == NULL)
     return NULL;
-  tx_ed25519_verifier_init(&c->verifier, pinned);
+  if (count > 0) {
+    c->keys = malloc(count * sizeof(*c->keys));
+    if (c->keys == NULL) {
+      free(c);
+      return NULL;
+    }
+    memcpy(c->keys, keys, count * sizeof(*c->keys));
+  }
+  tx_ed25519_verifier_init(&c->verifier, (const uint8_t (*)[32])c->keys, count, accept_any);
   c->ctx.random_bytes = tx_random_bytes;
   c->ctx.get_time = &ptls_get_time;
   c->ctx.key_exchanges = key_exchanges;
   c->ctx.cipher_suites = prefer_aes ? suites_aes_first : suites_chacha_first;
   c->ctx.verify_certificate = &c->verifier.super;
   c->ctx.use_raw_public_keys = 1;
+  c->ctx.use_exporter = 1;
   if (ngtcp2_crypto_picotls_configure_client_context(&c->ctx) != 0) {
     tx_tls_client_free(c);
     return NULL;
@@ -95,7 +107,19 @@ tx_tls_client *tx_tls_client_new(const uint8_t pinned[32], int prefer_aes) {
   return c;
 }
 
-void tx_tls_client_free(tx_tls_client *c) { free(c); }
+void tx_tls_client_free(tx_tls_client *c) {
+  if (c == NULL)
+    return;
+  free(c->keys);
+  free(c);
+}
+
+int tx_tls_client_presented_key(const tx_tls_client *c, uint8_t out[32]) {
+  if (!c->verifier.has_presented)
+    return 0;
+  memcpy(out, c->verifier.presented, 32);
+  return 1;
+}
 
 struct tx_tls_session {
   ngtcp2_crypto_picotls_ctx cptls;
@@ -161,6 +185,10 @@ void tx_tls_session_free(tx_tls_session *s) {
   if (s->cptls.ptls != NULL)
     ptls_free(s->cptls.ptls);
   free(s);
+}
+
+int tx_tls_session_export(tx_tls_session *s, uint8_t *out, size_t len, const char *label) {
+  return ptls_export_secret(s->cptls.ptls, out, len, label, ptls_iovec_init(NULL, 0), 0);
 }
 
 int tx_tls_mlkem_exchanges(void) { return tx_mlkem_exchanges; }

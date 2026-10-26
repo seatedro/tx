@@ -21,6 +21,10 @@ pub const Resize = messages.Resize;
 pub const Detach = messages.Detach;
 pub const Exit = messages.Exit;
 pub const Error = messages.Error;
+pub const AuthProbe = messages.AuthProbe;
+pub const AuthProbeReply = messages.AuthProbeReply;
+pub const AuthSignature = messages.AuthSignature;
+pub const AuthOk = messages.AuthOk;
 
 pub const Decoder = frame.Decoder;
 pub const encode = frame.encode;
