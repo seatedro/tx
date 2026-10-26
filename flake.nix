@@ -24,6 +24,7 @@
       devShells.default = pkgs.mkShell {
         packages = [
           zig.packages.${system}."0.17.0"
+          pkgs.clang-tools # clang-format for src/**/*.{c,h}
         ];
       };
     });
