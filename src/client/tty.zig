@@ -44,15 +44,27 @@ pub const RawMode = struct {
 
     /// Applies `makeRaw` after the terminal's pending output is written.
     pub fn enter(fd: posix.fd_t) TerminalError!RawMode {
-        var saved: posix.termios = undefined;
-        try getAttrs(fd, &saved);
+        const raw: RawMode = try .save(fd);
+        try raw.apply();
+        return raw;
+    }
 
-        const raw = makeRaw(saved);
-        switch (setAttrs(fd, &raw)) {
+    /// Saves the terminal's attributes without changing them. `restore`
+    /// sets them again, and `apply` enters raw mode.
+    pub fn save(fd: posix.fd_t) TerminalError!RawMode {
+        var raw: RawMode = .{ .fd = fd, .saved = undefined };
+        try getAttrs(fd, &raw.saved);
+        return raw;
+    }
+
+    /// Applies `makeRaw` to the saved attributes, after the terminal's
+    /// pending output is written.
+    pub fn apply(raw: *const RawMode) TerminalError!void {
+        const attrs = makeRaw(raw.saved);
+        switch (setAttrs(raw.fd, &attrs)) {
             .SUCCESS => {},
             else => |err| return terminalError(err),
         }
-        return .{ .fd = fd, .saved = saved };
     }
 
     /// Thread-safe and async-signal-safe, for use from a panic or crash
@@ -561,7 +573,7 @@ fn waitForWake(wake_fd: posix.fd_t) void {
 // than the kernel's, which std.c's termios matches, and tcgetattr would
 // write past its end. TCGETS and TCSETSW use the kernel's layout. macOS's
 // tcgetattr matches std.c's termios.
-fn getAttrs(fd: posix.fd_t, attrs: *posix.termios) TerminalError!void {
+pub fn getAttrs(fd: posix.fd_t, attrs: *posix.termios) TerminalError!void {
     const rc = if (native_os == .linux)
         ioctl(fd, std.os.linux.T.CGETS, @intFromPtr(attrs))
     else
@@ -571,7 +583,7 @@ fn getAttrs(fd: posix.fd_t, attrs: *posix.termios) TerminalError!void {
 
 /// Applies `attrs` after pending output is written, as OpenSSH does with
 /// TCSADRAIN. Async-signal-safe.
-fn setAttrs(fd: posix.fd_t, attrs: *const posix.termios) posix.E {
+pub fn setAttrs(fd: posix.fd_t, attrs: *const posix.termios) posix.E {
     while (true) {
         const rc = if (native_os == .linux)
             ioctl(fd, std.os.linux.T.CSETSW, @intFromPtr(attrs))

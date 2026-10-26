@@ -1,10 +1,12 @@
 //! The `tx` client's connection to one session.
 //!
-//! After the handshake, the client logs in with a key from the SSH agent:
-//! it probes the keys in turn, and signs the login transcript with the
-//! first one the server accepts. Signing runs on its own thread, since the
-//! agent may wait for the user to approve it. The signature and `Attach`
-//! go out together.
+//! After the handshake, the client logs in. It probes its keys in turn,
+//! from the SSH agent and from key files, and signs the login transcript
+//! with the first one the server accepts. Signing runs on its own thread:
+//! the agent may wait for the user to approve it, and a key file may need
+//! its passphrase. The signature and `Attach` go out together. The
+//! terminal enters raw mode once the login succeeds, so a passphrase
+//! prompt finds it as the user left it.
 //!
 //! Like the ssh client, it writes the session's output to the user's
 //! terminal unchanged and forwards what the user types. Output written to
@@ -20,8 +22,10 @@ const xev = @import("xev");
 const transport = @import("transport");
 const proto = @import("proto");
 const auth = @import("auth");
+const Wake = @import("wake").Wake;
 const tty = @import("tty.zig");
 const escape = @import("escape.zig");
+const passphrase = @import("passphrase.zig");
 
 const Endpoint = transport.endpoint.Endpoint;
 const Conn = transport.endpoint.Conn;
@@ -36,10 +40,14 @@ pub const Options = struct {
     host_keys: []const [32]u8,
     /// The account to log in as.
     user: []const u8,
-    /// The SSH agent's socket.
-    agent: []const u8,
-    /// The agent's Ed25519 keys, probed in order. At least one.
-    keys: []const auth.Key,
+    /// The keys to log in with, probed in order. At least one.
+    identities: []const Identity,
+    /// The SSH agent's socket, for identities from the agent.
+    agent: ?[]const u8 = null,
+    /// Asks for an encrypted key file's passphrase. Runs on the signer's
+    /// thread before the terminal enters raw mode, and gives up with null
+    /// when `cancel_fd` becomes readable.
+    passphrase: *const fn (path: []const u8, buf: []u8, cancel_fd: posix.fd_t) ?[]u8 = askPassphrase,
     /// Print the session's ID once attached.
     show_session_id: bool = false,
     /// Null starts a new session.
@@ -54,6 +62,22 @@ pub const Options = struct {
     idle_timeout_ns: u64 = 30 * std.time.ns_per_s,
     keep_alive_ns: u64 = 10 * std.time.ns_per_s,
 };
+
+pub const Identity = struct {
+    key: auth.Key,
+    source: union(enum) {
+        agent,
+        /// An OpenSSH private key file.
+        file: []const u8,
+    },
+};
+
+/// Prompts on the controlling terminal, as ssh does.
+fn askPassphrase(path: []const u8, buf: []u8, cancel_fd: posix.fd_t) ?[]u8 {
+    var prompt_buf: [std.fs.max_path_bytes + 64]u8 = undefined;
+    const prompt = std.fmt.bufPrint(&prompt_buf, "Enter passphrase for key '{s}': ", .{path}) catch "Enter passphrase: ";
+    return passphrase.ask(prompt, buf, cancel_fd) catch null;
+}
 
 pub const Outcome = union(enum) {
     /// The program exited.
@@ -112,13 +136,10 @@ const stream_window = 2 << 20;
 const max_message = 1 << 20;
 
 /// Runs one session until it exits or detaches. The user's terminal is in
-/// raw mode for the duration.
+/// raw mode from the login on.
 pub fn run(gpa: Allocator, io: Io, options: Options) !Outcome {
-    std.debug.assert(options.keys.len > 0);
+    std.debug.assert(options.identities.len > 0);
     transport.crypto.init(io);
-
-    const raw: tty.RawMode = try .enter(options.in_fd);
-    defer raw.restore();
 
     // Before any thread starts. Threads inherit the mask, and the signal
     // thread receives them.
@@ -132,10 +153,11 @@ pub fn run(gpa: Allocator, io: Io, options: Options) !Outcome {
     defer loop.deinit();
 
     var r: Run = undefined;
-    try r.init(gpa, io, &loop, options, &raw);
+    try r.init(gpa, io, &loop, options);
     defer r.deinit();
 
     while (r.outcome == null) try loop.run(.once);
+    if (r.failure) |err| return err;
     return r.outcome.?;
 }
 
@@ -148,6 +170,13 @@ const Run = struct {
     tls: transport.quic.Client,
     endpoint: Endpoint,
     conn: ?*Conn = null,
+    /// The terminal's attributes from before the session. Raw mode is
+    /// applied once `terminal` is set.
+    raw: tty.RawMode,
+    /// Raw mode is on, and the reader and writer run. Set after the login.
+    terminal: bool = false,
+    /// The size sent in `Hello`.
+    hello_size: tty.Size = undefined,
     /// The one stream to the server, opened after the handshake.
     stream: ?*Stream = null,
     decoder: proto.Decoder,
@@ -167,18 +196,32 @@ const Run = struct {
     session_id: ?u64 = null,
     /// Input typed before the server confirmed the attach.
     early_input: std.ArrayList(u8) = .empty,
-    /// The key in `options.keys` being probed or signed with.
+    /// The identity in `options.identities` being probed or signed with.
     key_index: usize = 0,
-    /// Set while the agent signs.
+    /// Set while a signature is being made.
     signer: ?Signer = null,
     outcome: ?Outcome = null,
+    /// An error `run` returns, for a failure with no outcome of its own.
+    failure: ?anyerror = null,
 
-    /// The agent connection and request of a signature in progress.
+    /// A signature in progress.
     const Signer = struct {
-        agent: auth.Agent,
         thread: std.Thread,
-        key_blob: [auth.ssh.key_blob_len]u8,
+        identity: Identity,
         data: auth.sshsig.SignedData,
+        /// For an agent identity. Shutting it down ends a request the user
+        /// hasn't answered.
+        agent: ?auth.Agent,
+        /// Ends a passphrase prompt nobody is answering.
+        cancel: Wake,
+    };
+
+    const SignError = auth.agent.Error || error{
+        /// The user gave up on the passphrase, or the session ended.
+        Canceled,
+        WrongPassphrase,
+        /// The key file can't be read or parsed.
+        KeyFile,
     };
 
     /// What the reader, writer and signal threads pass to the loop thread.
@@ -190,11 +233,11 @@ const Run = struct {
         input_ended: bool = false,
         below_low_water: bool = false,
         output_failed: bool = false,
-        /// The agent's signature blob, owned, or why it gave none.
-        signature: ?(auth.agent.Error![]u8) = null,
+        /// The signature blob, owned, or why there is none.
+        signature: ?(SignError![]u8) = null,
     };
 
-    fn init(r: *Run, gpa: Allocator, io: Io, loop: *xev.Loop, options: Options, raw: *const tty.RawMode) !void {
+    fn init(r: *Run, gpa: Allocator, io: Io, loop: *xev.Loop, options: Options) !void {
         r.* = .{
             .gpa = gpa,
             .io = io,
@@ -203,6 +246,7 @@ const Run = struct {
             .size = terminalSize(options),
             .tls = try .init(.{ .keys = options.host_keys }),
             .endpoint = undefined,
+            .raw = try .save(options.in_fd),
             .decoder = .init(gpa, max_message),
             .escape = .{ .char = options.escape_char },
             .wake = try .init(),
@@ -233,30 +277,43 @@ const Run = struct {
         });
         r.wake.wait(loop, &r.wake_c, Run, r, onWake);
 
-        try r.writer.start(gpa, io, .{
-            .fd = options.out_fd,
+        // From the start, so a terminating signal during the login ends it.
+        // Restoring the saved attributes before raw mode turns echo back on
+        // after a passphrase prompt.
+        try r.signals.start(.{ .fd = options.in_fd, .raw_mode = &r.raw, .context = r, .callback = onSignal });
+        r.conn = try r.endpoint.connect(options.server);
+    }
+
+    /// Enters raw mode and starts reading and writing the terminal.
+    fn startTerminal(r: *Run) !void {
+        try r.raw.apply();
+        errdefer r.raw.restore();
+
+        try r.writer.start(r.gpa, r.io, .{
+            .fd = r.options.out_fd,
             .capacity = writer_options.capacity,
             .high_water = writer_options.high_water,
             .low_water = writer_options.low_water,
             .context = r,
             .callback = onWriterEvent,
         });
-        try r.reader.start(.{ .fd = options.in_fd, .context = r, .callback = onReaderEvent });
-        try r.signals.start(.{ .fd = options.in_fd, .raw_mode = raw, .context = r, .callback = onSignal });
-        r.conn = try r.endpoint.connect(options.server);
+        errdefer r.writer.stop(.drain);
+        try r.reader.start(.{ .fd = r.options.in_fd, .context = r, .callback = onReaderEvent });
+        r.terminal = true;
     }
 
     /// Stops the threads, writes what is queued for the terminal, and closes
     /// the connection.
     fn deinit(r: *Run) void {
-        r.reader.stop();
+        if (r.terminal) r.reader.stop();
         r.signals.stop();
-        r.writer.stop(.drain);
+        if (r.terminal) r.writer.stop(.drain);
 
-        // Shutting the agent socket down ends a sign request the user
-        // hasn't answered.
+        // Ends a signature the user hasn't approved, or a passphrase they
+        // haven't typed.
         if (r.signer) |*signer| {
-            signer.agent.stream.shutdown(r.io, .both) catch {};
+            if (signer.agent) |*agent| agent.stream.shutdown(r.io, .both) catch {};
+            signer.cancel.notify();
             r.finishSigning();
         }
         if (r.inbox.signature) |result| if (result) |sig| r.gpa.free(sig) else |_| {};
@@ -273,6 +330,7 @@ const Run = struct {
         r.tls.deinit();
         r.inbox.input.deinit(r.gpa);
         r.early_input.deinit(r.gpa);
+        if (r.terminal) r.raw.restore();
     }
 
     fn fromCtx(ctx: ?*anyopaque) *Run {
@@ -318,6 +376,7 @@ const Run = struct {
 
         // Hello and the first probe go together. The server answers both,
         // in order.
+        r.hello_size = r.size;
         const cell_w, const cell_h = cellSize(r.size);
         r.send(.{ .hello = .{
             .revision = proto.revision,
@@ -333,21 +392,21 @@ const Run = struct {
 
     /// Asks whether the server accepts the current key.
     fn probe(r: *Run) void {
-        const blob = auth.ssh.keyBlob(r.options.keys[r.key_index]);
+        const blob = auth.ssh.keyBlob(r.options.identities[r.key_index].key);
         r.send(.{ .auth_probe = .{ .user = r.options.user, .key = &blob } });
     }
 
     fn onProbeReply(r: *Run, m: proto.AuthProbeReply) void {
-        const blob = auth.ssh.keyBlob(r.options.keys[r.key_index]);
+        const blob = auth.ssh.keyBlob(r.options.identities[r.key_index].key);
         if (r.signer != null or !std.mem.eql(u8, m.key, &blob)) return r.refuse("unexpected probe reply");
 
         if (m.accepted) return r.startSigning();
 
         r.key_index += 1;
-        if (r.key_index == r.options.keys.len) {
+        if (r.key_index == r.options.identities.len) {
             // `Name` truncates a message longer than it holds.
             var buf: [512]u8 = undefined;
-            return r.refuse(std.fmt.bufPrint(&buf, "the server accepted none of the agent's keys for {s}", .{r.options.user}) catch unreachable);
+            return r.refuse(std.fmt.bufPrint(&buf, "the server accepted none of the keys for {s}", .{r.options.user}) catch unreachable);
         }
         r.probe();
     }
@@ -366,15 +425,26 @@ const Run = struct {
         };
         conn.quic.exportSecret(&transcript.exporter, auth.login.exporter_label);
 
-        const agent: auth.Agent = auth.Agent.connect(r.io, r.options.agent) catch return r.refuse("can't connect to the SSH agent");
+        const identity = r.options.identities[r.key_index];
+        var agent: ?auth.Agent = null;
+        if (identity.source == .agent) {
+            agent = auth.Agent.connect(r.io, r.options.agent.?) catch return r.refuse("can't connect to the SSH agent");
+        }
+        var cancel: Wake = Wake.init() catch {
+            if (agent) |*a| a.close();
+            return r.finish(.{ .disconnected = .failed });
+        };
+
         r.signer = .{
-            .agent = agent,
             .thread = undefined,
-            .key_blob = auth.ssh.keyBlob(r.options.keys[r.key_index]),
+            .identity = identity,
             .data = transcript.signedData(),
+            .agent = agent,
+            .cancel = cancel,
         };
         r.signer.?.thread = std.Thread.spawn(.{}, signMain, .{r}) catch {
-            r.signer.?.agent.close();
+            if (agent) |*a| a.close();
+            cancel.deinit();
             r.signer = null;
             return r.finish(.{ .disconnected = .failed });
         };
@@ -383,7 +453,10 @@ const Run = struct {
     /// Runs on the signer's thread.
     fn signMain(r: *Run) void {
         const signer = &r.signer.?;
-        const result = signer.agent.sign(r.gpa, &signer.key_blob, signer.data.slice());
+        const result: SignError![]u8 = switch (signer.identity.source) {
+            .agent => signer.agent.?.sign(r.gpa, &auth.ssh.keyBlob(signer.identity.key), signer.data.slice()),
+            .file => |path| r.signWithFile(path, signer),
+        };
         {
             r.inbox.mutex.lockUncancelable(r.io);
             defer r.inbox.mutex.unlock(r.io);
@@ -392,31 +465,85 @@ const Run = struct {
         r.wake.notify() catch {};
     }
 
+    /// Signs with the key in an OpenSSH private key file, asking for its
+    /// passphrase if it has one. Runs on the signer's thread.
+    fn signWithFile(r: *Run, path: []const u8, signer: *const Signer) SignError![]u8 {
+        const text = Io.Dir.cwd().readFileAlloc(r.io, path, r.gpa, .limited(64 << 10)) catch return error.KeyFile;
+        defer {
+            std.crypto.secureZero(u8, text);
+            r.gpa.free(text);
+        }
+        var file = auth.private_key.PrivateKeyFile.parse(r.gpa, text) catch return error.KeyFile;
+        defer file.deinit(r.gpa);
+
+        // Three tries, as ssh gives.
+        var pass_buf: [1024]u8 = undefined;
+        defer std.crypto.secureZero(u8, &pass_buf);
+        var kp = for (0..3) |_| {
+            const pass = if (file.isEncrypted())
+                r.options.passphrase(path, &pass_buf, signer.cancel.read_fd) orelse return error.Canceled
+            else
+                "";
+            break file.decrypt(pass) catch |err| switch (err) {
+                error.WrongPassphrase => continue,
+                error.Malformed => return error.KeyFile,
+            };
+        } else return error.WrongPassphrase;
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&kp));
+
+        const sig = kp.sign(signer.data.slice(), null) catch return error.KeyFile;
+        return r.gpa.dupe(u8, &auth.sshsig.signatureBlob(sig.toBytes()));
+    }
+
     /// Joins the signer's thread, which has finished or is about to.
     fn finishSigning(r: *Run) void {
         const signer = &r.signer.?;
         signer.thread.join();
-        signer.agent.close();
+        if (signer.agent) |*agent| agent.close();
+        signer.cancel.deinit();
         r.signer = null;
     }
 
     /// Sends the signature and the attach together. The server attaches
     /// only if the login succeeds.
-    fn onSignature(r: *Run, result: auth.agent.Error![]u8) void {
-        const key_blob = r.signer.?.key_blob;
+    fn onSignature(r: *Run, result: SignError![]u8) void {
+        const identity = r.signer.?.identity;
         r.finishSigning();
 
-        const sig = result catch |err| return r.refuse(switch (err) {
-            error.Refused => "the SSH agent refused to sign",
-            else => "the SSH agent failed",
-        });
+        const sig = result catch |err| {
+            var buf: [std.fs.max_path_bytes + 64]u8 = undefined;
+            const path = switch (identity.source) {
+                .agent => "",
+                .file => |p| p,
+            };
+            return r.refuse(switch (err) {
+                error.Refused => "the SSH agent refused to sign",
+                error.Canceled => "login canceled",
+                error.WrongPassphrase => std.fmt.bufPrint(&buf, "wrong passphrase for {s}", .{path}) catch "wrong passphrase",
+                error.KeyFile => std.fmt.bufPrint(&buf, "can't read the key in {s}", .{path}) catch "can't read the key file",
+                else => "the SSH agent failed",
+            });
+        };
         defer r.gpa.free(sig);
 
+        const key_blob = auth.ssh.keyBlob(identity.key);
         r.send(.{ .auth_signature = .{ .user = r.options.user, .key = &key_blob, .signature = sig } });
         r.send(.{ .attach = .{ .session_id = r.options.session_id } });
     }
 
+    fn onAuthOk(r: *Run) void {
+        r.startTerminal() catch |err| {
+            r.failure = err;
+            r.finish(.{ .disconnected = .failed });
+        };
+    }
+
     /// Ends the run for a reason of the client's own, with code 0.
+    fn sendResize(r: *Run) void {
+        const cell_w, const cell_h = cellSize(r.size);
+        r.send(.{ .resize = .{ .cols = r.size.cols, .rows = r.size.rows, .cell_width_px = cell_w, .cell_height_px = cell_h } });
+    }
+
     fn refuse(r: *Run, message: []const u8) void {
         r.finish(.{ .refused = .{ .code = 0, .message = .init(message) } });
     }
@@ -432,7 +559,7 @@ const Run = struct {
 
         // Returning credit lets the server send more. While the terminal is
         // behind, the credit waits for `below_low_water`.
-        if (r.writer.aboveHighWater()) r.held += bytes.len else stream.consume(bytes.len);
+        if (r.terminal and r.writer.aboveHighWater()) r.held += bytes.len else stream.consume(bytes.len);
 
         // The server finishes the stream only after Exit or Error.
         if (fin) r.finish(.{ .disconnected = .{ .peer = .{ .application = 0 } } });
@@ -442,11 +569,16 @@ const Run = struct {
         switch (message) {
             .hello_reply => |m| if (m.revision != proto.revision) r.refuse("the server speaks another protocol revision"),
             .auth_probe_reply => |m| r.onProbeReply(m),
-            .auth_ok => {},
+            .auth_ok => r.onAuthOk(),
             // Input typed before this was held, since the server had no
             // session to give it to.
             .attached => |m| {
+                if (!r.terminal) return r.refuse("the server attached before the login");
                 r.session_id = m.session_id;
+
+                // The terminal changed size since `Hello`.
+                if (!std.meta.eql(r.size, r.hello_size)) r.sendResize();
+
                 if (r.options.show_session_id) {
                     var buf: [64]u8 = undefined;
                     const line = std.fmt.bufPrint(&buf, "tx: session {d}\r\n", .{m.session_id}) catch unreachable;
@@ -457,6 +589,7 @@ const Run = struct {
             },
             // Acked once queued for the terminal.
             .output => |m| {
+                if (!r.terminal) return r.refuse("the server sent output before the login");
                 r.writer.write(m.bytes) catch |err| switch (err) {
                     error.Failed => return r.finish(.{ .detached = r.session_id }),
                     error.QueueFull => log.warn("output dropped: the terminal queue is full", .{}),
@@ -541,7 +674,7 @@ const Run = struct {
         // lock. Notifications may have been coalesced.
         var input: std.ArrayList(u8) = .empty;
         defer input.deinit(r.gpa);
-        var signature: ?(auth.agent.Error![]u8) = null;
+        var signature: ?(SignError![]u8) = null;
         const resize, const terminate, const input_ended, const below_low_water, const output_failed = taken: {
             r.inbox.mutex.lockUncancelable(r.io);
             defer r.inbox.mutex.unlock(r.io);
@@ -564,10 +697,11 @@ const Run = struct {
 
         r.forwardInput(input.items);
 
+        // Before the attach, the server has no terminal to resize.
+        // `.attached` sends the size then.
         if (resize) |size| {
             r.size = size;
-            const cell_w, const cell_h = cellSize(size);
-            r.send(.{ .resize = .{ .cols = size.cols, .rows = size.rows, .cell_width_px = cell_w, .cell_height_px = cell_h } });
+            if (r.session_id != null) r.sendResize();
         }
 
         // The terminal caught up: return the credit held back in `onData`.

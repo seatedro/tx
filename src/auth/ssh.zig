@@ -79,12 +79,13 @@ pub fn keyBlob(key: Key) [key_blob_len]u8 {
 }
 
 pub fn parseKeyBlob(blob: []const u8) ParseError!Key {
+    // Other types have other fields after the type.
     var r: Reader = .init(blob);
     const key_type = try r.string();
+    if (!std.mem.eql(u8, key_type, ed25519)) return error.UnsupportedType;
+
     const key = try r.string();
     try r.end();
-
-    if (!std.mem.eql(u8, key_type, ed25519)) return error.UnsupportedType;
     if (key.len != 32) return error.Malformed;
     return key[0..32].*;
 }
