@@ -64,7 +64,7 @@ pub const Options = struct {
 };
 
 pub const Identity = struct {
-    key: auth.Key,
+    key: auth.ssh.PublicKey,
     source: union(enum) {
         agent,
         /// An OpenSSH private key file.
@@ -392,13 +392,13 @@ const Run = struct {
 
     /// Asks whether the server accepts the current key.
     fn probe(r: *Run) void {
-        const blob = auth.ssh.keyBlob(r.options.identities[r.key_index].key);
-        r.send(.{ .auth_probe = .{ .user = r.options.user, .key = &blob } });
+        const key = &r.options.identities[r.key_index].key;
+        r.send(.{ .auth_probe = .{ .user = r.options.user, .key = key.blob() } });
     }
 
     fn onProbeReply(r: *Run, m: proto.AuthProbeReply) void {
-        const blob = auth.ssh.keyBlob(r.options.identities[r.key_index].key);
-        if (r.signer != null or !std.mem.eql(u8, m.key, &blob)) return r.refuse("unexpected probe reply");
+        const key = &r.options.identities[r.key_index].key;
+        if (r.signer != null or !std.mem.eql(u8, m.key, key.blob())) return r.refuse("unexpected probe reply");
 
         if (m.accepted) return r.startSigning();
 
@@ -454,7 +454,7 @@ const Run = struct {
     fn signMain(r: *Run) void {
         const signer = &r.signer.?;
         const result: SignError![]u8 = switch (signer.identity.source) {
-            .agent => signer.agent.?.sign(r.gpa, &auth.ssh.keyBlob(signer.identity.key), signer.data.slice()),
+            .agent => signer.agent.?.sign(r.gpa, signer.identity.key.blob(), signer.data.slice()),
             .file => |path| r.signWithFile(path, signer),
         };
         {
@@ -526,8 +526,7 @@ const Run = struct {
         };
         defer r.gpa.free(sig);
 
-        const key_blob = auth.ssh.keyBlob(identity.key);
-        r.send(.{ .auth_signature = .{ .user = r.options.user, .key = &key_blob, .signature = sig } });
+        r.send(.{ .auth_signature = .{ .user = r.options.user, .key = identity.key.blob(), .signature = sig } });
         r.send(.{ .attach = .{ .session_id = r.options.session_id } });
     }
 
