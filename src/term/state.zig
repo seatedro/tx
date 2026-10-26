@@ -1,5 +1,5 @@
-//! A canonical text dump of a Terminal's state, for checking that a replica
-//! matches its primary.
+//! A canonical text dump of a Terminal's state, for checking that a terminal
+//! fed the client stream matches the primary.
 //!
 //! Terminals in the same state produce the same dump however their pages
 //! are laid out. Styles and hyperlinks are numbered by first appearance,
@@ -207,9 +207,7 @@ const Dumper = struct {
         try d.line("  charset", s.charset);
         try d.line("  protected_mode", s.protected_mode);
         try d.line("  kitty_keyboard", s.kitty_keyboard);
-        // `semantic_prompt.seen` is omitted. libghostty-vt never reads it,
-        // and the snapshot rederives it differently (a prompt cursor carried
-        // onto the alternate screen sets it there).
+        // `semantic_prompt.seen` is omitted. libghostty-vt never reads it.
         try d.line("  semantic_click", s.semantic_prompt.click);
         if (s.selection) |sel| {
             try d.print("  selection rectangle={} ", .{sel.rectangle});

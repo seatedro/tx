@@ -1,13 +1,12 @@
-//! The Terminal fed the program's output, and the log replicas replay to
-//! reproduce it.
+//! The Terminal fed the program's output, and the log of what it consumed.
 //!
 //! State changes go through `output` and `resize`, which append to the log
-//! before applying. A replica restored from `snapshot` that applies the log
-//! from the returned seq reaches the same state.
+//! before applying, so a terminal fed the log from seq 0 reaches the same
+//! state.
 //!
 //! Query replies (DA, DSR, DECRQM and so on) and external effects come from
 //! the stream handler's effect callbacks, which the host installs through
-//! `handler`. Replicas leave them null.
+//! `handler`.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const vt = @import("ghostty-vt");
@@ -21,24 +20,11 @@ pub const Handler = Stream.Handler;
 pub const Options = struct {
     cols: u16,
     rows: u16,
-    /// Carried in the snapshot.
     max_scrollback_bytes: ?usize = 10_000_000,
     max_scrollback_lines: ?usize = null,
-    /// Not carried in the snapshot. Pass the same value as
-    /// `replica.Options.kitty_image_storage_limit`.
     kitty_image_storage_limit: usize = 320 * 1000 * 1000,
     /// In bytes.
     log_capacity: usize = 8 * 1024 * 1024,
-    /// The longest unfinished sequence a snapshot can carry. A snapshot cut
-    /// inside a longer one fails with `ContinuationUnavailable` until the
-    /// stream returns to ground or starts a new sequence.
-    continuation_max_bytes: usize = 1024 * 1024,
-};
-
-pub const SnapshotError = vt.snapshot.EncodeError || Allocator.Error || error{
-    /// The unfinished sequence at the cut is longer than
-    /// `Options.continuation_max_bytes`. Retry after more output.
-    ContinuationUnavailable,
 };
 
 pub const Primary = struct {
@@ -69,7 +55,6 @@ pub const Primary = struct {
         self.stream = .init(.{
             .allocator = gpa,
             .handler = .init(&self.terminal),
-            .continuation_max_bytes = options.continuation_max_bytes,
         });
         return self;
     }
@@ -115,24 +100,6 @@ pub const Primary = struct {
         if (size.cols == 0 or size.rows == 0) return error.InvalidValue;
         _ = try self.log.append(.{ .resize = size });
         try self.stream.handler.resize(size.terminal());
-    }
-
-    /// Encodes the current state, including the stream's unfinished
-    /// sequence. Returns the seq of the first record a replica restored
-    /// from it must apply.
-    pub fn snapshot(self: *Primary, gpa: Allocator, writer: *std.Io.Writer) SnapshotError!u64 {
-        var continuation: std.Io.Writer.Allocating = .init(gpa);
-        defer continuation.deinit();
-        self.stream.writeContinuation(&continuation.writer) catch |err| switch (err) {
-            error.WriteFailed => return error.OutOfMemory,
-            error.ContinuationDisabled => unreachable,
-            error.ContinuationUnavailable => return error.ContinuationUnavailable,
-        };
-        const bytes = continuation.written();
-        try vt.snapshot.encode(gpa, writer, &self.terminal, .{
-            .continuation = if (bytes.len == 0) .ground else .{ .bytes = bytes },
-        });
-        return self.log.nextSeq();
     }
 };
 
@@ -191,37 +158,4 @@ test "fromHandler finds the primary from an effect callback" {
     // DSR 6, a cursor position report.
     try primary.output("ab\x1b[6n");
     try testing.expectEqualStrings("\x1b[1;3R", replies.bytes.items);
-}
-
-test "a snapshot cut inside a sequence carries it" {
-    const primary: *Primary = try .create(testing.allocator, testing.io, .{ .cols = 10, .rows = 3 });
-    defer primary.destroy();
-
-    try primary.output("a\x1b]2;ti");
-    var encoded: std.Io.Writer.Allocating = .init(testing.allocator);
-    defer encoded.deinit();
-    try testing.expectEqual(1, try primary.snapshot(testing.allocator, &encoded.writer));
-
-    var reader: std.Io.Reader = .fixed(encoded.written());
-    var decoded = try vt.snapshot.decode(testing.allocator, testing.io, &reader, .{
-        .max_continuation_bytes = 1024,
-    });
-    defer decoded.deinit(testing.allocator);
-    try testing.expectEqualStrings("\x1b]2;ti", decoded.continuation.bytes);
-}
-
-test "a snapshot inside a sequence too long to carry fails until the sequence ends" {
-    const primary: *Primary = try .create(testing.allocator, testing.io, .{
-        .cols = 10,
-        .rows = 3,
-        .continuation_max_bytes = 8,
-    });
-    defer primary.destroy();
-
-    var encoded: std.Io.Writer.Allocating = .init(testing.allocator);
-    defer encoded.deinit();
-    try primary.output("\x1b]2;a long title");
-    try testing.expectError(error.ContinuationUnavailable, primary.snapshot(testing.allocator, &encoded.writer));
-    try primary.output("\x07");
-    try testing.expectEqual(2, try primary.snapshot(testing.allocator, &encoded.writer));
 }
