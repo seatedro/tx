@@ -58,7 +58,7 @@ pub fn main(init: std.process.Init) !u8 {
     const login_user = user orelse paths.userName(environ) orelse return fail("can't tell the local user name; use -l", .{});
     if (login_user.len == 0 or login_user.len > auth.login.max_user_len) return fail("invalid user name", .{});
 
-    const address = resolve(io, host, port) catch |err| return fail("{s}: {t}", .{ host, err });
+    const address = resolve(io, host, port) catch |err| return fail("can't resolve {s}: {t}", .{ host, err });
 
     // The agent's keys, before the network: without one there's no login.
     const agent_path = environ.get("SSH_AUTH_SOCK") orelse return fail("SSH_AUTH_SOCK is not set; tx logs in with keys from the SSH agent", .{});
@@ -92,7 +92,11 @@ pub fn main(init: std.process.Init) !u8 {
     switch (outcome) {
         .exited => |exit| return exit.status,
         .detached => |id| {
-            if (id) |n| std.debug.print("tx: detached from session {d}; reattach with tx --attach {d} {s}\n", .{ n, n, destination.? });
+            // The command that reattaches, with the port if it isn't the
+            // default.
+            var port_buf: [16]u8 = undefined;
+            const port_arg = if (port == default_port) "" else std.fmt.bufPrint(&port_buf, "-p {d} ", .{port}) catch unreachable;
+            if (id) |n| std.debug.print("tx: detached from session {d}; reattach with tx {s}--attach {d} {s}\n", .{ n, port_arg, n, destination.? });
             return 0;
         },
         .disconnected => |reason| return fail("connection closed: {t}", .{reason}),

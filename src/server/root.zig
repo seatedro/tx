@@ -148,7 +148,7 @@ pub const Server = struct {
             .host_loopback = try addresses.hostLoopback(gpa, io, options.listen),
             .timer = try .init(),
         };
-        try self.listenOnNewAddresses(.initial);
+        try self.updateAddresses(.initial);
         if (self.endpoints.items.len == 0) return error.NoAddresses;
         self.rescan.?.timer.run(loop, &self.rescan.?.c, rescan_ms, Server, self, onRescan);
     }
@@ -216,7 +216,7 @@ pub const Server = struct {
 
     /// Binds the wildcard's addresses that have no endpoint, and stops the
     /// endpoints of addresses that went away.
-    fn listenOnNewAddresses(self: *Server, when: enum { initial, rescan }) !void {
+    fn updateAddresses(self: *Server, when: enum { initial, rescan }) !void {
         const r = &self.rescan.?;
         const found = try addresses.interfaces(self.gpa, r.wildcard);
         defer self.gpa.free(found);
@@ -267,7 +267,7 @@ pub const Server = struct {
         result catch return .disarm;
         if (self.stopping) return .disarm;
 
-        self.listenOnNewAddresses(.rescan) catch |err| log.warn("looking for addresses failed: {t}", .{err});
+        self.updateAddresses(.rescan) catch |err| log.warn("looking for addresses failed: {t}", .{err});
 
         // Retired endpoints are freed once the loop has finished with them.
         var i: usize = 0;
