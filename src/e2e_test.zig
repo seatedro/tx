@@ -758,12 +758,35 @@ test "a server on a wildcard address answers on each address it binds" {
     for (st.server.endpoints.items) |e| try bound.append(gpa, e.local);
     try testing.expect(bound.items.len > 0);
 
+    // Every endpoint shares the first one's port.
+    for (bound.items) |address| try testing.expectEqual(bound.items[0].getPort(), address.getPort());
+
     for (bound.items) |address| {
+        // macOS can't send to its own Tailscale IPv6 address, through tx or
+        // otherwise.
+        if (!try reachesItself(address)) continue;
+
         var rc: RawClient = undefined;
         try rc.initTo(&st, address, login.key, .{ .revision = proto.revision, .term = "xterm-256color", .cols = 80, .rows = 24 });
         defer rc.deinit();
         _ = try rc.waitAttached();
     }
+}
+
+/// Whether a UDP datagram sent to `address`, from this machine, arrives.
+fn reachesItself(address: Io.net.IpAddress) !bool {
+    var any = address;
+    any.setPort(0);
+    const receiver = try any.bind(testing.io, .{ .mode = .dgram });
+    defer receiver.close(testing.io);
+    const sender = try any.bind(testing.io, .{ .mode = .dgram });
+    defer sender.close(testing.io);
+
+    sender.send(testing.io, &receiver.address, "ping") catch return false;
+    var buf: [16]u8 = undefined;
+    const timeout: Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(500), .clock = .awake } };
+    _ = receiver.receiveTimeout(testing.io, &buf, timeout) catch return false;
+    return true;
 }
 
 /// The size of a session's primary terminal, read on the server thread.
