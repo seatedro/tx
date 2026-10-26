@@ -54,7 +54,7 @@ pub const Transcript = struct {
     }
 
     /// Checks a client's signature blob made with `key`.
-    pub fn verify(t: Transcript, key: ssh.Key, signature_blob: []const u8) sshsig.VerifyError!void {
+    pub fn verify(t: Transcript, key: *const ssh.PublicKey, signature_blob: []const u8) sshsig.VerifyError!void {
         return sshsig.verify(key, signature_blob, &t.signedData());
     }
 };

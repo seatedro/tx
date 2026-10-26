@@ -57,10 +57,16 @@ const Login = struct {
     }
 
     /// Adds `key` to the `authorized_keys` file.
-    fn authorize(l: *Login, key: auth.Key) !void {
+    fn authorize(l: *Login, key: *const auth.ssh.PublicKey) !void {
         const old = try l.tmp.dir.readFileAlloc(testing.io, "authorized_keys", gpa, .unlimited);
         defer gpa.free(old);
-        const new = try std.fmt.allocPrint(gpa, "{s}ssh-ed25519 {s}\n", .{ old, auth.ssh.KeyText.init(key).slice() });
+        var text_buf: [std.base64.standard.Encoder.calcSize(auth.ssh.max_key_blob_len)]u8 = undefined;
+        const text = std.base64.standard.Encoder.encode(&text_buf, key.blob());
+        const key_type = switch (key.kind) {
+            .ed25519 => auth.ssh.ed25519,
+            .rsa => auth.ssh.rsa,
+        };
+        const new = try std.fmt.allocPrint(gpa, "{s}{s} {s}\n", .{ old, key_type, text });
         defer gpa.free(new);
         try l.tmp.dir.writeFile(testing.io, .{ .sub_path = "authorized_keys", .data = new });
     }
@@ -96,7 +102,7 @@ const Login = struct {
     /// Client options for a client on `pty`, logging in with `keys` from
     /// the agent. The result points into `l`, until the next call.
     fn clientOptions(l: *Login, st: *const ServerThread, pty: *const TestPty, keys: []const auth.Key) client.session.Options {
-        for (keys, 0..) |key, i| l.identities[i] = .{ .key = key, .source = .agent };
+        for (keys, 0..) |key, i| l.identities[i] = .{ .key = .fromEd25519(key), .source = .agent };
         return .{
             .server = st.server.address(),
             .host_keys = &st.host_keys,
@@ -563,7 +569,7 @@ fn loginWithKeyFile(text: []const u8, ask: *const fn ([]const u8, []u8, posix.fd
     defer gpa.free(path);
     var file: auth.private_key.PrivateKeyFile = try .parse(gpa, text);
     defer file.deinit(gpa);
-    try login.authorize(file.public_key);
+    try login.authorize(&.fromEd25519(file.public_key));
 
     var st: ServerThread = undefined;
     try st.init(try login.serverOptions(&environ, &.{ "/bin/sh", "-c", "printf 'ready\\r\\n'" }));
@@ -573,13 +579,41 @@ fn loginWithKeyFile(text: []const u8, ask: *const fn ([]const u8, []u8, posix.fd
     defer pty.close();
     var ct: ClientThread = .{ .options = login.clientOptions(&st, &pty, &.{other.public_key.toBytes()}) };
     const ids = [_]client.session.Identity{
-        .{ .key = other.public_key.toBytes(), .source = .agent },
-        .{ .key = file.public_key, .source = .{ .file = path } },
+        .{ .key = .fromEd25519(other.public_key.toBytes()), .source = .agent },
+        .{ .key = .fromEd25519(file.public_key), .source = .{ .file = path } },
     };
     ct.options.identities = &ids;
     ct.options.passphrase = ask;
     try ct.start();
     return ct.join(&pty);
+}
+
+test "an RSA key from the agent logs in" {
+    transport.crypto.init(testing.io);
+    var environ = try testEnviron();
+    defer environ.deinit();
+
+    // The agent holds only the RSA key, and authorized_keys lists it.
+    var login: Login = undefined;
+    try login.init(&.{});
+    defer login.deinit();
+    login.agent.rsa_keys = (&auth.agent.test_rsa_key)[0..1];
+    const rsa_key = auth.agent.test_rsa_key.public();
+    try login.authorize(&rsa_key);
+
+    var st: ServerThread = undefined;
+    try st.init(try login.serverOptions(&environ, &.{ "/bin/sh", "-c", "printf 'ready\\r\\n'" }));
+    defer st.deinit();
+
+    var pty: TestPty = try .open();
+    defer pty.close();
+    var ct: ClientThread = .{ .options = login.clientOptions(&st, &pty, &.{}) };
+    const ids = [_]client.session.Identity{.{ .key = rsa_key, .source = .agent }};
+    ct.options.identities = &ids;
+    try ct.start();
+    const outcome = try ct.join(&pty);
+    try testing.expectEqual(0, outcome.exited.status);
+    try testing.expectEqual(1, login.agent.signatures.load(.monotonic));
 }
 
 test "a key file logs in when the agent's keys don't" {
