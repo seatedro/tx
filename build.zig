@@ -22,7 +22,13 @@ pub fn build(b: *std.Build) void {
     });
     b.getInstallStep().dependOn(&ngtcp2_crypto.step);
 
+    const xev = b.dependency("libxev", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("xev");
+
     const transport_libs: TransportLibs = .{
+        .xev = xev,
         .ngtcp2 = ngtcp2,
         .ngtcp2_crypto = ngtcp2_crypto,
         .picotls = picotls,
@@ -164,6 +170,7 @@ fn addTestRuns(
 }
 
 const TransportLibs = struct {
+    xev: *std.Build.Module,
     ngtcp2: *std.Build.Step.Compile,
     ngtcp2_crypto: *std.Build.Step.Compile,
     picotls: *std.Build.Step.Compile,
@@ -194,6 +201,7 @@ fn transportModule(
         .link_libc = true,
     });
     mod.addImport("c", c.createModule());
+    mod.addImport("xev", libs.xev);
     mod.addImport("crypto", cryptoModule(b, target, optimize, libs.picotls));
     mod.addIncludePath(b.path("src/transport/include"));
     mod.addIncludePath(b.path("src/crypto/include"));
