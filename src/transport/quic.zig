@@ -122,6 +122,9 @@ pub const Connection = struct {
         /// not use it.
         server_name: ?[*:0]const u8 = null,
         idle_timeout_ns: u64 = 30 * std.time.ns_per_s,
+        /// Send a PING after this long without other packets, so an idle
+        /// connection stays open.
+        keep_alive_ns: ?u64 = null,
         /// Bytes the peer may send on each stream ahead of `consume`.
         stream_window: u64 = 8 << 20,
         /// Bytes the peer may send on all streams together ahead of
@@ -184,6 +187,7 @@ pub const Connection = struct {
             self,
         ));
         self.conn = conn.?;
+        if (options.keep_alive_ns) |ns| c.ngtcp2_conn_set_keep_alive_timeout(self.conn, ns);
         self.session = c.tx_tls_session_new_client(client.tls, self.conn, &self.conn_ref, options.server_name) orelse {
             c.ngtcp2_conn_del(self.conn);
             return error.OutOfMemory;
@@ -247,6 +251,7 @@ pub const Connection = struct {
             self,
         ));
         self.conn = conn.?;
+        if (options.keep_alive_ns) |ns| c.ngtcp2_conn_set_keep_alive_timeout(self.conn, ns);
         self.session = c.tx_tls_session_new_server(server.tls, self.conn, &self.conn_ref) orelse {
             c.ngtcp2_conn_del(self.conn);
             return error.OutOfMemory;
