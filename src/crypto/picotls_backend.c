@@ -489,14 +489,13 @@ void tx_ed25519_signer_dispose(tx_ed25519_signer *signer) {
   ptls_clear_memory(signer->secret_key, sizeof(signer->secret_key));
 }
 
-static int ed25519_verify_sign(void *pinned, uint16_t algo, ptls_iovec_t data, ptls_iovec_t sig) {
+static int ed25519_verify_sign(void *key, uint16_t algo, ptls_iovec_t data, ptls_iovec_t sig) {
   if (data.base == NULL)
     return 0; /* cleanup call; nothing to free */
   if (algo != PTLS_SIGNATURE_ED25519 || sig.len != 64) {
     return PTLS_ALERT_DECRYPT_ERROR;
   }
-  return tx_ed25519_verify(pinned, data.base, data.len, sig.base) == 0 ? 0
-                                                                       : PTLS_ALERT_DECRYPT_ERROR;
+  return tx_ed25519_verify(key, data.base, data.len, sig.base) == 0 ? 0 : PTLS_ALERT_DECRYPT_ERROR;
 }
 
 static int ed25519_verify_cert(ptls_verify_certificate_t *_self, ptls_t *tls,
@@ -505,19 +504,41 @@ static int ed25519_verify_cert(ptls_verify_certificate_t *_self, ptls_t *tls,
                                void **verify_data, ptls_iovec_t *certs, size_t num_certs) {
   (void)tls, (void)server_name;
   tx_ed25519_verifier *self = (tx_ed25519_verifier *)_self;
-  uint8_t want[TX_ED25519_SPKI_LEN];
-  tx_ed25519_spki(want, self->pinned);
-  if (num_certs != 1 || certs[0].len != sizeof(want) ||
-      !ptls_mem_equal(certs[0].base, want, sizeof(want))) {
+
+  /* The certificate is an Ed25519 SubjectPublicKeyInfo: a fixed prefix,
+     then the key. Rebuilding it from the key checks the prefix. */
+  if (num_certs != 1 || certs[0].len != TX_ED25519_SPKI_LEN) {
     return PTLS_ALERT_BAD_CERTIFICATE;
   }
+  const uint8_t *key = certs[0].base + TX_ED25519_SPKI_LEN - 32;
+  uint8_t want[TX_ED25519_SPKI_LEN];
+  tx_ed25519_spki(want, key);
+  if (!ptls_mem_equal(certs[0].base, want, sizeof(want))) {
+    return PTLS_ALERT_BAD_CERTIFICATE;
+  }
+  memcpy(self->presented, key, sizeof(self->presented));
+  self->has_presented = 1;
+
+  int accepted = self->accept_any;
+  for (size_t i = 0; i < self->count && !accepted; ++i) {
+    accepted = ptls_mem_equal(self->keys[i], key, 32);
+  }
+  if (!accepted) {
+    return PTLS_ALERT_BAD_CERTIFICATE;
+  }
+
+  /* CertificateVerify proves the server holds the key's secret half. */
   *verify_sign = ed25519_verify_sign;
-  *verify_data = self->pinned;
+  *verify_data = self->presented;
   return 0;
 }
 
-void tx_ed25519_verifier_init(tx_ed25519_verifier *verifier, const uint8_t pinned[32]) {
+void tx_ed25519_verifier_init(tx_ed25519_verifier *verifier, const uint8_t (*keys)[32],
+                              size_t count, int accept_any) {
+  memset(verifier, 0, sizeof(*verifier));
   verifier->super.cb = ed25519_verify_cert;
   verifier->super.algos = ed25519_algos;
-  memcpy(verifier->pinned, pinned, sizeof(verifier->pinned));
+  verifier->keys = keys;
+  verifier->count = count;
+  verifier->accept_any = accept_any;
 }

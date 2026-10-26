@@ -226,7 +226,7 @@ static void tls_pair(const char *name, int client_tx, int server_tx, int chacha,
   tx_ed25519_signer signer;
   tx_ed25519_signer_init(&signer, secret_key);
   tx_ed25519_verifier verifier;
-  tx_ed25519_verifier_init(&verifier, pub);
+  tx_ed25519_verifier_init(&verifier, (const uint8_t (*)[32])pub, 1, 0);
 
   ptls_cipher_suite_t *tx_suites[] = {chacha ? &tx_chacha20poly1305sha256 : &tx_aes128gcmsha256,
                                       NULL};

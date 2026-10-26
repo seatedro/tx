@@ -80,24 +80,45 @@ pub fn build(b: *std.Build) void {
     });
     addTestRuns(b, proto_tests, test_step, test_network_step);
 
+    const auth_tests = b.addTest(.{
+        .name = "auth-test",
+        .root_module = authModule(b, target, optimize),
+    });
+    addTestRuns(b, auth_tests, test_step, test_network_step);
+
     // One instance of each module for the executables and the end-to-end
     // test, so that they share their dependencies' code and globals.
     const term = termModule(b, target, optimize, ghostty_vt);
     const transport = transportModule(b, target, optimize, transport_libs);
     const proto = protoModule(b, target, optimize);
+    const auth = authModule(b, target, optimize);
     const session = sessionModule(b, target, optimize, term, wake);
-    const client = clientModule(b, target, optimize, .{ .xev = xev, .transport = transport, .proto = proto, .wake = wake });
+    const client = clientModule(b, target, optimize, .{ .xev = xev, .transport = transport, .proto = proto, .auth = auth, .wake = wake });
     const server = serverModule(b, target, optimize, .{
         .xev = xev,
         .transport = transport,
         .proto = proto,
+        .auth = auth,
         .session = session,
         .term = term,
     });
 
+    const server_tests = b.addTest(.{
+        .name = "server-test",
+        .root_module = serverModule(b, target, optimize, .{
+            .xev = xev,
+            .transport = transport,
+            .proto = proto,
+            .auth = auth,
+            .session = session,
+            .term = term,
+        }),
+    });
+    addTestRuns(b, server_tests, test_step, test_network_step);
+
     const client_tests = b.addTest(.{
         .name = "client-test",
-        .root_module = clientModule(b, target, optimize, .{ .xev = xev, .transport = transport, .proto = proto, .wake = wake }),
+        .root_module = clientModule(b, target, optimize, .{ .xev = xev, .transport = transport, .proto = proto, .auth = auth, .wake = wake }),
     });
     addTestRuns(b, client_tests, test_step, test_network_step);
 
@@ -114,6 +135,7 @@ pub fn build(b: *std.Build) void {
     e2e.addImport("client", client);
     e2e.addImport("term", term);
     e2e.addImport("proto", proto);
+    e2e.addImport("auth", auth);
     addTestRuns(b, b.addTest(.{ .name = "e2e-test", .root_module = e2e }), test_step, test_network_step);
 
     const tx = b.createModule(.{
@@ -123,6 +145,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     tx.addImport("client", client);
+    tx.addImport("auth", auth);
     b.installArtifact(b.addExecutable(.{ .name = "tx", .root_module = tx }));
 
     const tx_session = b.createModule(.{
@@ -134,6 +157,7 @@ pub fn build(b: *std.Build) void {
     tx_session.addImport("xev", xev);
     tx_session.addImport("server", server);
     tx_session.addImport("transport", transport);
+    tx_session.addImport("auth", auth);
     b.installArtifact(b.addExecutable(.{ .name = "tx-session", .root_module = tx_session }));
 }
 
@@ -141,6 +165,7 @@ const ServerDeps = struct {
     xev: *std.Build.Module,
     transport: *std.Build.Module,
     proto: *std.Build.Module,
+    auth: *std.Build.Module,
     session: *std.Build.Module,
     term: *std.Build.Module,
 };
@@ -160,6 +185,7 @@ fn serverModule(
     mod.addImport("xev", deps.xev);
     mod.addImport("transport", deps.transport);
     mod.addImport("proto", deps.proto);
+    mod.addImport("auth", deps.auth);
     mod.addImport("session", deps.session);
     mod.addImport("term", deps.term);
     return mod;
@@ -169,6 +195,7 @@ const ClientDeps = struct {
     xev: *std.Build.Module,
     transport: *std.Build.Module,
     proto: *std.Build.Module,
+    auth: *std.Build.Module,
     wake: *std.Build.Module,
 };
 
@@ -179,6 +206,18 @@ fn protoModule(
 ) *std.Build.Module {
     return b.createModule(.{
         .root_source_file = b.path("src/proto/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+}
+
+fn authModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Module {
+    return b.createModule(.{
+        .root_source_file = b.path("src/auth/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -199,6 +238,7 @@ fn clientModule(
     mod.addImport("xev", deps.xev);
     mod.addImport("transport", deps.transport);
     mod.addImport("proto", deps.proto);
+    mod.addImport("auth", deps.auth);
     mod.addImport("wake", deps.wake);
     return mod;
 }

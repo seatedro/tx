@@ -1,7 +1,8 @@
 //! tx-session and tx end to end in one process. The server and each client
 //! run on their own thread and loop. A pseudo-terminal pair stands in for
 //! the user's terminal: the client uses the slave, and the test types into
-//! and reads from the master.
+//! and reads from the master. Clients log in with a key from a test agent,
+//! listed in an `authorized_keys` file in a temporary directory.
 const std = @import("std");
 const builtin = @import("builtin");
 const testing = std.testing;
@@ -15,9 +16,77 @@ const server_pkg = @import("server");
 const client = @import("client");
 const term = @import("term");
 const proto = @import("proto");
+const auth = @import("auth");
 
 const gpa = testing.allocator;
 const timeout_ms = 10_000;
+
+/// The account the test server accepts logins for.
+const test_user = "tx-test";
+
+/// A user key, an agent holding keys, and an `authorized_keys` file
+/// listing the user key.
+const Login = struct {
+    tmp: testing.TmpDir,
+    key: Ed25519.KeyPair,
+    agent: auth.agent.TestAgent = undefined,
+    agent_path: []u8,
+    authorized_keys: []u8,
+
+    /// The agent holds `agent_keys`, or the user key if null.
+    fn init(l: *Login, agent_keys: ?[]const Ed25519.KeyPair) !void {
+        var tmp = testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const dir = buf[0..try tmp.dir.realPath(testing.io, &buf)];
+
+        l.* = .{
+            .tmp = tmp,
+            .key = .generate(testing.io),
+            .agent_path = try std.fs.path.join(gpa, &.{ dir, "agent.sock" }),
+            .authorized_keys = try std.fs.path.join(gpa, &.{ dir, "authorized_keys" }),
+        };
+
+        const line = try std.fmt.allocPrint(gpa, "ssh-ed25519 {s} test\n", .{auth.ssh.KeyText.init(l.key.public_key.toBytes()).slice()});
+        defer gpa.free(line);
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = "authorized_keys", .data = line });
+
+        try l.agent.start(testing.io, l.agent_path, agent_keys orelse (&l.key)[0..1]);
+    }
+
+    fn deinit(l: *Login) void {
+        l.agent.stop(l.agent_path);
+        gpa.free(l.agent_path);
+        gpa.free(l.authorized_keys);
+        l.tmp.cleanup();
+    }
+
+    /// Server options for a server that runs `argv`.
+    fn serverOptions(l: *const Login, environ: *const std.process.Environ.Map, argv: []const []const u8) !server_pkg.Options {
+        return .{
+            .listen = try .parseIp4("127.0.0.1", 0),
+            .identity = Ed25519.KeyPair.generate(testing.io),
+            .user = test_user,
+            .authorized_keys = (&l.authorized_keys)[0..1],
+            .environ = environ,
+            .argv = argv,
+        };
+    }
+
+    /// Client options for a client on `pty`, with the keys the agent holds.
+    fn clientOptions(l: *const Login, st: *const ServerThread, pty: *const TestPty, keys: []const auth.Key) client.session.Options {
+        return .{
+            .server = st.server.address(),
+            .host_keys = &st.host_keys,
+            .user = test_user,
+            .agent = l.agent_path,
+            .keys = keys,
+            .in_fd = pty.slave,
+            .out_fd = pty.slave,
+            .term = "xterm-256color",
+        };
+    }
+};
 
 fn nowMs() i64 {
     return Io.Clock.awake.now(testing.io).toMilliseconds();
@@ -34,6 +103,8 @@ const ServerThread = struct {
     thread: std.Thread = undefined,
     pending: std.atomic.Value(?*Request) = .init(null),
     stopping: bool = false,
+    /// The server's public key, for clients to accept.
+    host_keys: [1][32]u8 = undefined,
 
     const Request = struct {
         run: *const fn (req: *Request, st: *ServerThread) void,
@@ -43,6 +114,7 @@ const ServerThread = struct {
     fn init(st: *ServerThread, options: server_pkg.Options) !void {
         st.* = .{ .loop = try .init(.{}), .server = undefined, .wake = try .init() };
         try st.server.init(gpa, testing.io, &st.loop, options);
+        st.host_keys = .{options.identity.public_key.toBytes()};
         st.wake.wait(&st.loop, &st.wake_c, ServerThread, st, onWake);
         st.thread = try std.Thread.spawn(.{}, run, .{st});
     }
@@ -140,6 +212,15 @@ const TestPty = struct {
         if (c.write(p.master, bytes.ptr, bytes.len) != bytes.len) return error.WriteFailed;
     }
 
+    /// Reads what the client writes to its terminal for up to `ms`.
+    fn readFor(p: *TestPty, ms: i32) !void {
+        var fds = [_]posix.pollfd{.{ .fd = p.master, .events = posix.POLL.IN, .revents = 0 }};
+        if (c.poll(&fds, 1, ms) != 1) return;
+        var buf: [4096]u8 = undefined;
+        const n = c.read(p.master, &buf, buf.len);
+        if (n > 0) try p.output.appendSlice(gpa, buf[0..@intCast(n)]);
+    }
+
     /// Reads what the client wrote to its terminal until it contains
     /// `needle`.
     fn readUntil(p: *TestPty, needle: []const u8) !void {
@@ -164,6 +245,7 @@ const TestPty = struct {
 const ClientThread = struct {
     options: client.session.Options,
     result: ?anyerror!client.session.Outcome = null,
+    done: std.atomic.Value(bool) = .init(false),
     thread: std.Thread = undefined,
 
     fn start(ct: *ClientThread) !void {
@@ -172,9 +254,14 @@ const ClientThread = struct {
 
     fn run(ct: *ClientThread) void {
         ct.result = client.session.run(gpa, testing.io, ct.options);
+        ct.done.store(true, .release);
     }
 
-    fn join(ct: *ClientThread) !client.session.Outcome {
+    /// Keeps reading the client's terminal until the client returns. On
+    /// macOS, restoring the terminal's attributes waits until its output
+    /// has been read, and a pty holds little output.
+    fn join(ct: *ClientThread, pty: *TestPty) !client.session.Outcome {
+        while (!ct.done.load(.acquire)) try pty.readFor(10);
         ct.thread.join();
         return ct.result.?;
     }
@@ -197,37 +284,29 @@ test "a session runs, detaches, reattaches and exits through tx-session and tx" 
     var environ: std.process.Environ.Map = .init(gpa);
     defer environ.deinit();
     try environ.put("PATH", testing.environ.getPosix("PATH") orelse "/usr/bin:/bin");
+    var login: Login = undefined;
+    try login.init(null);
+    defer login.deinit();
+    const keys = [_]auth.Key{login.key.public_key.toBytes()};
 
     var st: ServerThread = undefined;
-    try st.init(.{
-        .listen = try .parseIp4("127.0.0.1", 0),
-        .identity = Ed25519.KeyPair.generate(testing.io),
-        .environ = &environ,
-        .argv = &.{
-            "/bin/sh", "-c",
-            \\printf 'hello \033[1mbold\033[m\r\n'
-            \\i=0; while [ $i -lt 40 ]; do printf 'line %d\r\n' $i; i=$((i + 1)); done
-            \\printf 'term=%s\r\n' "$TERM"
-            \\printf 'ready\r\n'
-            \\read -r a
-            \\printf 'got %s\r\n' "$a"
-            \\read -r b
-            \\exit 3
-        },
-    });
+    try st.init(try login.serverOptions(&environ, &.{
+        "/bin/sh", "-c",
+        \\printf 'hello \033[1mbold\033[m\r\n'
+        \\i=0; while [ $i -lt 40 ]; do printf 'line %d\r\n' $i; i=$((i + 1)); done
+        \\printf 'term=%s\r\n' "$TERM"
+        \\printf 'ready\r\n'
+        \\read -r a
+        \\printf 'got %s\r\n' "$a"
+        \\read -r b
+        \\exit 3
+    }));
     defer st.deinit();
-    const pinned = st.server.options.identity.public_key.toBytes();
 
     // A new session.
     var first: TestPty = try .open();
     defer first.close();
-    var a: ClientThread = .{ .options = .{
-        .server = st.server.address(),
-        .pinned = pinned,
-        .in_fd = first.slave,
-        .out_fd = first.slave,
-        .term = "xterm-256color",
-    } };
+    var a: ClientThread = .{ .options = login.clientOptions(&st, &first, &keys) };
     try a.start();
     try first.readUntil("ready");
     try testing.expect(std.mem.indexOf(u8, first.output.items, "term=xterm-256color") != null);
@@ -236,81 +315,211 @@ test "a session runs, detaches, reattaches and exits through tx-session and tx" 
 
     // `~.` detaches. The session keeps running.
     try first.type_("~.");
-    const detached = try a.join();
+    const detached = try a.join(&first);
     const session_id = detached.detached.?;
     try expectMatchesPrimary(&st, session_id, first.output.items);
 
     // Reattach from another terminal: the log is replayed into it.
     var second: TestPty = try .open();
     defer second.close();
-    var b: ClientThread = .{ .options = .{
-        .server = st.server.address(),
-        .pinned = pinned,
-        .session_id = session_id,
-        .in_fd = second.slave,
-        .out_fd = second.slave,
-        .term = "xterm-256color",
-    } };
+    var b: ClientThread = .{ .options = login.clientOptions(&st, &second, &keys) };
+    b.options.session_id = session_id;
     try b.start();
     try second.readUntil("got abc");
     try expectMatchesPrimary(&st, session_id, second.output.items);
 
     // The program exits; the client reports its status.
     try second.type_("q\r");
-    const exited = try b.join();
+    const exited = try b.join(&second);
     try testing.expectEqual(3, exited.exited.status);
     try testing.expectEqual(null, try primaryDump(&st, session_id));
 }
 
-test "a client pinning another key is refused" {
+test "a client accepting another server key is refused" {
     transport.crypto.init(testing.io);
     var environ: std.process.Environ.Map = .init(gpa);
     defer environ.deinit();
+    var login: Login = undefined;
+    try login.init(null);
+    defer login.deinit();
     var st: ServerThread = undefined;
-    try st.init(.{
-        .listen = try .parseIp4("127.0.0.1", 0),
-        .identity = Ed25519.KeyPair.generate(testing.io),
-        .environ = &environ,
-        .argv = &.{ "/bin/sh", "-c", "sleep 10" },
-    });
+    try st.init(try login.serverOptions(&environ, &.{ "/bin/sh", "-c", "sleep 10" }));
     defer st.deinit();
 
     var pty: TestPty = try .open();
     defer pty.close();
-    var ct: ClientThread = .{ .options = .{
-        .server = st.server.address(),
-        .pinned = Ed25519.KeyPair.generate(testing.io).public_key.toBytes(),
-        .in_fd = pty.slave,
-        .out_fd = pty.slave,
-        .term = "xterm-256color",
-    } };
+    var ct: ClientThread = .{ .options = login.clientOptions(&st, &pty, &.{login.key.public_key.toBytes()}) };
+    ct.options.host_keys = &.{Ed25519.KeyPair.generate(testing.io).public_key.toBytes()};
     try ct.start();
-    const outcome = try ct.join();
-    try testing.expectEqual(transport.endpoint.CloseReason.handshake_failed, outcome.disconnected);
+    const outcome = try ct.join(&pty);
+    try testing.expectEqual(st.host_keys[0], outcome.host_key_refused);
+}
+
+test "the agent's keys are probed in order and only the accepted one signs" {
+    transport.crypto.init(testing.io);
+    var environ = try testEnviron();
+    defer environ.deinit();
+
+    // The agent holds an unlisted key first, then the user key.
+    const unlisted: Ed25519.KeyPair = .generate(testing.io);
+    var login: Login = undefined;
+    try login.init(null);
+    defer login.deinit();
+    login.agent.keys = &.{ unlisted, login.key };
+    const keys = [_]auth.Key{ unlisted.public_key.toBytes(), login.key.public_key.toBytes() };
+
+    var st: ServerThread = undefined;
+    try st.init(try login.serverOptions(&environ, &.{ "/bin/sh", "-c", "printf 'ready\\r\\n'; read -r a" }));
+    defer st.deinit();
+
+    var pty: TestPty = try .open();
+    defer pty.close();
+    var ct: ClientThread = .{ .options = login.clientOptions(&st, &pty, &keys) };
+    ct.options.show_session_id = true;
+    try ct.start();
+    try pty.readUntil("tx: session 1\r\n");
+    try pty.readUntil("ready");
+    try pty.type_("\r");
+    _ = try ct.join(&pty);
+
+    try testing.expectEqual(1, login.agent.signatures.load(.monotonic));
+}
+
+test "a client whose keys aren't in authorized_keys is refused" {
+    transport.crypto.init(testing.io);
+    var environ: std.process.Environ.Map = .init(gpa);
+    defer environ.deinit();
+
+    const unlisted: Ed25519.KeyPair = .generate(testing.io);
+    var login: Login = undefined;
+    try login.init(&.{unlisted});
+    defer login.deinit();
+    var st: ServerThread = undefined;
+    try st.init(try login.serverOptions(&environ, &.{ "/bin/sh", "-c", "sleep 10" }));
+    defer st.deinit();
+
+    var pty: TestPty = try .open();
+    defer pty.close();
+    var ct: ClientThread = .{ .options = login.clientOptions(&st, &pty, &.{unlisted.public_key.toBytes()}) };
+    try ct.start();
+    const outcome = try ct.join(&pty);
+    try testing.expectEqualStrings("the server accepted none of the agent's keys for tx-test", outcome.refused.message.slice());
+    try testing.expectEqual(0, login.agent.signatures.load(.monotonic));
+}
+
+test "a client logging in as another user is refused" {
+    transport.crypto.init(testing.io);
+    var environ: std.process.Environ.Map = .init(gpa);
+    defer environ.deinit();
+    var login: Login = undefined;
+    try login.init(null);
+    defer login.deinit();
+    var st: ServerThread = undefined;
+    try st.init(try login.serverOptions(&environ, &.{ "/bin/sh", "-c", "sleep 10" }));
+    defer st.deinit();
+
+    var pty: TestPty = try .open();
+    defer pty.close();
+    var ct: ClientThread = .{ .options = login.clientOptions(&st, &pty, &.{login.key.public_key.toBytes()}) };
+    ct.options.user = "root";
+    try ct.start();
+    const outcome = try ct.join(&pty);
+    try testing.expectEqualStrings("the server accepted none of the agent's keys for root", outcome.refused.message.slice());
+}
+
+test "a refused signature fails the login" {
+    transport.crypto.init(testing.io);
+    var environ: std.process.Environ.Map = .init(gpa);
+    defer environ.deinit();
+    var login: Login = undefined;
+    try login.init(null);
+    defer login.deinit();
+    login.agent.refuse.store(true, .release);
+    var st: ServerThread = undefined;
+    try st.init(try login.serverOptions(&environ, &.{ "/bin/sh", "-c", "sleep 10" }));
+    defer st.deinit();
+
+    var pty: TestPty = try .open();
+    defer pty.close();
+    var ct: ClientThread = .{ .options = login.clientOptions(&st, &pty, &.{login.key.public_key.toBytes()}) };
+    try ct.start();
+    const outcome = try ct.join(&pty);
+    try testing.expectEqualStrings("the SSH agent refused to sign", outcome.refused.message.slice());
+}
+
+test "a signature over another transcript is refused" {
+    transport.crypto.init(testing.io);
+    var environ: std.process.Environ.Map = .init(gpa);
+    defer environ.deinit();
+    var login: Login = undefined;
+    try login.init(null);
+    defer login.deinit();
+    var st: ServerThread = undefined;
+    try st.init(try login.serverOptions(&environ, &.{ "/bin/sh", "-c", "sleep 10" }));
+    defer st.deinit();
+
+    var rc: RawClient = undefined;
+    try rc.init(&st, login.key, .{ .revision = proto.revision, .term = "xterm-256color", .cols = 80, .rows = 24 });
+    defer rc.deinit();
+    rc.login = .wrong_exporter;
+    try testing.expectEqual(@backingInt(server_pkg.ErrorCode.auth), try rc.waitError());
+    try testing.expectEqual(null, rc.attached);
+}
+
+test "attaching before login is refused" {
+    transport.crypto.init(testing.io);
+    var environ: std.process.Environ.Map = .init(gpa);
+    defer environ.deinit();
+    var login: Login = undefined;
+    try login.init(null);
+    defer login.deinit();
+    var st: ServerThread = undefined;
+    try st.init(try login.serverOptions(&environ, &.{ "/bin/sh", "-c", "sleep 10" }));
+    defer st.deinit();
+
+    var rc: RawClient = undefined;
+    try rc.init(&st, login.key, .{ .revision = proto.revision, .term = "xterm-256color", .cols = 80, .rows = 24 });
+    defer rc.deinit();
+    rc.login = .skip;
+    try testing.expectEqual(@backingInt(server_pkg.ErrorCode.protocol), try rc.waitError());
+    try testing.expectEqual(null, rc.attached);
 }
 
 /// A client that speaks the protocol directly, for messages `tx` doesn't
-/// send.
+/// send. It logs in with `key`, signing itself.
 const RawClient = struct {
     loop: xev.Loop,
     tls: transport.quic.Client,
     endpoint: transport.endpoint.Endpoint,
+    conn: ?*transport.endpoint.Conn = null,
     stream: ?*transport.endpoint.Stream = null,
     decoder: proto.Decoder,
     hello: proto.Hello,
+    key: Ed25519.KeyPair,
+    /// Set before the loop first runs.
+    login: enum { normal, wrong_exporter, skip } = .normal,
     attached: ?u64 = null,
+    error_code: ?u32 = null,
     output: std.ArrayList(u8) = .empty,
 
-    fn init(rc: *RawClient, server: Io.net.IpAddress, pinned: [32]u8, hello: proto.Hello) !void {
+    fn init(rc: *RawClient, st: *const ServerThread, key: Ed25519.KeyPair, hello: proto.Hello) !void {
+        return rc.initTo(st, st.server.address(), key, hello);
+    }
+
+    fn initTo(rc: *RawClient, st: *const ServerThread, server: Io.net.IpAddress, key: Ed25519.KeyPair, hello: proto.Hello) !void {
         rc.* = .{
             .loop = try .init(.{}),
-            .tls = try .init(pinned),
+            .tls = try .init(.{ .keys = &.{st.server.options.identity.public_key.toBytes()} }),
             .endpoint = undefined,
             .decoder = .init(gpa, 1 << 20),
             .hello = hello,
+            .key = key,
         };
         try rc.endpoint.init(gpa, testing.io, &rc.loop, .{
-            .local = try .parseIp4("127.0.0.1", 0),
+            .local = switch (server) {
+                .ip4 => try .parseIp4("0.0.0.0", 0),
+                .ip6 => try .parseIp6("::", 0),
+            },
             .role = .{ .client = &rc.tls },
             .handler = .{ .ctx = rc, .connected = onConnected, .data = onData },
         });
@@ -338,8 +547,35 @@ const RawClient = struct {
     fn onConnected(ctx: ?*anyopaque, conn: *transport.endpoint.Conn) void {
         const rc: *RawClient = @ptrCast(@alignCast(ctx.?));
         const stream = conn.openStream(.bidi) catch @panic("stream");
+        rc.conn = conn;
         rc.stream = stream;
         send(stream, .{ .hello = rc.hello });
+        switch (rc.login) {
+            .skip => send(stream, .{ .attach = .{} }),
+            else => send(stream, .{ .auth_probe = .{ .user = test_user, .key = &auth.ssh.keyBlob(rc.key.public_key.toBytes()) } }),
+        }
+    }
+
+    /// Signs the transcript, or one with another exporter value, and
+    /// attaches.
+    fn signIn(rc: *RawClient, stream: *transport.endpoint.Stream) void {
+        var transcript: auth.login.Transcript = .{
+            .exporter = undefined,
+            .host_key = rc.tls.presentedKey().?,
+            .user = test_user,
+            .alpn = transport.quic.alpn,
+            .revision = proto.revision,
+        };
+        rc.conn.?.quic.exportSecret(&transcript.exporter, auth.login.exporter_label);
+        if (rc.login == .wrong_exporter) transcript.exporter[0] ^= 1;
+
+        const data = transcript.signedData();
+        const sig = rc.key.sign(data.slice(), null) catch @panic("sign");
+        send(stream, .{ .auth_signature = .{
+            .user = test_user,
+            .key = &auth.ssh.keyBlob(rc.key.public_key.toBytes()),
+            .signature = &auth.sshsig.signatureBlob(sig.toBytes()),
+        } });
         send(stream, .{ .attach = .{} });
     }
 
@@ -348,10 +584,22 @@ const RawClient = struct {
         stream.consume(bytes.len);
         rc.decoder.feed(bytes);
         while (rc.decoder.next() catch null) |message| switch (message) {
+            .auth_probe_reply => |m| if (m.accepted) rc.signIn(stream),
             .attached => |m| rc.attached = m.session_id,
             .output => |m| rc.output.appendSlice(gpa, m.bytes) catch @panic("OOM"),
+            .@"error" => |m| rc.error_code = m.code,
             else => {},
         };
+    }
+
+    fn waitError(rc: *RawClient) !u32 {
+        const deadline = nowMs() + timeout_ms;
+        while (rc.error_code == null) {
+            if (nowMs() > deadline) return error.Timeout;
+            try rc.loop.run(.no_wait);
+            testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+        }
+        return rc.error_code.?;
     }
 
     fn waitAttached(rc: *RawClient) !u64 {
@@ -374,6 +622,33 @@ const RawClient = struct {
     }
 };
 
+test "a server on a wildcard address answers on each address it binds" {
+    transport.crypto.init(testing.io);
+    var environ: std.process.Environ.Map = .init(gpa);
+    defer environ.deinit();
+    var login: Login = undefined;
+    try login.init(null);
+    defer login.deinit();
+    var options = try login.serverOptions(&environ, &.{ "/bin/sh", "-c", "sleep 10" });
+    options.listen = try .parseIp6("::", 0);
+    var st: ServerThread = undefined;
+    try st.init(options);
+    defer st.deinit();
+
+    // Read before the first rescan can change the list.
+    var bound: std.ArrayList(Io.net.IpAddress) = .empty;
+    defer bound.deinit(gpa);
+    for (st.server.endpoints.items) |e| try bound.append(gpa, e.local);
+    try testing.expect(bound.items.len > 0);
+
+    for (bound.items) |address| {
+        var rc: RawClient = undefined;
+        try rc.initTo(&st, address, login.key, .{ .revision = proto.revision, .term = "xterm-256color", .cols = 80, .rows = 24 });
+        defer rc.deinit();
+        _ = try rc.waitAttached();
+    }
+}
+
 /// The size of a session's primary terminal, read on the server thread.
 fn primarySize(st: *ServerThread, session_id: u64) !struct { u16, u16 } {
     const Size = struct {
@@ -394,18 +669,14 @@ fn primarySize(st: *ServerThread, session_id: u64) !struct { u16, u16 } {
 
 test "a server bounds the terminal size a client sends" {
     transport.crypto.init(testing.io);
-    var environ: std.process.Environ.Map = .init(gpa);
+    var environ = try testEnviron();
     defer environ.deinit();
-    try environ.put("PATH", testing.environ.getPosix("PATH") orelse "/usr/bin:/bin");
+    var login: Login = undefined;
+    try login.init(null);
+    defer login.deinit();
     var st: ServerThread = undefined;
-    try st.init(.{
-        .listen = try .parseIp4("127.0.0.1", 0),
-        .identity = Ed25519.KeyPair.generate(testing.io),
-        .environ = &environ,
-        .argv = &.{ "/bin/sh", "-c", "sleep 10" },
-    });
+    try st.init(try login.serverOptions(&environ, &.{ "/bin/sh", "-c", "sleep 10" }));
     defer st.deinit();
-    const pinned = st.server.options.identity.public_key.toBytes();
 
     for ([_]struct { u16, u16, u16, u16 }{
         .{ 0, 0, 80, 24 },
@@ -413,7 +684,7 @@ test "a server bounds the terminal size a client sends" {
     }) |case| {
         const cols, const rows, const want_cols, const want_rows = case;
         var rc: RawClient = undefined;
-        try rc.init(st.server.address(), pinned, .{ .revision = proto.revision, .term = "xterm-256color", .cols = cols, .rows = rows });
+        try rc.init(&st, login.key, .{ .revision = proto.revision, .term = "xterm-256color", .cols = cols, .rows = rows });
         defer rc.deinit();
         const id = try rc.waitAttached();
         const got_cols, const got_rows = try primarySize(&st, id);
@@ -433,17 +704,15 @@ test "input larger than the terminal's input queue reaches the program" {
     transport.crypto.init(testing.io);
     var environ = try testEnviron();
     defer environ.deinit();
+    var login: Login = undefined;
+    try login.init(null);
+    defer login.deinit();
     var st: ServerThread = undefined;
-    try st.init(.{
-        .listen = try .parseIp4("127.0.0.1", 0),
-        .identity = Ed25519.KeyPair.generate(testing.io),
-        .environ = &environ,
-        .argv = &.{ "/bin/sh", "-c", "stty raw -echo; printf 'ready\\r\\n'; head -c 262144 | wc -c" },
-    });
+    try st.init(try login.serverOptions(&environ, &.{ "/bin/sh", "-c", "stty raw -echo; printf 'ready\\r\\n'; head -c 262144 | wc -c" }));
     defer st.deinit();
 
     var rc: RawClient = undefined;
-    try rc.init(st.server.address(), st.server.options.identity.public_key.toBytes(), .{
+    try rc.init(&st, login.key, .{
         .revision = proto.revision,
         .term = "xterm-256color",
         .cols = 80,
@@ -463,16 +732,14 @@ test "stopping the server kills a program that ignores SIGHUP" {
     transport.crypto.init(testing.io);
     var environ = try testEnviron();
     defer environ.deinit();
+    var login: Login = undefined;
+    try login.init(null);
+    defer login.deinit();
     var st: ServerThread = undefined;
-    try st.init(.{
-        .listen = try .parseIp4("127.0.0.1", 0),
-        .identity = Ed25519.KeyPair.generate(testing.io),
-        .environ = &environ,
-        .argv = &.{ "/bin/sh", "-c", "trap '' HUP; printf 'ready\\r\\n'; while :; do sleep 1; done" },
-    });
+    try st.init(try login.serverOptions(&environ, &.{ "/bin/sh", "-c", "trap '' HUP; printf 'ready\\r\\n'; while :; do sleep 1; done" }));
 
     var rc: RawClient = undefined;
-    try rc.init(st.server.address(), st.server.options.identity.public_key.toBytes(), .{
+    try rc.init(&st, login.key, .{
         .revision = proto.revision,
         .term = "xterm-256color",
         .cols = 80,
