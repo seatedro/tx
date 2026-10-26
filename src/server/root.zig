@@ -1,8 +1,12 @@
 //! tx-session's server: QUIC connections attached to sessions.
 //!
-//! A client opens one bidirectional stream and sends `Hello`, then `Attach`.
-//! The server answers with `HelloReply` and `Attached`, then streams the
-//! session's output records and applies the client's `Input` and `Resize`.
+//! A client opens one bidirectional stream and sends `Hello`, then logs in:
+//! `AuthProbe` for each key it might sign with, and `AuthSignature` with
+//! one the server accepts. Keys come from `authorized_keys`, for the
+//! server's own user only. Once logged in, the client sends `Attach`. The
+//! server answers with `HelloReply`, `AuthProbeReply`, `AuthOk` and
+//! `Attached`, then streams the session's output records and applies the
+//! client's `Input` and `Resize`.
 //! A connection that closes leaves its session running, detached. A
 //! session ends when its program exits; the attached client gets `Exit`.
 //!
@@ -18,6 +22,7 @@ const transport = @import("transport");
 const proto = @import("proto");
 const session = @import("session");
 const term = @import("term");
+const auth = @import("auth");
 
 const Endpoint = transport.endpoint.Endpoint;
 const Conn = transport.endpoint.Conn;
@@ -29,6 +34,11 @@ const log = std.log.scoped(.server);
 pub const Options = struct {
     listen: IpAddress,
     identity: Ed25519.KeyPair,
+    /// The account clients log in as. No other user name is accepted.
+    user: []const u8,
+    /// `authorized_keys` files. The first one that exists is read, at each
+    /// login attempt.
+    authorized_keys: []const []const u8,
     /// The environment of new sessions. `TERM` and `COLORTERM` come from the
     /// client.
     environ: *const std.process.Environ.Map,
@@ -46,6 +56,8 @@ pub const ErrorCode = enum(u32) {
     no_session = 3,
     log_trimmed = 4,
     spawn = 5,
+    /// The login failed. The message doesn't say why.
+    auth = 6,
 };
 
 /// Output buffered on a stream above which the server stops reading the
@@ -55,6 +67,14 @@ const low_water = 256 << 10;
 
 /// The longest message body accepted from a client.
 const max_message = 1 << 20;
+
+/// The longest message body accepted before login. Login messages carry
+/// a user name, a key and a signature.
+const max_login_message = 16 << 10;
+
+/// Probes and signatures a client may send before the server gives up, as
+/// sshd's MaxAuthTries.
+const max_login_attempts = 6;
 
 /// Bounds on a client's terminal size. libghostty-vt asserts on zero, and
 /// the size sets how much memory the primary terminal allocates.
@@ -139,7 +159,7 @@ pub const Server = struct {
     fn onConnected(ctx: ?*anyopaque, conn: *Conn) void {
         const self = fromCtx(ctx);
         const client = self.gpa.create(Client) catch return conn.close(0);
-        client.* = .{ .server = self, .conn = conn, .decoder = .init(self.gpa, max_message) };
+        client.* = .{ .server = self, .conn = conn, .decoder = .init(self.gpa, max_login_message) };
         conn.context = client;
     }
 
@@ -163,8 +183,9 @@ pub const Server = struct {
         while (true) {
             const message = client.decoder.next() catch return client.fail(.protocol, "malformed message");
             client.handle(message orelse break);
-            // `handle` may have closed the connection.
-            if (stream.conn.closing != null) return;
+            // `handle` may have closed the connection, or sent `Error` and
+            // finished the stream.
+            if (stream.conn.closing != null or stream.fin) return;
         }
 
         // The client finished its side: it is gone.
@@ -189,6 +210,27 @@ pub const Server = struct {
         const client = Client.of(conn) orelse return;
         client.destroy();
         conn.context = null;
+    }
+
+    /// Whether `key_blob` may log in as `user`.
+    fn accepts(self: *Server, user: []const u8, key_blob: []const u8) bool {
+        if (!std.mem.eql(u8, user, self.options.user)) return false;
+
+        // Only Ed25519 keys for now.
+        const key = auth.ssh.parseKeyBlob(key_blob) catch return false;
+
+        const match = auth.authorized_keys.check(self.io, self.gpa, self.options.authorized_keys, key) catch |err| {
+            log.warn("reading authorized_keys failed: {t}", .{err});
+            return false;
+        };
+        return switch (match) {
+            .allowed => true,
+            .absent => false,
+            .restricted => {
+                log.info("refused key {s}: its authorized_keys line has options, which tx doesn't implement yet", .{auth.Fingerprint.init(key).slice()});
+                return false;
+            },
+        };
     }
 
     fn startSession(self: *Server, hello: *const Hello) !*Session {
@@ -250,6 +292,9 @@ const Client = struct {
     stream: ?*Stream = null,
     decoder: proto.Decoder,
     hello: ?Hello = null,
+    logged_in: bool = false,
+    /// Probes and signatures received.
+    login_attempts: u32 = 0,
     session: ?*Session = null,
     /// The highest seq the client reported written to its terminal.
     acked: ?u64 = null,
@@ -266,11 +311,19 @@ const Client = struct {
         gpa.destroy(client);
     }
 
-    /// Hello, then Attach, then Input, Resize, Ack and Detach. Unknown
-    /// message types are ignored, for newer clients.
+    /// Hello, then the login, then Attach, then Input, Resize, Ack and
+    /// Detach. Unknown message types are ignored, for newer clients.
     fn handle(client: *Client, message: proto.Message) void {
+        // Before login, a client can say hello, log in and leave.
+        if (!client.logged_in) switch (message) {
+            .hello, .auth_probe, .auth_signature, .detach, .unknown => {},
+            else => return client.fail(.protocol, "not logged in"),
+        };
+
         switch (message) {
             .hello => |m| client.onHello(m),
+            .auth_probe => |m| client.onAuthProbe(m),
+            .auth_signature => |m| client.onAuthSignature(m),
             .attach => |m| client.onAttach(m),
             .input => |m| if (client.session) |s| s.input(m.bytes),
             .resize => |m| if (client.session) |s| {
@@ -295,6 +348,61 @@ const Client = struct {
         hello.colorterm.appendSlice(gpa, m.colorterm orelse "") catch return client.fail(.protocol, "out of memory");
         client.hello = hello;
         client.send(.{ .hello_reply = .{ .revision = proto.revision } });
+    }
+
+    fn onAuthProbe(client: *Client, m: proto.AuthProbe) void {
+        if (!client.startLoginAttempt()) return;
+        client.send(.{ .auth_probe_reply = .{ .key = m.key, .accepted = client.server.accepts(m.user, m.key) } });
+    }
+
+    fn onAuthSignature(client: *Client, m: proto.AuthSignature) void {
+        if (!client.startLoginAttempt()) return;
+        const server = client.server;
+
+        // `accepts` checked the user name and the key's type.
+        if (!server.accepts(m.user, m.key)) return client.fail(.auth, "login refused");
+        const key = auth.ssh.parseKeyBlob(m.key) catch unreachable;
+
+        // The transcript as the server sees the connection. A signature
+        // made for another connection or server doesn't match it.
+        var transcript: auth.login.Transcript = .{
+            .exporter = undefined,
+            .host_key = server.options.identity.public_key.toBytes(),
+            .user = m.user,
+            .alpn = transport.quic.alpn,
+            .revision = proto.revision,
+        };
+        client.conn.quic.exportSecret(&transcript.exporter, auth.login.exporter_label);
+
+        transcript.verify(key, m.signature) catch {
+            log.info("bad signature from {f} for {s} with key {s}", .{ client.conn.remote, m.user, auth.Fingerprint.init(key).slice() });
+            return client.fail(.auth, "login refused");
+        };
+
+        log.info("{f} logged in as {s} with key {s}", .{ client.conn.remote, m.user, auth.Fingerprint.init(key).slice() });
+        client.logged_in = true;
+        client.decoder.max_body_len = max_message;
+        client.send(.{ .auth_ok = .{} });
+    }
+
+    /// Counts a probe or signature. False if the client has used up its
+    /// attempts, or is logged in already.
+    fn startLoginAttempt(client: *Client) bool {
+        if (client.hello == null) {
+            client.fail(.protocol, "login before hello");
+            return false;
+        }
+        if (client.logged_in) {
+            client.fail(.protocol, "second login");
+            return false;
+        }
+
+        client.login_attempts += 1;
+        if (client.login_attempts > max_login_attempts) {
+            client.fail(.auth, "too many login attempts");
+            return false;
+        }
+        return true;
     }
 
     fn onAttach(client: *Client, m: proto.Attach) void {
@@ -331,6 +439,8 @@ const Client = struct {
     /// the connection.
     fn send(client: *Client, message: proto.Message) void {
         const stream = client.stream orelse return;
+        // Nothing follows `Error` or `Exit`.
+        if (stream.fin) return;
         const gpa = client.server.gpa;
         const buf = gpa.alloc(u8, proto.encodedLen(message)) catch return client.conn.close(0);
         defer gpa.free(buf);
