@@ -315,12 +315,20 @@ pub const Connection = struct {
         c.ngtcp2_path_storage_zero(&ps);
         var pi: c.ngtcp2_pkt_info = undefined;
         var vec: c.ngtcp2_vec = .{ .base = @constCast(data.ptr), .len = data.len };
+        // ngtcp2 sets `datalen` to the stream bytes it put in the packet,
+        // and leaves it at -1 if the packet carries none.
         var datalen: c.ngtcp2_ssize = -1;
         const flags: u32 = if (fin) c.NGTCP2_WRITE_STREAM_FLAG_FIN else 0;
         const n = c.ngtcp2_conn_writev_stream_versioned(self.conn, &ps.path, c.NGTCP2_PKT_INFO_VERSION, &pi, buf.ptr, buf.len, &datalen, flags, stream_id, &vec, 1, now(self.io));
+
+        // The stream has no credit, but other frames (ACKs, other streams)
+        // may still need a packet.
         if (n == c.NGTCP2_ERR_STREAM_DATA_BLOCKED) {
             return .{ .datagram = try self.send(buf), .consumed = 0, .blocked = true };
         }
+
+        // The FIN went out if a packet was written and it carried the last
+        // byte of `data`.
         const d = try self.datagram(n, &ps);
         return .{
             .datagram = d,
@@ -341,6 +349,7 @@ pub const Connection = struct {
         return stream_id;
     }
 
+    /// Whether this side opened `stream_id`.
     pub fn isLocalStream(self: *const Connection, stream_id: i64) bool {
         return c.ngtcp2_conn_is_local_stream2(self.conn, stream_id) != 0;
     }
@@ -356,11 +365,13 @@ pub const Connection = struct {
     /// connection then sends nothing else.
     pub fn writeClose(self: *Connection, buf: []u8, code: CloseCode) Error!?Datagram {
         std.debug.assert(buf.len >= max_datagram_size);
+
         var ccerr: c.ngtcp2_ccerr = undefined;
         switch (code) {
             .transport => |v| c.ngtcp2_ccerr_set_transport_error(&ccerr, v, null, 0),
             .application => |v| c.ngtcp2_ccerr_set_application_error(&ccerr, v, null, 0),
         }
+
         var ps: c.ngtcp2_path_storage = undefined;
         c.ngtcp2_path_storage_zero(&ps);
         var pi: c.ngtcp2_pkt_info = undefined;
@@ -370,6 +381,8 @@ pub const Connection = struct {
 
     /// The transport error code that reports `last_error` to the peer.
     pub fn errorCode(self: *const Connection) u64 {
+        // A TLS failure is reported as CRYPTO_ERROR plus the TLS alert
+        // (RFC 9000 §20.1).
         if (self.last_error == c.NGTCP2_ERR_CRYPTO)
             return c.NGTCP2_CRYPTO_ERROR | @as(u64, c.ngtcp2_conn_get_tls_alert2(self.conn));
         return c.ngtcp2_err_infer_quic_transport_error_code(self.last_error);
@@ -387,10 +400,13 @@ pub const Connection = struct {
 
     /// Source connection IDs in use. The peer addresses packets to them.
     pub fn connectionIds(self: *const Connection, buf: *[max_connection_ids]c.ngtcp2_cid) []c.ngtcp2_cid {
+        // With a null buffer, ngtcp2_conn_get_scid2 returns the count.
         std.debug.assert(c.ngtcp2_conn_get_scid2(self.conn, null) <= buf.len);
         return buf[0..c.ngtcp2_conn_get_scid2(self.conn, buf)];
     }
 
+    /// ngtcp2 keeps up to 8 IDs in use (NGTCP2_MAX_SCID_POOL_SIZE), and
+    /// counts retired IDs it hasn't dropped yet.
     pub const max_connection_ids = 16;
 
     /// Give the peer `n` more bytes of flow control credit on `stream_id` and
@@ -544,6 +560,7 @@ fn getNewConnectionId(
     } else {
         crypto.random(&token.*.data);
     }
+
     if (self.handler.connectionIdIssued) |f| f(self.handler.ctx, self, cid.*.data[0..cidlen]);
     return 0;
 }
@@ -583,6 +600,9 @@ fn ackedStreamData(
     if (self.handler.streamAcked) |f| f(self.handler.ctx, self, stream_id, offset, datalen);
     return 0;
 }
+
+// The ngtcp2 callbacks below forward to `Handler`. Returning 0 tells ngtcp2
+// the callback succeeded.
 
 fn streamOpen(_: ?*c.ngtcp2_conn, stream_id: i64, user_data: ?*anyopaque) callconv(.c) c_int {
     const self = fromUserData(user_data);

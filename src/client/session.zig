@@ -89,14 +89,19 @@ const writer_options = .{
 /// in flight when the queue crosses its high-water mark still fits.
 const stream_window = 2 << 20;
 
+/// The largest message body accepted from the server.
 const max_message = 1 << 20;
 
 /// Runs one session until it exits or detaches. The user's terminal is in
 /// raw mode for the duration.
 pub fn run(gpa: Allocator, io: Io, options: Options) !Outcome {
     transport.crypto.init(io);
+
     const raw: tty.RawMode = try .enter(options.in_fd);
     defer raw.restore();
+
+    // Before any thread starts. Threads inherit the mask, and the signal
+    // thread receives them.
     const old_mask = tty.blockSignals();
     defer {
         var ignored: posix.sigset_t = undefined;
@@ -105,9 +110,11 @@ pub fn run(gpa: Allocator, io: Io, options: Options) !Outcome {
 
     var loop: xev.Loop = try .init(.{});
     defer loop.deinit();
+
     var r: Run = undefined;
     try r.init(gpa, io, &loop, options, &raw);
     defer r.deinit();
+
     while (r.outcome == null) try loop.run(.once);
     return r.outcome.?;
 }
@@ -121,9 +128,13 @@ const Run = struct {
     tls: transport.quic.Client,
     endpoint: Endpoint,
     conn: ?*Conn = null,
+    /// The one stream to the server, opened after the handshake.
     stream: ?*Stream = null,
     decoder: proto.Decoder,
     escape: escape.Escape,
+
+    /// The threads put events in `inbox` and notify `wake`. `onWake` takes
+    /// them on the loop thread.
     inbox: Inbox = .{},
     wake: xev.Async,
     wake_c: xev.Completion = .{},
@@ -166,6 +177,8 @@ const Run = struct {
         errdefer r.decoder.deinit();
         errdefer r.tls.deinit();
 
+        // Any local address of the server's family. The kernel picks the
+        // port.
         const local: IpAddress = switch (options.server) {
             .ip4 => try .parseIp4("0.0.0.0", 0),
             .ip6 => try .parseIp6("::", 0),
@@ -205,6 +218,8 @@ const Run = struct {
         r.reader.stop();
         r.signals.stop();
         r.writer.stop(.drain);
+
+        // Stop the endpoint, then run the loop until its completions finish.
         r.endpoint.stop();
         // `onWake` disarms once the outcome is set. Cancelling the wait would
         // end it with an ECANCELED that libxev's poll doesn't map.
@@ -222,11 +237,14 @@ const Run = struct {
         return @ptrCast(@alignCast(ctx.?));
     }
 
+    /// Records the outcome and closes the connection. The first outcome
+    /// wins.
     fn finish(r: *Run, outcome: Outcome) void {
         if (r.outcome == null) r.outcome = outcome;
         if (r.conn) |conn| conn.close(0);
     }
 
+    /// Encodes `message` onto the stream. The stream copies it.
     fn send(r: *Run, message: proto.Message) void {
         const stream = r.stream orelse return;
         const buf = r.gpa.alloc(u8, proto.encodedLen(message)) catch return r.finish(.{ .disconnected = .failed });
@@ -238,11 +256,15 @@ const Run = struct {
 
     /// 80x24 when the terminal doesn't report a size, as ssh does.
     fn terminalSize(options: Options) tty.Size {
+        // stdout first: stdin may be redirected while stdout is the
+        // terminal.
         const size = tty.getSize(options.out_fd) catch tty.getSize(options.in_fd) catch return .{ .cols = 80, .rows = 24 };
         if (size.cols == 0 or size.rows == 0) return .{ .cols = 80, .rows = 24 };
         return size;
     }
 
+    /// The cell size in pixels, from the grid's size. Null when the
+    /// terminal doesn't report pixels.
     fn cellSize(size: tty.Size) struct { ?u32, ?u32 } {
         if (size.width_px == 0 or size.height_px == 0 or size.cols == 0 or size.rows == 0) return .{ null, null };
         return .{ size.width_px / size.cols, size.height_px / size.rows };
@@ -251,6 +273,8 @@ const Run = struct {
     fn onConnected(ctx: ?*anyopaque, conn: *Conn) void {
         const r = fromCtx(ctx);
         r.stream = conn.openStream(.bidi) catch return r.finish(.{ .disconnected = .failed });
+
+        // Hello and Attach go together. The server answers both, in order.
         const cell_w, const cell_h = cellSize(r.size);
         r.send(.{ .hello = .{
             .revision = proto.revision,
@@ -266,23 +290,32 @@ const Run = struct {
 
     fn onData(ctx: ?*anyopaque, stream: *Stream, bytes: []const u8, fin: bool) void {
         const r = fromCtx(ctx);
+
         r.decoder.feed(bytes);
         while (r.outcome == null) {
             const message = r.decoder.next() catch return r.finish(.{ .disconnected = .failed });
             r.handle(message orelse break);
         }
+
+        // Returning credit lets the server send more. While the terminal is
+        // behind, the credit waits for `below_low_water`.
         if (r.writer.aboveHighWater()) r.held += bytes.len else stream.consume(bytes.len);
+
+        // The server finishes the stream only after Exit or Error.
         if (fin) r.finish(.{ .disconnected = .{ .peer = .{ .application = 0 } } });
     }
 
     fn handle(r: *Run, message: proto.Message) void {
         switch (message) {
             .hello_reply => |m| if (m.revision != proto.revision) r.finish(.{ .refused = .{ .code = 0, .message = .init("the server speaks another protocol revision") } }),
+            // Input typed before this was held, since the server had no
+            // session to give it to.
             .attached => |m| {
                 r.session_id = m.session_id;
                 if (r.early_input.items.len > 0) r.send(.{ .input = .{ .bytes = r.early_input.items } });
                 r.early_input.clearAndFree(r.gpa);
             },
+            // Acked once queued for the terminal.
             .output => |m| {
                 r.writer.write(m.bytes) catch |err| switch (err) {
                     error.Failed => return r.finish(.{ .detached = r.session_id }),
@@ -307,6 +340,9 @@ const Run = struct {
         }
         if (r.outcome == null) r.outcome = .{ .disconnected = reason };
     }
+
+    // The next three run on the reader, writer and signal threads. Each
+    // records the event in `inbox` and wakes the loop.
 
     fn onReaderEvent(ctx: ?*anyopaque, event: tty.Reader.Event) void {
         const r = fromCtx(ctx);
@@ -352,6 +388,9 @@ const Run = struct {
     fn onWake(r_: ?*Run, _: *xev.Loop, _: *xev.Completion, result: xev.Async.WaitError!void) xev.CallbackAction {
         const r = r_.?;
         result catch return .disarm;
+
+        // Take everything from the inbox at once and handle it without the
+        // lock. Notifications may have been coalesced.
         var input: std.ArrayList(u8) = .empty;
         defer input.deinit(r.gpa);
         const resize, const terminate, const input_ended, const below_low_water, const output_failed = taken: {
@@ -369,26 +408,38 @@ const Run = struct {
             }
             break :taken .{ box.resize, box.terminate, box.input_ended, box.below_low_water, box.output_failed };
         };
+
         r.forwardInput(input.items);
+
         if (resize) |size| {
             r.size = size;
             const cell_w, const cell_h = cellSize(size);
             r.send(.{ .resize = .{ .cols = size.cols, .rows = size.rows, .cell_width_px = cell_w, .cell_height_px = cell_h } });
         }
+
+        // The terminal caught up: return the credit held back in `onData`.
         if (below_low_water and r.held > 0) {
             if (r.stream) |stream| stream.consume(r.held);
             r.held = 0;
         }
+
+        // The session keeps running on the server.
         if (terminate or input_ended or output_failed) r.finish(.{ .detached = r.session_id });
         return if (r.outcome == null) .rearm else .disarm;
     }
 
+    /// Runs input through the escape handler and sends it, or holds it
+    /// until the attach completes.
     fn forwardInput(r: *Run, input: []const u8) void {
+        // `Escape.feed` can add one byte to its input.
         var out: [4097]u8 = undefined;
         var rest = input;
+
+        // Stops after `~.`: what follows it isn't sent.
         while (rest.len > 0 and r.outcome == null) {
             const chunk = rest[0..@min(rest.len, out.len - 1)];
             rest = rest[chunk.len..];
+
             const result = r.escape.feed(chunk, &out);
             if (result.forward.len > 0) {
                 if (r.session_id == null) {

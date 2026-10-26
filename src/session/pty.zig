@@ -337,9 +337,12 @@ pub const Pty = struct {
     /// reused before the child is reaped. Reap it with `tryWait` afterwards.
     pub fn waitExited(self: *const Pty) WaitError!void {
         const pid = self.pid orelse return;
+
         // Larger than siginfo_t on every supported platform. Only the
         // return value is used.
         var info: [128]u8 align(8) = undefined;
+
+        // WNOWAIT leaves the child a zombie. Its pid stays reserved.
         while (libc.waitid(p_pid, @intCast(pid), &info, w_exited | w_nowait) == -1) switch (posix.errno(-1)) {
             .INTR => {},
             .CHILD => return error.ProcessNotFound,

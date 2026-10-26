@@ -133,6 +133,9 @@ pub const Server = struct {
         return @ptrCast(@alignCast(ctx.?));
     }
 
+    // Endpoint callbacks. A connection's `context` is its `Client`, set once
+    // the handshake completes.
+
     fn onConnected(ctx: ?*anyopaque, conn: *Conn) void {
         const self = fromCtx(ctx);
         const client = self.gpa.create(Client) catch return conn.close(0);
@@ -140,6 +143,7 @@ pub const Server = struct {
         conn.context = client;
     }
 
+    /// A client uses one stream. Others are refused.
     fn onStreamOpened(_: ?*anyopaque, stream: *Stream) void {
         const client = Client.of(stream.conn) orelse return stream.reset(0);
         if (client.stream != null) return stream.reset(0);
@@ -148,9 +152,13 @@ pub const Server = struct {
     }
 
     fn onData(_: ?*anyopaque, stream: *Stream, bytes: []const u8, fin: bool) void {
+        // Credit is returned at once. Input the program isn't reading
+        // queues in the host.
         stream.consume(bytes.len);
+
         const client = Client.of(stream.conn) orelse return;
         if (client.stream != stream) return;
+
         client.decoder.feed(bytes);
         while (true) {
             const message = client.decoder.next() catch return client.fail(.protocol, "malformed message");
@@ -158,9 +166,13 @@ pub const Server = struct {
             // `handle` may have closed the connection.
             if (stream.conn.closing != null) return;
         }
+
+        // The client finished its side: it is gone.
         if (fin) stream.conn.close(0);
     }
 
+    /// The client's stream drained. Resume a paused session once it is
+    /// below `low_water`.
     fn onAcked(_: ?*anyopaque, stream: *Stream) void {
         const client = Client.of(stream.conn) orelse return;
         const s = client.session orelse return;
@@ -172,6 +184,7 @@ pub const Server = struct {
         if (client.stream == stream) client.stream = null;
     }
 
+    /// The session, if any, keeps running detached.
     fn onClosed(_: ?*anyopaque, conn: *Conn, _: transport.endpoint.CloseReason) void {
         const client = Client.of(conn) orelse return;
         client.destroy();
@@ -179,6 +192,8 @@ pub const Server = struct {
     }
 
     fn startSession(self: *Server, hello: *const Hello) !*Session {
+        // The server's environment, plus what describes the client's
+        // terminal and the session's ID.
         var environ = try self.options.environ.clone(self.gpa);
         defer environ.deinit();
         try environ.put("TERM", hello.term.items);
@@ -192,8 +207,9 @@ pub const Server = struct {
         errdefer wake.deinit();
         var grace: xev.Timer = try .init();
         errdefer grace.deinit();
-        // The host's thread can notify as soon as it starts, so `wake` is
-        // set up first.
+
+        // The host's thread can notify as soon as it starts. `wake` has to
+        // exist first.
         s.* = .{ .server = self, .id = self.next_id, .host = undefined, .wake = wake, .grace = grace };
         s.host = try Host.create(self.gpa, self.io, .{
             .argv = self.options.argv,
@@ -205,8 +221,11 @@ pub const Server = struct {
             .context = s,
         });
         errdefer s.host.destroy();
+
         try self.sessions.put(self.gpa, s.id, s);
         self.next_id += 1;
+
+        // A notification sent before this is kept by the Async.
         s.wake.wait(self.loop, &s.wake_c, Session, s, Session.onWake);
         return s;
     }
@@ -247,6 +266,8 @@ const Client = struct {
         gpa.destroy(client);
     }
 
+    /// Hello, then Attach, then Input, Resize, Ack and Detach. Unknown
+    /// message types are ignored, for newer clients.
     fn handle(client: *Client, message: proto.Message) void {
         switch (message) {
             .hello => |m| client.onHello(m),
@@ -265,6 +286,8 @@ const Client = struct {
     fn onHello(client: *Client, m: proto.Hello) void {
         if (client.hello != null) return client.fail(.protocol, "second hello");
         if (m.revision != proto.revision) return client.fail(.revision, "unsupported protocol revision");
+
+        // Copied: the decoder's buffer is reused for the next message.
         const gpa = client.server.gpa;
         var hello: Hello = .{ .size = boundedSize(m.cols, m.rows, cellSize(m.cell_width_px, m.cell_height_px)) orelse
             .{ .cols = 80, .rows = 24 } };
@@ -277,6 +300,8 @@ const Client = struct {
     fn onAttach(client: *Client, m: proto.Attach) void {
         const hello = &(client.hello orelse return client.fail(.protocol, "attach before hello"));
         if (client.session != null) return client.fail(.protocol, "second attach");
+
+        // An ID reattaches. Without one, a new session starts.
         const server = client.server;
         const s = if (m.session_id) |id|
             server.sessions.get(id) orelse return client.fail(.no_session, "no such session")
@@ -285,16 +310,25 @@ const Client = struct {
                 log.warn("starting a session failed: {t}", .{err});
                 return client.fail(.spawn, "can't start the session");
             };
+
+        // The client rebuilds the screen by replaying the log from seq 0.
         if (s.host.primary.log.firstSeq() != 0) return client.fail(.log_trimmed, "the session's output is no longer in its log");
+
         // One client at a time: the newer attach wins.
         if (s.client) |other| other.conn.close(0);
+
         s.attach(client);
         client.send(.{ .attached = .{ .session_id = s.id } });
         s.pump();
+
+        // The replay is the output as the program wrote it at the old size.
+        // Resizing afterwards makes the program redraw at the client's.
         const t = &s.host.primary.terminal;
         if (t.cols != hello.size.cols or t.rows != hello.size.rows) s.resize(hello.size);
     }
 
+    /// Encodes `message` onto the stream, which copies it. A failure closes
+    /// the connection.
     fn send(client: *Client, message: proto.Message) void {
         const stream = client.stream orelse return;
         const gpa = client.server.gpa;
@@ -305,12 +339,15 @@ const Client = struct {
         stream.write(buf) catch client.conn.close(0);
     }
 
+    /// Sends `Error` and finishes the stream. The client closes the
+    /// connection after reading it.
     fn fail(client: *Client, code: ErrorCode, message: []const u8) void {
         client.send(.{ .@"error" = .{ .code = @backingInt(code), .message = message } });
         if (client.stream) |stream| stream.finish();
     }
 };
 
+/// Null unless both are present.
 fn cellSize(width: ?u32, height: ?u32) ?term.log.Resize.CellSize {
     return .{ .width = width orelse return null, .height = height orelse return null };
 }
@@ -339,7 +376,11 @@ const Session = struct {
     fn attach(s: *Session, client: *Client) void {
         s.client = client;
         client.session = s;
+
+        // Replay from the start of the log.
         s.next_seq = 0;
+
+        // The client's terminal answers queries now.
         s.host.answer_queries = false;
     }
 
@@ -347,6 +388,8 @@ const Session = struct {
         if (s.client) |client| client.session = null;
         s.client = null;
         s.host.answer_queries = true;
+
+        // No stream is backed up now. Output keeps flowing while detached.
         s.resume_();
     }
 
@@ -363,9 +406,11 @@ const Session = struct {
     fn pump(s: *Session) void {
         const client = s.client orelse return;
         const stream = client.stream orelse return;
+        // The log dropped records the client hasn't been sent.
         var it = s.host.primary.log.iterator(s.next_seq) catch {
             return client.fail(.log_trimmed, "the client fell behind the session's log");
         };
+
         while (it.next()) |record| {
             switch (record.payload) {
                 .output => |bytes| client.send(.{ .output = .{ .seq = record.seq, .bytes = bytes } }),
@@ -373,6 +418,9 @@ const Session = struct {
             }
             s.next_seq = record.seq + 1;
         }
+
+        // The stream copies what it's given. A client that doesn't
+        // acknowledge would grow it without bound.
         if (stream.buffered() > high_water) s.paused = true;
     }
 
@@ -382,10 +430,14 @@ const Session = struct {
         s.process();
     }
 
+    /// Logs the host's queued output, sends it to the client, and ends the
+    /// session once the program has exited and its output is sent.
     fn process(s: *Session) void {
         if (s.paused or s.ended) return;
+
         s.host.processOutput() catch |err| log.warn("session {d}: output dropped: {t}", .{ s.id, err });
         s.pump();
+
         if (s.host.finished) s.reap();
     }
 
@@ -398,7 +450,11 @@ const Session = struct {
     fn onWake(s_: ?*Session, _: *xev.Loop, _: *xev.Completion, result: xev.Async.WaitError!void) xev.CallbackAction {
         const s = s_.?;
         result catch |err| log.warn("session {d}: wakeup failed: {t}", .{ s.id, err });
+
+        // After the grace period, the session is left for `Server.deinit`.
         if (!s.grace_over) s.process();
+
+        // Disarming is what lets the loop finish after `Server.stop`.
         if (s.ended or s.grace_over) {
             s.freeIfEnded();
             return .disarm;
@@ -411,6 +467,9 @@ const Session = struct {
             log.warn("session {d}: wait failed: {t}", .{ s.id, err });
             return s.end(.{ .status = 255 });
         };
+
+        // A signal is reported as a shell reports it, 128 plus its number,
+        // and by name.
         s.end(switch (t) {
             .exited => |code| .{ .status = code },
             .signal => |sig| .{ .status = 128 +| @as(u8, @truncate(@backingInt(sig))), .signal = @tagName(sig) },
@@ -426,8 +485,13 @@ const Session = struct {
             client.session = null;
         }
         s.client = null;
+
+        // The ID can't be attached to from now on.
         _ = s.server.sessions.swapRemove(s.id);
         s.ended = true;
+
+        // `end` may run outside `onWake`, from `resume_`. The notification
+        // makes `onWake` run and free the session.
         s.wake.notify() catch {};
     }
 
@@ -435,6 +499,9 @@ const Session = struct {
     /// period ends its session as usual.
     fn stop(s: *Session) void {
         if (s.ended) return;
+
+        // Only the program gets it. Its jobs get SIGHUP from the shell, or
+        // from the terminal closing in `Host.destroy`.
         s.host.pty.kill(.HUP) catch {};
         s.grace.run(s.server.loop, &s.grace_c, stop_grace_ms, Session, s, onGraceOver);
     }
@@ -442,7 +509,7 @@ const Session = struct {
     fn onGraceOver(s_: ?*Session, _: *xev.Loop, _: *xev.Completion, _: xev.Timer.RunError!void) xev.CallbackAction {
         const s = s_.?;
         s.grace_over = true;
-        // Ends the `wake` wait, so the loop can finish.
+        // Ends the `wake` wait. The loop can then finish.
         s.wake.notify() catch {};
         s.freeIfEnded();
         return .disarm;
@@ -455,6 +522,7 @@ const Session = struct {
     }
 
     fn destroy(s: *Session) void {
+        // First, since the host's thread notifies `wake` until it is joined.
         s.host.destroy();
         s.wake.deinit();
         s.grace.deinit();

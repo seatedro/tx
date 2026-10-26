@@ -41,9 +41,11 @@ pub const Hello = struct {
     pub fn encodedLen(m: Hello) usize {
         return bodyLen(Hello, m);
     }
+
     pub fn encode(m: Hello, w: *Writer) Writer.Error!void {
         return encodeBody(Hello, m, w);
     }
+
     pub fn decode(bytes: []const u8) DecodeError!Hello {
         return decodeBody(Hello, bytes);
     }
@@ -59,9 +61,11 @@ pub const HelloReply = struct {
     pub fn encodedLen(m: HelloReply) usize {
         return bodyLen(HelloReply, m);
     }
+
     pub fn encode(m: HelloReply, w: *Writer) Writer.Error!void {
         return encodeBody(HelloReply, m, w);
     }
+
     pub fn decode(bytes: []const u8) DecodeError!HelloReply {
         return decodeBody(HelloReply, bytes);
     }
@@ -77,9 +81,11 @@ pub const Attach = struct {
     pub fn encodedLen(m: Attach) usize {
         return bodyLen(Attach, m);
     }
+
     pub fn encode(m: Attach, w: *Writer) Writer.Error!void {
         return encodeBody(Attach, m, w);
     }
+
     pub fn decode(bytes: []const u8) DecodeError!Attach {
         return decodeBody(Attach, bytes);
     }
@@ -94,9 +100,11 @@ pub const Attached = struct {
     pub fn encodedLen(m: Attached) usize {
         return bodyLen(Attached, m);
     }
+
     pub fn encode(m: Attached, w: *Writer) Writer.Error!void {
         return encodeBody(Attached, m, w);
     }
+
     pub fn decode(bytes: []const u8) DecodeError!Attached {
         return decodeBody(Attached, bytes);
     }
@@ -113,9 +121,11 @@ pub const Output = struct {
     pub fn encodedLen(m: Output) usize {
         return bodyLen(Output, m);
     }
+
     pub fn encode(m: Output, w: *Writer) Writer.Error!void {
         return encodeBody(Output, m, w);
     }
+
     pub fn decode(bytes: []const u8) DecodeError!Output {
         return decodeBody(Output, bytes);
     }
@@ -131,9 +141,11 @@ pub const Ack = struct {
     pub fn encodedLen(m: Ack) usize {
         return bodyLen(Ack, m);
     }
+
     pub fn encode(m: Ack, w: *Writer) Writer.Error!void {
         return encodeBody(Ack, m, w);
     }
+
     pub fn decode(bytes: []const u8) DecodeError!Ack {
         return decodeBody(Ack, bytes);
     }
@@ -149,9 +161,11 @@ pub const Input = struct {
     pub fn encodedLen(m: Input) usize {
         return bodyLen(Input, m);
     }
+
     pub fn encode(m: Input, w: *Writer) Writer.Error!void {
         return encodeBody(Input, m, w);
     }
+
     pub fn decode(bytes: []const u8) DecodeError!Input {
         return decodeBody(Input, bytes);
     }
@@ -175,9 +189,11 @@ pub const Resize = struct {
     pub fn encodedLen(m: Resize) usize {
         return bodyLen(Resize, m);
     }
+
     pub fn encode(m: Resize, w: *Writer) Writer.Error!void {
         return encodeBody(Resize, m, w);
     }
+
     pub fn decode(bytes: []const u8) DecodeError!Resize {
         return decodeBody(Resize, bytes);
     }
@@ -190,9 +206,11 @@ pub const Detach = struct {
     pub fn encodedLen(m: Detach) usize {
         return bodyLen(Detach, m);
     }
+
     pub fn encode(m: Detach, w: *Writer) Writer.Error!void {
         return encodeBody(Detach, m, w);
     }
+
     pub fn decode(bytes: []const u8) DecodeError!Detach {
         return decodeBody(Detach, bytes);
     }
@@ -213,9 +231,11 @@ pub const Exit = struct {
     pub fn encodedLen(m: Exit) usize {
         return bodyLen(Exit, m);
     }
+
     pub fn encode(m: Exit, w: *Writer) Writer.Error!void {
         return encodeBody(Exit, m, w);
     }
+
     pub fn decode(bytes: []const u8) DecodeError!Exit {
         return decodeBody(Exit, bytes);
     }
@@ -231,9 +251,11 @@ pub const Error = struct {
     pub fn encodedLen(m: Error) usize {
         return bodyLen(Error, m);
     }
+
     pub fn encode(m: Error, w: *Writer) Writer.Error!void {
         return encodeBody(Error, m, w);
     }
+
     pub fn decode(bytes: []const u8) DecodeError!Error {
         return decodeBody(Error, bytes);
     }
@@ -259,6 +281,7 @@ pub const Message = union(enum) {
         body: []const u8,
     };
 
+    // Two messages with one type ID would decode as whichever comes first.
     comptime {
         const types = @typeInfo(Message).@"union".field_types;
         for (types, 0..) |T, i| {
@@ -295,6 +318,7 @@ pub const Message = union(enum) {
 
     /// Decodes a body. An unknown `type_id` gives `.unknown`.
     pub fn decode(type_id: u64, body: []const u8) DecodeError!Message {
+        // Unrolled at compile time into one comparison per message type.
         inline for (@typeInfo(Message).@"union".field_names, @typeInfo(Message).@"union".field_types) |name, T| {
             if (T != Unknown and type_id == T.type_id)
                 return @unionInit(Message, name, try T.decode(body));
@@ -303,6 +327,7 @@ pub const Message = union(enum) {
     }
 };
 
+/// Checks a message type's declarations at compile time.
 fn checkSchema(comptime M: type) void {
     comptime {
         const info = @typeInfo(M).@"struct";
@@ -310,18 +335,27 @@ fn checkSchema(comptime M: type) void {
         const tag_names = @typeInfo(Tags).@"struct".field_names;
         if (tag_names.len != info.field_names.len)
             @compileError(@typeName(M) ++ ".tags must name each field once");
+
+        // `decodeBody` tracks the fields it has seen in a u64.
         if (info.field_names.len > 64)
             @compileError(@typeName(M) ++ " has more than 64 fields");
+
         for (info.field_names, info.field_types, 0..) |name, T, i| {
             if (!@hasField(Tags, name))
                 @compileError(@typeName(M) ++ "." ++ name ++ " has no tag");
+
+            // Tags are written as varints.
             const tag = @field(M.tags, name);
             if (tag < 0 or tag > wire.max_varint)
                 @compileError(@typeName(M) ++ "." ++ name ++ " has an invalid tag");
+
             for (info.field_names[0..i]) |prev| {
                 if (@field(M.tags, prev) == tag)
                     @compileError(@typeName(M) ++ "." ++ name ++ " reuses a tag");
             }
+
+            // Fields are byte strings or unsigned integers of up to 64
+            // bits, optional or not.
             const V = switch (@typeInfo(T)) {
                 .optional => |o| o.child,
                 else => T,
@@ -333,6 +367,7 @@ fn checkSchema(comptime M: type) void {
     }
 }
 
+/// The encoded size of one field. `T` is a field type without the optional.
 fn valueLen(comptime T: type, tag: u64, value: T) usize {
     if (T == []const u8) return wire.fieldLen(tag, value.len);
     return wire.uintFieldLen(tag, value);
@@ -349,6 +384,7 @@ fn readValue(comptime T: type, bytes: []const u8) DecodeError!T {
     return wire.readUint(T, bytes);
 }
 
+/// The encoded size of `m`'s fields. Null optional fields take no bytes.
 fn bodyLen(comptime M: type, m: M) usize {
     comptime checkSchema(M);
     const info = @typeInfo(M).@"struct";
@@ -366,6 +402,7 @@ fn bodyLen(comptime M: type, m: M) usize {
     return len;
 }
 
+/// Writes `m`'s fields in declaration order, leaving out null optionals.
 fn encodeBody(comptime M: type, m: M, w: *Writer) Writer.Error!void {
     comptime checkSchema(M);
     const info = @typeInfo(M).@"struct";
@@ -383,7 +420,12 @@ fn decodeBody(comptime M: type, bytes: []const u8) DecodeError!M {
     comptime checkSchema(M);
     const info = @typeInfo(M).@"struct";
     var m: M = undefined;
+
+    // Bit i is set once struct field i has been read.
     var seen: u64 = 0;
+
+    // Fields can come in any order. A tag no struct field has is skipped,
+    // and a repeated tag overwrites the earlier value.
     var it: wire.FieldIterator = .init(bytes);
     while (try it.next()) |field| {
         inline for (info.field_names, info.field_types, 0..) |name, T, i| {
@@ -393,6 +435,8 @@ fn decodeBody(comptime M: type, bytes: []const u8) DecodeError!M {
             }
         }
     }
+
+    // Absent fields take their defaults. A field without one is required.
     inline for (info.field_names, info.field_types, info.field_attrs, 0..) |name, T, attrs, i| {
         if (seen & (@as(u64, 1) << i) == 0)
             @field(m, name) = attrs.defaultValue(T) orelse return error.MissingField;

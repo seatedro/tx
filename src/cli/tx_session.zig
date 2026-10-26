@@ -10,6 +10,7 @@ const server_pkg = @import("server");
 const transport = @import("transport");
 const keyfile = @import("keyfile.zig");
 
+/// Below the ephemeral port ranges of Linux and macOS.
 pub const default_port = 8739;
 
 /// Variables a session inherits from tx-session's environment.
@@ -20,6 +21,7 @@ pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
+    // Options.
     var listen: Io.net.IpAddress = try .parseIp4("127.0.0.1", default_port);
     var key_path: ?[]const u8 = null;
     var i: usize = 1;
@@ -33,13 +35,20 @@ pub fn main(init: std.process.Init) !u8 {
             key_path = args[i];
         } else return usage("unknown argument");
     }
+
+    // Anyone who can reach the port gets a shell as this user.
     if (!isLoopback(listen)) return usage("revision 0 listens on loopback addresses only");
 
     transport.crypto.init(io);
+
+    // The first run creates the key.
     const path = key_path orelse try keyfile.defaultPath(gpa, init.environ_map);
     defer if (key_path == null) gpa.free(path);
     const identity = try keyfile.loadOrCreate(io, path);
 
+    // Sessions get a small environment, like the one sshd gives: the
+    // allowlist, the locale, and TX_SESSION. Each session adds TERM and
+    // COLORTERM from its client.
     var environ: std.process.Environ.Map = .init(gpa);
     defer environ.deinit();
     for (inherited) |name| if (init.environ_map.get(name)) |value| try environ.put(name, value);
@@ -56,6 +65,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     var loop: xev.Loop = try .init(.{});
     defer loop.deinit();
+
     var server: server_pkg.Server = undefined;
     try server.init(gpa, io, &loop, .{
         .listen = listen,
@@ -66,6 +76,7 @@ pub fn main(init: std.process.Init) !u8 {
         .cwd = if (init.environ_map.get("HOME")) |home| .{ .path = home } else .inherit,
     });
     defer server.deinit();
+
     std.log.info("listening on {f}", .{server.address()});
     try loop.run(.until_done);
     return 0;
@@ -77,6 +88,7 @@ const ip6_loopback: [16]u8 = blk: {
     break :blk bytes;
 };
 
+/// 127.0.0.0/8 or ::1.
 fn isLoopback(address: Io.net.IpAddress) bool {
     return switch (address) {
         .ip4 => |a| a.bytes[0] == 127,

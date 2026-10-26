@@ -116,6 +116,7 @@ pub const Host = struct {
 
         var wake: Wake = try .init();
         errdefer wake.deinit();
+
         self.* = .{
             .gpa = gpa,
             .io = io,
@@ -134,8 +135,11 @@ pub const Host = struct {
             .wake = wake,
         };
         errdefer self.pty.deinit();
+
+        // The primary's query replies go to the pty through the input queue.
         primary.context = self;
         primary.handler().effects.write_pty = &writePty;
+
         self.thread = try std.Thread.spawn(.{}, threadMain, .{self});
         return self;
     }
@@ -147,11 +151,15 @@ pub const Host = struct {
             self.mutex.lockUncancelable(self.io);
             self.queues.stopping = true;
             self.mutex.unlock(self.io);
+
+            // Wakes the thread from poll.
             self.wake.notify();
+
             // The thread may be waiting for the program to exit.
             self.pty.kill(.KILL) catch {};
             thread.join();
         }
+
         self.pty.deinit();
         self.primary.destroy();
         self.wake.deinit();
@@ -165,12 +173,20 @@ pub const Host = struct {
     /// On error the rest of the taken output is dropped; `finished` is set
     /// either way.
     pub fn processOutput(self: *Host) term.log.AppendError!void {
+        // Swap buffers with the thread and process the output without the
+        // lock. `exited` is read under the same lock. No output follows it,
+        // and all of the program's output is in what was taken.
         self.mutex.lockUncancelable(self.io);
         std.mem.swap(std.ArrayList(u8), &self.queues.output, &self.taken);
         const exited = self.queues.exited;
         self.mutex.unlock(self.io);
+
+        // A full queue stopped the thread reading. It has room again.
         if (self.taken.items.len >= self.output_limit) self.wake.notify();
+
         self.finished = exited;
+
+        // Logged in records of at most `max_record` bytes.
         defer self.taken.clearRetainingCapacity();
         var rest = self.taken.items;
         while (rest.len > 0) {
@@ -182,10 +198,13 @@ pub const Host = struct {
 
     /// After `finished` is set: ends the thread and reaps the program.
     pub fn reap(self: *Host) pty_pkg.WaitError!pty_pkg.Term {
+        // The thread has set `exited` and is ending.
         if (self.thread) |thread| {
             thread.join();
             self.thread = null;
         }
+
+        // The program is a zombie. This doesn't block.
         return self.pty.wait();
     }
 
@@ -195,6 +214,9 @@ pub const Host = struct {
         defer self.mutex.unlock(self.io);
         const q = &self.queues;
         if (q.closed or bytes.len == 0) return;
+
+        // The thread polls for writability while input is queued. It needs
+        // a wakeup when the queue stops being empty.
         const was_empty = q.input_start == q.input.items.len;
         try q.input.appendSlice(self.gpa, bytes);
         if (was_empty) self.wake.notify();
@@ -219,6 +241,8 @@ pub const Host = struct {
         const fd = self.pty.master;
         var buf: [max_record]u8 = undefined;
         while (true) {
+            // Decide what to wait for. Reading stops while the output queue
+            // is full, which leaves the program blocked on its writes.
             self.mutex.lockUncancelable(self.io);
             const q = &self.queues;
             const stopping = q.stopping;
@@ -227,6 +251,8 @@ pub const Host = struct {
             const want_write = q.input_start < q.input.items.len;
             self.mutex.unlock(self.io);
             if (stopping) return;
+
+            // After end of file there is nothing left to read or write.
             if (closed) return self.waitExited();
 
             var events: i16 = 0;
@@ -245,7 +271,11 @@ pub const Host = struct {
                     return self.close();
                 },
             };
+            // A wakeup only means the queues changed. The loop's next pass
+            // reads them.
             if (fds[0].revents != 0) self.wake.drain();
+
+            // An error or hangup is reported by the read or write itself.
             const revents = fds[1].revents;
             const failed = posix.POLL.ERR | posix.POLL.HUP;
             if (want_write and revents & (posix.POLL.OUT | failed) != 0) self.writeInput();
@@ -255,6 +285,8 @@ pub const Host = struct {
 
     /// Reads until the pty would block or `buf` is full.
     fn readOutput(self: *Host, buf: []u8) void {
+        // macOS returns at most 1 KiB per read from a pty master. Read until
+        // `buf` is full, then take the lock once.
         var len: usize = 0;
         const eof = while (len < buf.len) {
             const n = self.pty.read(buf[len..]) catch |err| switch (err) {
@@ -274,11 +306,16 @@ pub const Host = struct {
         q.output.appendSlice(self.gpa, buf[0..len]) catch log.warn("output dropped: out of memory", .{});
         if (eof) q.closed = true;
         self.mutex.unlock(self.io);
+
+        // Notify when output arrives in an empty queue. The caller takes the
+        // whole queue, and later appends don't need another notification.
         if (eof or (was_empty and len > 0)) self.notify(self.context);
     }
 
     /// Writes queued input until the pty would block.
     fn writeInput(self: *Host) void {
+        // Held across the writes, which don't block: `sendInput` may move
+        // the queue's buffer.
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const q = &self.queues;
@@ -295,6 +332,7 @@ pub const Host = struct {
             };
             q.input_start += n;
         }
+
         if (q.input_start == q.input.items.len) {
             q.input.clearRetainingCapacity();
             q.input_start = 0;
@@ -308,6 +346,7 @@ pub const Host = struct {
         }
     }
 
+    /// Ends reading and writing after poll fails.
     fn close(self: *Host) void {
         self.mutex.lockUncancelable(self.io);
         self.queues.closed = true;
@@ -320,10 +359,14 @@ pub const Host = struct {
     /// running, so this can block for a long time; `destroy` kills it.
     fn waitExited(self: *Host) void {
         self.pty.waitExited() catch |err| log.warn("wait failed: {t}", .{err});
+
         self.mutex.lockUncancelable(self.io);
         self.queues.exited = true;
         const stopping = self.queues.stopping;
         self.mutex.unlock(self.io);
+
+        // `destroy` killed the program and is joining the thread. The
+        // caller may be freeing what `notify` points to.
         if (!stopping) self.notify(self.context);
     }
 };

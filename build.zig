@@ -60,6 +60,7 @@ pub fn build(b: *std.Build) void {
     });
     addTestRuns(b, term_tests, test_step, test_network_step);
 
+    // The wake pipe, shared by the client's threads and the session host.
     const wake = b.createModule(.{
         .root_source_file = b.path("src/wake.zig"),
         .target = target,
@@ -100,6 +101,7 @@ pub fn build(b: *std.Build) void {
     });
     addTestRuns(b, client_tests, test_step, test_network_step);
 
+    // The end-to-end tests run a server and clients in one process.
     const e2e = b.createModule(.{
         .root_source_file = b.path("src/e2e_test.zig"),
         .target = target,

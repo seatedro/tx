@@ -87,13 +87,20 @@ pub const Endpoint = struct {
     /// Server only: connection IDs to connections.
     routes: std.AutoHashMapUnmanaged(Cid, *Conn) = .empty,
 
+    /// The pending receive. Large enough for any UDP datagram.
     recv_c: xev.Completion = .{},
     recv_state: xev.UDP.State = undefined,
     recv_buf: [65536]u8 = undefined,
+
+    /// Fires at the earliest ngtcp2 expiry of any connection.
     timer: xev.Timer,
     timer_c: xev.Completion = .{},
     timer_cancel_c: xev.Completion = .{},
+
+    /// Cancel the receive and the timer in `stop`.
     stop_c: [2]xev.Completion = .{ .{}, .{} },
+
+    /// Each outgoing packet is written here, then sent before the next.
     out: [quic.max_datagram_size]u8 = undefined,
     /// Nesting of endpoint events, so that flushing and freeing happen once,
     /// when the outermost ends.
@@ -107,6 +114,8 @@ pub const Endpoint = struct {
         errdefer _ = std.c.close(udp.fd);
         try udp.bind(options.local);
         try std.posix.setsockopt(udp.fd, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, &std.mem.toBytes(options.receive_buffer));
+
+        // Read back the address to learn the port when `local` asked for 0.
         var bound: PosixAddress = undefined;
         var bound_len: std.posix.socklen_t = @sizeOf(PosixAddress);
         if (std.c.getsockname(udp.fd, &bound.any, &bound_len) != 0) return error.Unexpected;
@@ -139,6 +148,9 @@ pub const Endpoint = struct {
         defer self.end();
         self.stopping = true;
         for (self.conns.items) |conn| conn.close(0);
+
+        // The loop finishes once these complete. `end` won't re-arm the
+        // timer while stopping.
         self.cancel(&self.stop_c[0], &self.recv_c);
         self.cancel(&self.stop_c[1], &self.timer_c);
     }
@@ -149,12 +161,15 @@ pub const Endpoint = struct {
         self.begin();
         defer self.end();
         std.debug.assert(self.options.role == .client and self.conns.items.len == 0);
+
         const conn = try self.gpa.create(Conn);
         errdefer self.gpa.destroy(conn);
         conn.* = .{ .endpoint = self, .remote = remote };
         conn.quic = try quic.Connection.connect(self.gpa, self.io, self.options.role.client, self.local, remote, self.connectionOptions(conn));
         errdefer conn.quic.deinit();
         try self.conns.append(self.gpa, conn);
+
+        // `end` sends the first Initial packet.
         conn.flush_pending = true;
         return conn;
     }
@@ -179,12 +194,15 @@ pub const Endpoint = struct {
         };
     }
 
+    /// Cancels `target` if it is pending, unless a cancel is already queued.
     fn cancel(self: *Endpoint, cancel_c: *xev.Completion, target: *xev.Completion) void {
         if (target.state() != .active or cancel_c.state() == .active) return;
         cancel_c.* = .{ .op = .{ .cancel = .{ .c = target } } };
         self.loop.add(cancel_c);
     }
 
+    /// Starts an event. Every entry point into the endpoint (a datagram,
+    /// the timer, a call from the app) runs between `begin` and `end`.
     fn begin(self: *Endpoint) void {
         self.depth += 1;
     }
@@ -194,10 +212,14 @@ pub const Endpoint = struct {
     fn end(self: *Endpoint) void {
         self.depth -= 1;
         if (self.depth > 0) return;
+
         for (self.conns.items) |conn| {
             if (conn.flush_pending and conn.closing == null) self.flush(conn);
         }
         self.reap();
+
+        // Sending and receiving move ngtcp2's expiry. The timer is set
+        // again after every event.
         if (!self.stopping) self.armTimer();
     }
 
@@ -216,28 +238,41 @@ pub const Endpoint = struct {
         result: xev.ReadError!usize,
     ) xev.CallbackAction {
         const self = self_.?;
+
+        // A failed receive is retried, except after `stop` cancels it.
         const n = result catch |err| {
             if (err != error.Canceled) log.warn("receive failed: {t}", .{err});
             return if (self.stopping) .disarm else .rearm;
         };
+
         self.begin();
         defer self.end();
         self.dispatch(from, self.recv_buf[0..n]);
         return if (self.stopping) .disarm else .rearm;
     }
 
+    /// Hands a datagram to its connection. On a server, a datagram for no
+    /// known connection may start a new one.
     fn dispatch(self: *Endpoint, from: IpAddress, packet: []const u8) void {
+        // A client has one connection, and every datagram is for it.
         const conn = switch (self.options.role) {
             .client => if (self.conns.items.len > 0) self.conns.items[0] else return,
             .server => self.route(packet) orelse return self.accept(from, packet),
         };
         if (conn.closing != null) return;
+
         conn.quic.receive(from, packet) catch |err| return conn.fail(err);
+
+        // Replies go to where the peer last sent from. A client that changes
+        // address keeps its connection.
         conn.remote = from;
         conn.flush_pending = true;
     }
 
+    /// Finds the connection by the packet's destination connection ID.
     fn route(self: *Endpoint, packet: []const u8) ?*Conn {
+        // Short header packets don't carry the ID's length. It is the length
+        // this endpoint issues.
         var vc: c.ngtcp2_version_cid = undefined;
         if (c.ngtcp2_pkt_decode_version_cid(&vc, packet.ptr, packet.len, cid_len) != 0) return null;
         return self.routes.get(.init(vc.dcid[0..vc.dcidlen]));
@@ -245,8 +280,10 @@ pub const Endpoint = struct {
 
     fn accept(self: *Endpoint, from: IpAddress, packet: []const u8) void {
         if (self.stopping) return;
+
         var vc: c.ngtcp2_version_cid = undefined;
         if (c.ngtcp2_pkt_decode_version_cid(&vc, packet.ptr, packet.len, cid_len) != 0) return;
+
         const conn = self.gpa.create(Conn) catch return;
         conn.* = .{ .endpoint = self, .remote = from };
         self.conns.append(self.gpa, conn) catch {
@@ -254,7 +291,8 @@ pub const Endpoint = struct {
             return;
         };
         conn.quic = quic.Connection.accept(self.gpa, self.io, self.options.role.server, self.local, from, packet, self.connectionOptions(conn)) catch {
-            // Not an Initial packet, or not a valid one.
+            // Not an Initial packet, or not a valid one. ngtcp2's callbacks
+            // may have added routes before it failed.
             _ = self.conns.pop();
             self.removeRoutes(conn);
             self.gpa.destroy(conn);
@@ -263,6 +301,8 @@ pub const Endpoint = struct {
         // The client addresses its Initial packets to the ID it chose until
         // it learns ours.
         self.addRoute(vc.dcid[0..vc.dcidlen], conn);
+
+        // Then the IDs the connection issued.
         var ids: [quic.Connection.max_connection_ids]c.ngtcp2_cid = undefined;
         for (conn.quic.connectionIds(&ids)) |*cid| self.addRoute(cid.data[0..cid.datalen], conn);
         conn.flush_pending = true;
@@ -277,21 +317,32 @@ pub const Endpoint = struct {
         var it = self.routes.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.* == conn) {
+                // Removing invalidates the iterator. Start over; a connection
+                // has a handful of IDs.
                 self.routes.removeByPtr(entry.key_ptr);
                 it = self.routes.iterator();
             }
         }
     }
 
+    /// Sends everything the connection has to send: each stream's queued
+    /// bytes, then ACKs and other frames.
     fn flush(self: *Endpoint, conn: *Conn) void {
         conn.flush_pending = false;
+
         var streams = conn.streams.valueIterator();
         stream: while (streams.next()) |stream_ptr| {
             const stream = stream_ptr.*;
+
+            // One packet per iteration, until the stream has nothing left
+            // or can't send more.
             while (!stream.closed) {
+                // `unsent` stops at a chunk boundary. FIN goes with the
+                // chunk that reaches the end of the written bytes.
                 const data = stream.send.unsent();
                 const fin = stream.fin and !stream.fin_sent and stream.send.sent + data.len == stream.send.end;
                 if (data.len == 0 and !fin) continue :stream;
+
                 const w = conn.quic.sendStream(&self.out, stream.id, data, fin) catch |err| switch (err) {
                     // The stream was reset or stopped. Its queued data is
                     // dropped.
@@ -304,12 +355,17 @@ pub const Endpoint = struct {
                 };
                 stream.send.sent += w.consumed;
                 if (w.fin) stream.fin_sent = true;
+
                 // Nothing to send: congestion control is holding packets.
                 const d = w.datagram orelse return;
                 self.sendDatagram(d);
+
+                // Flow control blocks this stream. Others may still send.
                 if (w.blocked or (w.consumed == 0 and !w.fin)) continue :stream;
             }
         }
+
+        // Packets without stream data: ACKs, flow control updates, PINGs.
         while (true) {
             const d = conn.quic.send(&self.out) catch |err| return conn.fail(err);
             self.sendDatagram(d orelse return);
@@ -331,15 +387,20 @@ pub const Endpoint = struct {
         }
     }
 
+    /// Frees closed streams and closed connections, calling the handler for
+    /// each first.
     fn reap(self: *Endpoint) void {
         var i: usize = 0;
         while (i < self.conns.items.len) {
             const conn = self.conns.items[i];
             conn.reapStreams();
+
             const reason = conn.closing orelse {
                 i += 1;
                 continue;
             };
+
+            // A closing connection's streams close with it.
             _ = self.conns.orderedRemove(i);
             self.removeRoutes(conn);
             var streams = conn.streams.valueIterator();
@@ -348,12 +409,14 @@ pub const Endpoint = struct {
                 stream.*.deinit();
             }
             conn.streams.deinit(self.gpa);
+
             if (self.options.handler.closed) |f| f(self.options.handler.ctx, conn, reason);
             conn.quic.deinit();
             self.gpa.destroy(conn);
         }
     }
 
+    /// Sets the timer to the earliest expiry of any connection.
     fn armTimer(self: *Endpoint) void {
         var next: ?u64 = null;
         for (self.conns.items) |conn| {
@@ -361,6 +424,9 @@ pub const Endpoint = struct {
             next = @min(next orelse ns, ns);
         }
         const ns = next orelse return;
+
+        // libxev timers take milliseconds. Rounding up avoids firing before
+        // the expiry and finding nothing to do.
         const ms = std.math.divCeil(u64, ns, std.time.ns_per_ms) catch unreachable;
         self.timer.reset(self.loop, &self.timer_c, &self.timer_cancel_c, ms, Endpoint, self, onTimer);
     }
@@ -369,9 +435,13 @@ pub const Endpoint = struct {
         const self = self_.?;
         // A reset cancels the previous timer; `end` re-arms it.
         result catch {};
+
         self.begin();
         defer self.end();
         if (self.stopping) return .disarm;
+
+        // Each connection checks its own expiry and does nothing if it
+        // hasn't passed.
         for (self.conns.items) |conn| {
             if (conn.closing != null) continue;
             conn.quic.handleExpiry() catch |err| {
@@ -409,15 +479,20 @@ pub const Conn = struct {
     /// Sends CONNECTION_CLOSE with an application error code.
     pub fn close(conn: *Conn, app_error_code: u64) void {
         if (conn.closing != null) return;
+
         const e = conn.endpoint;
         e.begin();
         defer e.end();
+
+        // One CONNECTION_CLOSE, best effort. A peer that misses it times
+        // out.
         if (conn.quic.writeClose(&e.out, .{ .application = app_error_code })) |d| {
             if (d) |datagram| e.sendDatagram(datagram);
         } else |_| {}
         conn.closing = .local;
     }
 
+    /// Closes the connection after an ngtcp2 error.
     fn fail(conn: *Conn, err: quic.Error) void {
         const e = conn.endpoint;
         conn.closing = switch (err) {
@@ -426,6 +501,8 @@ pub const Conn = struct {
             error.HandshakeFailed => .handshake_failed,
             else => .failed,
         };
+
+        // After a peer's close or an idle timeout there is no one to tell.
         switch (err) {
             error.Closed, error.IdleTimeout => {},
             // Tell the peer why.
@@ -448,6 +525,9 @@ pub const Conn = struct {
     /// `streams`.
     fn reapStreams(conn: *Conn) void {
         const handler = conn.endpoint.options.handler;
+
+        // Removing invalidates the iterator. Each removal starts the scan
+        // over.
         var again = true;
         while (again) {
             again = false;
@@ -485,6 +565,9 @@ pub const Conn = struct {
     fn onStreamData(ctx: ?*anyopaque, qc: *quic.Connection, id: i64, bytes: []const u8, fin: bool) void {
         const conn = fromCtx(ctx);
         const stream = conn.streams.get(id) orelse return;
+
+        // Without a data handler the bytes are dropped, and their credit is
+        // returned so the peer isn't blocked.
         const handler = conn.endpoint.options.handler;
         if (handler.data) |f| f(handler.ctx, stream, bytes, fin) else qc.consume(id, bytes.len) catch {};
     }
@@ -504,6 +587,8 @@ pub const Conn = struct {
         if (handler.reset) |f| f(handler.ctx, stream, code);
     }
 
+    /// This can run while `flush` iterates `streams`. The stream is marked
+    /// here and freed by `reap` when the event ends.
     fn onStreamClosed(ctx: ?*anyopaque, _: *quic.Connection, id: i64) void {
         const conn = fromCtx(ctx);
         if (conn.streams.get(id)) |stream| stream.closed = true;
@@ -536,6 +621,8 @@ pub const Stream = struct {
     /// it.
     pub fn write(stream: *Stream, bytes: []const u8) Allocator.Error!void {
         std.debug.assert(!stream.fin);
+
+        // Writes to a closed stream or connection are dropped.
         if (stream.closed or stream.conn.closing != null) return;
         try stream.send.append(stream.conn.endpoint.gpa, bytes);
         stream.requestFlush();
@@ -566,6 +653,8 @@ pub const Stream = struct {
         stream.requestFlush();
     }
 
+    /// Marks the connection for flushing. Outside an event, the empty event
+    /// flushes it now; inside one, the outermost `end` does.
     fn requestFlush(stream: *Stream) void {
         const e = stream.conn.endpoint;
         stream.conn.flush_pending = true;
@@ -584,11 +673,16 @@ pub const Stream = struct {
 /// pointers ngtcp2 keeps stay valid. Offsets are stream offsets.
 const SendQueue = struct {
     chunks: std.ArrayList(*[chunk_len]u8) = .empty,
+
+    // Stream offsets, in order: base <= acked <= sent <= end.
+
     /// The offset of the first byte of `chunks.items[0]`.
     base: u64 = 0,
+    /// Bytes before this are acknowledged.
     acked: u64 = 0,
-    /// Passed to ngtcp2.
+    /// Bytes before this were passed to ngtcp2.
     sent: u64 = 0,
+    /// The offset after the last byte written.
     end: u64 = 0,
 
     const chunk_len = 16 * 1024;
@@ -596,12 +690,17 @@ const SendQueue = struct {
     fn append(q: *SendQueue, gpa: Allocator, bytes: []const u8) Allocator.Error!void {
         var rest = bytes;
         while (rest.len > 0) {
+            // Bytes held in the chunks, acknowledged or not.
             const used: usize = @intCast(q.end - q.base);
+
+            // The last chunk is full, or there is none.
             if (used == q.chunks.items.len * chunk_len) {
                 const chunk = try gpa.create([chunk_len]u8);
                 errdefer gpa.destroy(chunk);
                 try q.chunks.append(gpa, chunk);
             }
+
+            // Fill the last chunk.
             const chunk = q.chunks.items[used / chunk_len];
             const off = used % chunk_len;
             const n = @min(rest.len, chunk_len - off);
@@ -614,6 +713,8 @@ const SendQueue = struct {
     /// The unsent bytes in the chunk holding `sent`.
     fn unsent(q: *const SendQueue) []const u8 {
         if (q.sent == q.end) return &.{};
+
+        // `sent` as a position in the chunks.
         const rel: usize = @intCast(q.sent - q.base);
         const off = rel % chunk_len;
         const n: usize = @intCast(@min(chunk_len - off, q.end - q.sent));
@@ -625,6 +726,8 @@ const SendQueue = struct {
     fn ack(q: *SendQueue, gpa: Allocator, offset: u64, len: u64) void {
         std.debug.assert(offset == q.acked);
         q.acked = offset + len;
+
+        // Free the chunks that are now fully acknowledged.
         while (q.chunks.items.len > 0 and q.acked >= q.base + chunk_len) {
             gpa.destroy(q.chunks.orderedRemove(0));
             q.base += chunk_len;
@@ -642,6 +745,7 @@ const Cid = struct {
     len: u8,
     data: [c.NGTCP2_MAX_CIDLEN]u8,
 
+    /// The unused bytes are zeroed. Equal IDs then hash equally.
     fn init(bytes: []const u8) Cid {
         var cid: Cid = .{ .len = @intCast(bytes.len), .data = @splat(0) };
         @memcpy(cid.data[0..bytes.len], bytes);
