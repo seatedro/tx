@@ -59,6 +59,24 @@ pub fn build(b: *std.Build) void {
         .root_module = sessionModule(b, target, optimize, termModule(b, target, optimize, ghostty_vt)),
     });
     addTestRuns(b, session_tests, test_step, test_network_step);
+
+    const proto_tests = b.addTest(.{
+        .name = "proto-test",
+        .root_module = protoModule(b, target, optimize),
+    });
+    addTestRuns(b, proto_tests, test_step, test_network_step);
+}
+
+fn protoModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Module {
+    return b.createModule(.{
+        .root_source_file = b.path("src/proto/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 }
 
 fn sessionModule(
