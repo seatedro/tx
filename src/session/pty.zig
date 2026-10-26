@@ -204,7 +204,7 @@ pub const Pty = struct {
                 .path => |path| .{ .path = try arena.dupeSentinel(u8, path, 0) },
             },
             .slave = slave,
-            .report = undefined,
+            .err_fd = undefined,
             .max_fd = maxFd(),
             .default_action = .{ .handler = .{ .handler = posix.SIG.DFL }, .mask = undefined, .flags = 0 },
             .empty_mask = undefined,
@@ -212,10 +212,10 @@ pub const Pty = struct {
         _ = c.sigemptyset(&child.default_action.mask);
         _ = c.sigemptyset(&child.empty_mask);
 
-        // The child writes a Report here if it fails before exec. A
+        // The child writes a ChildError here if it fails before exec. A
         // successful exec closes the pipe unwritten.
-        const report_pipe = try pipe();
-        child.report = report_pipe[1];
+        const err_pipe = try pipe();
+        child.err_fd = err_pipe[1];
 
         // Block all signals across fork so the child can't run a host
         // handler before resetting dispositions to the default.
@@ -227,13 +227,13 @@ pub const Pty = struct {
         if (pid == 0) child.run();
         _ = c.pthread_sigmask(posix.SIG.SETMASK, &old_mask, &all_signals);
 
-        closeFd(report_pipe[1]);
-        defer closeFd(report_pipe[0]);
+        closeFd(err_pipe[1]);
+        defer closeFd(err_pipe[0]);
         if (pid == -1) return switch (posix.errno(-1)) {
             .AGAIN, .NOMEM => error.SystemResources,
             else => |err| posix.unexpectedErrno(err),
         };
-        const failure = readReport(report_pipe[0]) orelse {
+        const failure = readChildError(err_pipe[0]) orelse {
             self.pid = pid;
             return self;
         };
@@ -396,10 +396,10 @@ const Child = struct {
         fd: posix.fd_t,
         path: [*:0]const u8,
     },
-    /// `slave` and `report` are above 2, so dup2 onto stdio doesn't clobber
+    /// `slave` and `err_fd` are above 2, so dup2 onto stdio doesn't clobber
     /// them.
     slave: posix.fd_t,
-    report: posix.fd_t,
+    err_fd: posix.fd_t,
     max_fd: posix.fd_t,
     default_action: posix.Sigaction,
     empty_mask: posix.sigset_t,
@@ -407,26 +407,26 @@ const Child = struct {
     fn run(child: *const Child) noreturn {
         switch (child.cwd) {
             .inherit => {},
-            .fd => |fd| if (c.fchdir(fd) != 0) fail(child.report, .chdir, posix.errno(-1)),
-            .path => |path| if (c.chdir(path) != 0) fail(child.report, .chdir, posix.errno(-1)),
+            .fd => |fd| if (c.fchdir(fd) != 0) fail(child.err_fd, .chdir, posix.errno(-1)),
+            .path => |path| if (c.chdir(path) != 0) fail(child.err_fd, .chdir, posix.errno(-1)),
         }
 
         // A new session has no controlling terminal, so TIOCSCTTY can make
         // the slave this one's. The child becomes the foreground process
         // group, which receives ^C and SIGWINCH.
-        if (c.setsid() == -1) fail(child.report, .setsid, posix.errno(-1));
+        if (c.setsid() == -1) fail(child.err_fd, .setsid, posix.errno(-1));
         if (ioctl(child.slave, tiocsctty, @as(c_ulong, 0)) == -1)
-            fail(child.report, .controlling_terminal, posix.errno(-1));
+            fail(child.err_fd, .controlling_terminal, posix.errno(-1));
 
         for ([_]posix.fd_t{ 0, 1, 2 }) |fd| {
-            if (c.dup2(child.slave, fd) == -1) fail(child.report, .stdio, posix.errno(-1));
+            if (c.dup2(child.slave, fd) == -1) fail(child.err_fd, .stdio, posix.errno(-1));
         }
-        // Close inherited fds other than the report pipe, moved to 3.
-        const report: posix.fd_t = 3;
-        if (c.dup2(child.report, report) == -1) fail(child.report, .stdio, posix.errno(-1));
-        if (c.fcntl(report, posix.F.SETFD, @as(c_int, posix.FD_CLOEXEC)) == -1)
-            fail(report, .stdio, posix.errno(-1));
-        closeFrom(report + 1, child.max_fd);
+        // Close inherited fds other than the error pipe, moved to 3.
+        const err_fd: posix.fd_t = 3;
+        if (c.dup2(child.err_fd, err_fd) == -1) fail(child.err_fd, .stdio, posix.errno(-1));
+        if (c.fcntl(err_fd, posix.F.SETFD, @as(c_int, posix.FD_CLOEXEC)) == -1)
+            fail(err_fd, .stdio, posix.errno(-1));
+        closeFrom(err_fd + 1, child.max_fd);
 
         // exec preserves ignored signals and the signal mask; the host
         // likely ignores SIGPIPE. sigaction fails on signals that can't be
@@ -437,7 +437,7 @@ const Child = struct {
         }
         _ = c.sigprocmask(posix.SIG.SETMASK, &child.empty_mask, null);
 
-        fail(report, .exec, child.exec());
+        fail(err_fd, .exec, child.exec());
     }
 
     /// Returns the errno if exec fails.
@@ -469,8 +469,8 @@ const Child = struct {
     }
 
     fn fail(fd: posix.fd_t, step: Diagnostic.Step, err: posix.E) noreturn {
-        const report: Report = .{ .step = @backingInt(step), .errno = @intCast(@backingInt(err)) };
-        const bytes = std.mem.asBytes(&report);
+        const child_err: ChildError = .{ .step = @backingInt(step), .errno = @intCast(@backingInt(err)) };
+        const bytes = std.mem.asBytes(&child_err);
         // Smaller than PIPE_BUF, so the write is atomic.
         while (posix.errno(c.write(fd, bytes, bytes.len)) == .INTR) {}
         // Don't call exit: atexit handlers belong to the host.
@@ -479,7 +479,7 @@ const Child = struct {
 };
 
 /// Written by a child that fails before exec.
-const Report = extern struct {
+const ChildError = extern struct {
     step: u32,
     errno: u32,
 
@@ -512,9 +512,9 @@ const Report = extern struct {
 };
 
 /// Returns null if the child exec'd.
-fn readReport(fd: posix.fd_t) ?Report.Failure {
-    var report: Report = undefined;
-    const bytes = std.mem.asBytes(&report);
+fn readChildError(fd: posix.fd_t) ?ChildError.Failure {
+    var child_err: ChildError = undefined;
+    const bytes = std.mem.asBytes(&child_err);
     const n = while (true) {
         const rc = c.read(fd, bytes, bytes.len);
         switch (posix.errno(rc)) {
@@ -526,8 +526,8 @@ fn readReport(fd: posix.fd_t) ?Report.Failure {
     if (n == 0) return null;
     if (n != bytes.len) return .{ .step = .exec, .errno = .IO };
     return .{
-        .step = std.enums.fromInt(Diagnostic.Step, report.step) orelse .exec,
-        .errno = @fromBackingInt(@intCast(report.errno)),
+        .step = std.enums.fromInt(Diagnostic.Step, child_err.step) orelse .exec,
+        .errno = @fromBackingInt(@intCast(child_err.errno)),
     };
 }
 
