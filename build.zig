@@ -6,14 +6,12 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // libghostty-vt, pinned in build.zig.zon. Code in src/ will import it.
     const ghostty = b.dependency("ghostty", .{
         .target = target,
         .optimize = optimize,
     });
-    _ = ghostty.module("ghostty-vt");
+    const ghostty_vt = ghostty.module("ghostty-vt");
 
-    // QUIC (ngtcp2) and TLS 1.3 (picotls), built from upstream sources.
     const ngtcp2_dep = b.dependency("ngtcp2", .{});
     const picotls_dep = b.dependency("picotls", .{});
     const ngtcp2 = ngtcp2_build.core(b, ngtcp2_dep, target, optimize);
@@ -49,6 +47,49 @@ pub fn build(b: *std.Build) void {
         .root_module = transportModule(b, target, optimize, transport_libs),
     });
     addTestRuns(b, transport_tests, test_step, test_network_step);
+
+    const term_tests = b.addTest(.{
+        .name = "term-test",
+        .root_module = termModule(b, target, optimize, ghostty_vt),
+    });
+    addTestRuns(b, term_tests, test_step, test_network_step);
+
+    const session_tests = b.addTest(.{
+        .name = "session-test",
+        .root_module = sessionModule(b, target, optimize, termModule(b, target, optimize, ghostty_vt)),
+    });
+    addTestRuns(b, session_tests, test_step, test_network_step);
+}
+
+fn sessionModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    term: *std.Build.Module,
+) *std.Build.Module {
+    const mod = b.createModule(.{
+        .root_source_file = b.path("src/session/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    mod.addImport("term", term);
+    return mod;
+}
+
+fn termModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    ghostty_vt: *std.Build.Module,
+) *std.Build.Module {
+    const mod = b.createModule(.{
+        .root_source_file = b.path("src/term/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    mod.addImport("ghostty-vt", ghostty_vt);
+    return mod;
 }
 
 const c_flags = &[_][]const u8{"-std=gnu11"};
@@ -71,8 +112,8 @@ fn cryptoModule(
     return mod;
 }
 
-/// `zig build test` runs `tests` offline; `zig build test-network` also runs
-/// the tests that need the internet.
+/// `test_network_step` sets `TX_TEST_NETWORK`, which enables the tests that
+/// need the internet.
 fn addTestRuns(
     b: *std.Build,
     tests: *std.Build.Step.Compile,
@@ -97,8 +138,8 @@ fn transportModule(
     optimize: std.builtin.OptimizeMode,
     libs: TransportLibs,
 ) *std.Build.Module {
-    // ngtcp2's API and tls.h, translated for quic.zig. picotls's headers
-    // stay out: its structs use bitfields, so only tls.c touches them.
+    // picotls's headers are left out because its structs use bitfields,
+    // which translate-c can't express. Only tls.c includes them.
     const c = b.addTranslateC(.{
         .root_source_file = b.path("src/transport/c.h"),
         .target = target,

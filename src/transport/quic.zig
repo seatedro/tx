@@ -1,9 +1,9 @@
-//! QUIC connections over ngtcp2, secured by tls.c: TLS 1.3 with Ed25519 raw
-//! public keys, ALPN "tx/1", and hybrid post-quantum key exchange.
+//! QUIC connections over ngtcp2, with TLS 1.3 from tls.c (Ed25519 raw public
+//! keys, ALPN "tx/1", hybrid post-quantum key exchange).
 //!
-//! A Connection does no I/O. Its owner feeds it datagrams with `receive`,
-//! sends what `send` and `sendStream` return, and calls `handleExpiry` once
-//! `timeout` has elapsed.
+//! `Connection` performs no I/O. The caller passes received datagrams to
+//! `receive`, transmits the datagrams written by `send` and `sendStream`, and
+//! calls `handleExpiry` when `timeout` elapses.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -30,11 +30,11 @@ pub const Error = error{
     Quic,
 };
 
-/// Buffers passed to `send` and `sendStream` must hold at least this many
-/// bytes, ngtcp2's largest UDP payload by default.
+/// Minimum length of the buffers passed to `send` and `sendStream`. This is
+/// ngtcp2's default maximum UDP payload size.
 pub const max_datagram_size = 1452;
 
-/// A server's TLS identity: the Ed25519 key it presents.
+/// Server TLS context for one Ed25519 identity.
 pub const Server = struct {
     tls: *c.tx_tls_server,
     /// Derives stateless reset tokens from connection IDs.
@@ -57,7 +57,7 @@ pub const Server = struct {
     }
 };
 
-/// A client's trust: the one server key it accepts.
+/// Client TLS context that accepts one pinned server key.
 pub const Client = struct {
     tls: *c.tx_tls_client,
 
@@ -85,7 +85,7 @@ pub const Connection = struct {
     conn_ref: c.ngtcp2_crypto_conn_ref,
     local: IpAddress,
     handler: Handler,
-    /// Set on servers, which derive stateless reset tokens from it.
+    /// Set on servers. Stateless reset tokens are derived from it.
     reset_secret: ?*const [32]u8,
     /// The ngtcp2 error code behind the last `Error.Quic`.
     last_error: c_int = 0,
@@ -93,18 +93,19 @@ pub const Connection = struct {
     pub const Handler = struct {
         ctx: ?*anyopaque = null,
         handshakeCompleted: ?*const fn (ctx: ?*anyopaque, conn: *Connection) void = null,
-        /// Data received on a stream. Call `consume` once it has been
-        /// processed, to extend the peer's flow control window.
+        /// Call `consume` after processing `data` to extend the peer's flow
+        /// control window.
         streamData: ?*const fn (ctx: ?*anyopaque, conn: *Connection, stream_id: i64, data: []const u8, fin: bool) void = null,
         /// The peer acknowledged `len` bytes of `stream_id` starting at
-        /// `offset`. Until then, the bytes passed to `sendStream` must stay
-        /// valid and unchanged (see `sendStream`).
+        /// `offset`. Bytes passed to `sendStream` must stay valid and
+        /// unchanged until they are acknowledged.
         streamAcked: ?*const fn (ctx: ?*anyopaque, conn: *Connection, stream_id: i64, offset: u64, len: u64) void = null,
     };
 
     pub const Options = struct {
         handler: Handler = .{},
-        /// Sent as SNI by clients. Raw public keys don't need it.
+        /// SNI sent by clients. Optional; raw public key authentication does
+        /// not use it.
         server_name: ?[*:0]const u8 = null,
         idle_timeout_ns: u64 = 30 * std.time.ns_per_s,
     };
@@ -234,8 +235,8 @@ pub const Connection = struct {
     }
 
     pub fn deinit(self: *Connection) void {
-        // The connection holds the session as its TLS handle, so it goes
-        // first.
+        // The connection references the session as its TLS native handle.
+        // Delete the connection first.
         c.ngtcp2_conn_del(self.conn);
         c.tx_tls_session_free(self.session);
         self.gpa.destroy(self);
@@ -262,7 +263,7 @@ pub const Connection = struct {
 
     pub const StreamWrite = struct {
         datagram: ?Datagram,
-        /// Bytes of `data` now owned by the connection.
+        /// Bytes of `data` accepted by the connection (see `sendStream`).
         consumed: usize,
     };
 
@@ -270,9 +271,9 @@ pub const Connection = struct {
     /// `stream_id` as fits and flow control allows. With `fin`, the stream
     /// is closed once all of `data` has been consumed.
     ///
-    /// ngtcp2 does not copy stream data: it keeps pointers into `data` to
-    /// retransmit lost packets. Consumed bytes must stay valid and unchanged
-    /// until the handler's `streamAcked` covers them.
+    /// ngtcp2 does not copy stream data. It keeps pointers into `data` for
+    /// retransmission. Consumed bytes must stay valid and unchanged until
+    /// `Handler.streamAcked` covers them.
     pub fn sendStream(self: *Connection, buf: []u8, stream_id: i64, data: []const u8, fin: bool) Error!StreamWrite {
         std.debug.assert(buf.len >= max_datagram_size);
         var ps: c.ngtcp2_path_storage = undefined;
@@ -297,8 +298,8 @@ pub const Connection = struct {
         return stream_id;
     }
 
-    /// Give the peer `n` more bytes of flow control credit on `stream_id`,
-    /// after the application has processed that much received data.
+    /// Give the peer `n` more bytes of flow control credit on `stream_id` and
+    /// on the connection. Call after processing `n` bytes of received data.
     pub fn consume(self: *Connection, stream_id: i64, n: usize) Error!void {
         try self.check(c.ngtcp2_conn_extend_max_stream_offset(self.conn, stream_id, n));
         c.ngtcp2_conn_extend_max_offset(self.conn, n);
@@ -317,7 +318,7 @@ pub const Connection = struct {
         return if (expiry <= t) 0 else expiry - t;
     }
 
-    /// Run timers that have expired: retransmission, idle timeout, and so on.
+    /// Run expired timers, such as retransmission and idle timeout.
     pub fn handleExpiry(self: *Connection) Error!void {
         const t = now(self.io);
         if (c.ngtcp2_conn_get_expiry(self.conn) <= t) {
@@ -347,8 +348,8 @@ pub const Connection = struct {
     }
 };
 
-/// An ngtcp2_path whose addresses live alongside it. It points into
-/// itself, so it is initialized in place and must not be copied.
+/// An ngtcp2_path with inline address storage. `value` points into the
+/// struct; initialize it in place and do not copy it.
 const Path = struct {
     local: PosixAddress,
     remote: PosixAddress,
