@@ -32,6 +32,8 @@ const Login = struct {
     agent: auth.agent.TestAgent = undefined,
     agent_path: []u8,
     authorized_keys: []u8,
+    /// Holds the identities `clientOptions` returns.
+    identities: [4]client.session.Identity = undefined,
 
     /// The agent holds `agent_keys`, or the user key if null.
     fn init(l: *Login, agent_keys: ?[]const Ed25519.KeyPair) !void {
@@ -54,6 +56,24 @@ const Login = struct {
         try l.agent.start(testing.io, l.agent_path, agent_keys orelse (&l.key)[0..1]);
     }
 
+    /// Adds `key` to the `authorized_keys` file.
+    fn authorize(l: *Login, key: auth.Key) !void {
+        const old = try l.tmp.dir.readFileAlloc(testing.io, "authorized_keys", gpa, .unlimited);
+        defer gpa.free(old);
+        const new = try std.fmt.allocPrint(gpa, "{s}ssh-ed25519 {s}\n", .{ old, auth.ssh.KeyText.init(key).slice() });
+        defer gpa.free(new);
+        try l.tmp.dir.writeFile(testing.io, .{ .sub_path = "authorized_keys", .data = new });
+    }
+
+    /// Writes a key file into the temporary directory and returns its
+    /// path, owned by the caller.
+    fn writeKeyFile(l: *Login, name: []const u8, text: []const u8) ![]u8 {
+        try l.tmp.dir.writeFile(testing.io, .{ .sub_path = name, .data = text });
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const dir = buf[0..try l.tmp.dir.realPath(testing.io, &buf)];
+        return std.fs.path.join(gpa, &.{ dir, name });
+    }
+
     fn deinit(l: *Login) void {
         l.agent.stop(l.agent_path);
         gpa.free(l.agent_path);
@@ -73,14 +93,16 @@ const Login = struct {
         };
     }
 
-    /// Client options for a client on `pty`, with the keys the agent holds.
-    fn clientOptions(l: *const Login, st: *const ServerThread, pty: *const TestPty, keys: []const auth.Key) client.session.Options {
+    /// Client options for a client on `pty`, logging in with `keys` from
+    /// the agent. The result points into `l`, until the next call.
+    fn clientOptions(l: *Login, st: *const ServerThread, pty: *const TestPty, keys: []const auth.Key) client.session.Options {
+        for (keys, 0..) |key, i| l.identities[i] = .{ .key = key, .source = .agent };
         return .{
             .server = st.server.address(),
             .host_keys = &st.host_keys,
             .user = test_user,
             .agent = l.agent_path,
-            .keys = keys,
+            .identities = l.identities[0..keys.len],
             .in_fd = pty.slave,
             .out_fd = pty.slave,
             .term = "xterm-256color",
@@ -403,7 +425,7 @@ test "a client whose keys aren't in authorized_keys is refused" {
     var ct: ClientThread = .{ .options = login.clientOptions(&st, &pty, &.{unlisted.public_key.toBytes()}) };
     try ct.start();
     const outcome = try ct.join(&pty);
-    try testing.expectEqualStrings("the server accepted none of the agent's keys for tx-test", outcome.refused.message.slice());
+    try testing.expectEqualStrings("the server accepted none of the keys for tx-test", outcome.refused.message.slice());
     try testing.expectEqual(0, login.agent.signatures.load(.monotonic));
 }
 
@@ -424,7 +446,7 @@ test "a client logging in as another user is refused" {
     ct.options.user = "root";
     try ct.start();
     const outcome = try ct.join(&pty);
-    try testing.expectEqualStrings("the server accepted none of the agent's keys for root", outcome.refused.message.slice());
+    try testing.expectEqualStrings("the server accepted none of the keys for root", outcome.refused.message.slice());
 }
 
 test "a refused signature fails the login" {
@@ -483,6 +505,101 @@ test "attaching before login is refused" {
     rc.login = .skip;
     try testing.expectEqual(@backingInt(server_pkg.ErrorCode.protocol), try rc.waitError());
     try testing.expectEqual(null, rc.attached);
+}
+
+// From `ssh-keygen -t ed25519`, with no passphrase and with "correct horse".
+// They are the test keys of auth/private_key.zig.
+const plain_key_file =
+    \\-----BEGIN OPENSSH PRIVATE KEY-----
+    \\b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+    \\QyNTUxOQAAACDI/tJmA4x7Bqj2AcaIoSueX1FmHADCLttG/2lcclxpWQAAAIjXUWLl11Fi
+    \\5QAAAAtzc2gtZWQyNTUxOQAAACDI/tJmA4x7Bqj2AcaIoSueX1FmHADCLttG/2lcclxpWQ
+    \\AAAEAgNr/hbGFlAKl+PqHYq7+Fb0LObTU5440OQQiXF0X+G8j+0mYDjHsGqPYBxoihK55f
+    \\UWYcAMIu20b/aVxyXGlZAAAABXBsYWlu
+    \\-----END OPENSSH PRIVATE KEY-----
+    \\
+;
+const encrypted_key_file =
+    \\-----BEGIN OPENSSH PRIVATE KEY-----
+    \\b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABAm/7i1ie
+    \\UhrMoBGLvmYoqEAAAAGAAAAAEAAAAzAAAAC3NzaC1lZDI1NTE5AAAAINCQJexQXcQKPgL7
+    \\X1aHoO45B6XEMcJxRSwTy8TYKT6vAAAAkMWEVaaFHfH4dTZLp0RicWHT1/vWTXf2iW8Vlf
+    \\bRk9QcckE+ynTGOb28DigYKDoFQoPiLnvB0kFtPGmTq2QBbnIL+5EO+TQbxEhXkUGo9OUk
+    \\z7FhHZW/Fqm4oivLFKYSdMTQmi8vpsmT79m0jYlPaa+6W5AqhjNaGWxdqpEk/GA28CCTKY
+    \\JXjp9dszWtvnBnHQ==
+    \\-----END OPENSSH PRIVATE KEY-----
+    \\
+;
+
+fn rightPassphrase(_: []const u8, buf: []u8, _: posix.fd_t) ?[]u8 {
+    const pass = "correct horse";
+    @memcpy(buf[0..pass.len], pass);
+    return buf[0..pass.len];
+}
+
+fn wrongPassphrase(_: []const u8, buf: []u8, _: posix.fd_t) ?[]u8 {
+    buf[0] = 'x';
+    return buf[0..1];
+}
+
+fn noPassphrase(_: []const u8, _: []u8, _: posix.fd_t) ?[]u8 {
+    return null;
+}
+
+/// Logs in with the key in `text`, saved as a key file the server accepts,
+/// and returns the outcome. The program prints `ready` and exits.
+fn loginWithKeyFile(text: []const u8, ask: *const fn ([]const u8, []u8, posix.fd_t) ?[]u8) !client.session.Outcome {
+    transport.crypto.init(testing.io);
+    var environ = try testEnviron();
+    defer environ.deinit();
+
+    // The agent holds no key the server accepts.
+    const other: Ed25519.KeyPair = .generate(testing.io);
+    var login: Login = undefined;
+    try login.init(&.{other});
+    defer login.deinit();
+
+    const path = try login.writeKeyFile("id_ed25519", text);
+    defer gpa.free(path);
+    var file: auth.private_key.PrivateKeyFile = try .parse(gpa, text);
+    defer file.deinit(gpa);
+    try login.authorize(file.public_key);
+
+    var st: ServerThread = undefined;
+    try st.init(try login.serverOptions(&environ, &.{ "/bin/sh", "-c", "printf 'ready\\r\\n'" }));
+    defer st.deinit();
+
+    var pty: TestPty = try .open();
+    defer pty.close();
+    var ct: ClientThread = .{ .options = login.clientOptions(&st, &pty, &.{other.public_key.toBytes()}) };
+    const ids = [_]client.session.Identity{
+        .{ .key = other.public_key.toBytes(), .source = .agent },
+        .{ .key = file.public_key, .source = .{ .file = path } },
+    };
+    ct.options.identities = &ids;
+    ct.options.passphrase = ask;
+    try ct.start();
+    return ct.join(&pty);
+}
+
+test "a key file logs in when the agent's keys don't" {
+    const outcome = try loginWithKeyFile(plain_key_file, noPassphrase);
+    try testing.expectEqual(0, outcome.exited.status);
+}
+
+test "an encrypted key file logs in with its passphrase" {
+    const outcome = try loginWithKeyFile(encrypted_key_file, rightPassphrase);
+    try testing.expectEqual(0, outcome.exited.status);
+}
+
+test "a wrong passphrase fails the login" {
+    const outcome = try loginWithKeyFile(encrypted_key_file, wrongPassphrase);
+    try testing.expect(std.mem.startsWith(u8, outcome.refused.message.slice(), "wrong passphrase for "));
+}
+
+test "a canceled passphrase prompt fails the login" {
+    const outcome = try loginWithKeyFile(encrypted_key_file, noPassphrase);
+    try testing.expectEqualStrings("login canceled", outcome.refused.message.slice());
 }
 
 /// A client that speaks the protocol directly, for messages `tx` doesn't
