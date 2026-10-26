@@ -138,6 +138,8 @@ pub const Signals = struct {
     options: Options,
     thread: std.Thread,
     stopping: std.atomic.Value(bool),
+    /// SIGWINCH's action before `start`, restored by `stop`.
+    old_winch: posix.Sigaction,
 
     pub const Event = union(enum) {
         /// The size after a SIGWINCH. Not sent if TIOCGWINSZ fails.
@@ -160,7 +162,16 @@ pub const Signals = struct {
     /// Asserts that the calling thread blocks `handled_signals`.
     pub fn start(s: *Signals, options: Options) std.Thread.SpawnError!void {
         assert(signalsBlocked());
-        s.* = .{ .options = options, .thread = undefined, .stopping = .init(false) };
+        s.* = .{ .options = options, .thread = undefined, .stopping = .init(false), .old_winch = undefined };
+
+        // SIGWINCH's default action is to ignore it, and macOS discards an
+        // ignored signal when it is sent, blocked or not. With a handler it
+        // stays pending until sigwait takes it. Every thread blocks it, so
+        // the handler never runs.
+        const action: posix.Sigaction = .{ .handler = .{ .handler = ignore }, .mask = posix.sigemptyset(), .flags = 0 };
+        _ = c.sigaction(.WINCH, &action, &s.old_winch);
+        errdefer _ = c.sigaction(.WINCH, &s.old_winch, null);
+
         s.thread = try std.Thread.spawn(.{}, run, .{s});
     }
 
@@ -169,8 +180,11 @@ pub const Signals = struct {
         // Pending on the signal thread, since it blocks SIGWINCH.
         _ = c.pthread_kill(s.thread.getHandle(), .WINCH);
         s.thread.join();
+        _ = c.sigaction(.WINCH, &s.old_winch, null);
         s.* = undefined;
     }
+
+    fn ignore(_: posix.SIG) callconv(.c) void {}
 
     fn run(s: *Signals) void {
         var set = signalSet();
@@ -688,7 +702,16 @@ test "raw mode sets OpenSSH's flags and restore brings back the saved attributes
 
     raw.restore();
     try getAttrs(pty.slave, &attrs);
-    try testing.expectEqual(before, attrs);
+    try expectRestored(before, attrs);
+}
+
+/// Fails unless `attrs` are `saved`. BSD kernels, macOS's among them, set
+/// PENDIN when ICANON is turned back on, to reprint pending input, so
+/// PENDIN isn't compared.
+fn expectRestored(saved: posix.termios, attrs: posix.termios) !void {
+    var got = attrs;
+    got.lflag.PENDIN = saved.lflag.PENDIN;
+    try testing.expectEqual(saved, got);
 }
 
 test "a pipe is not a terminal" {
@@ -981,5 +1004,5 @@ test "SIGTERM restores the terminal before the callback runs" {
     try testing.expectEqual(0, c.pthread_kill(signals.thread.getHandle(), .TERM));
     try waitUntil(&log, SignalLog.hasTerminate);
     try testing.expectEqual(posix.SIG.TERM, log.terminate.?);
-    try testing.expectEqual(raw.saved, log.attrs.?);
+    try expectRestored(raw.saved, log.attrs.?);
 }
