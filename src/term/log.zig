@@ -1,11 +1,10 @@
-//! The output log: the ordered records that take a replica from a snapshot
-//! to the primary terminal's current state.
+//! The ordered records that take a replica from a snapshot to the primary
+//! terminal's current state. A record holds bytes the primary consumed or
+//! an event outside the byte stream that changes terminal state.
 //!
-//! A record is either bytes the primary terminal consumed or one of
-//! the few events outside the byte stream that change terminal state. Seq
-//! numbers count records from 0 with no gaps, so a replica that has applied
-//! seq n needs exactly n + 1 next, and a reader that asks for a seq the
-//! ring has already dropped knows it needs a full resync instead.
+//! Seqs number records from 0 without gaps. A reader whose next seq has
+//! been dropped from the ring gets `error.Trimmed` and must resync from a
+//! snapshot.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const vt = @import("ghostty-vt");
@@ -15,23 +14,22 @@ pub const Record = struct {
     payload: Payload,
 };
 
-/// What a record carries. Default colors from the host will be added as
-/// another kind.
+/// Default colors from the host will be added as another variant.
 pub const Payload = union(enum) {
-    /// Bytes fed to the primary terminal's stream, in order. How the
-    /// bytes are split into records doesn't matter to the terminal state.
+    /// Bytes fed to the primary terminal's stream. Where output is split
+    /// into records does not affect terminal state.
     output: []const u8,
 
-    /// A resize, applied at this point in the stream on both ends.
+    /// Applied at this point in the stream on both ends.
     resize: Resize,
 };
 
-/// A resize as libghostty-vt's `Terminal.resize` takes it.
+/// The arguments to libghostty-vt's `Terminal.resize`.
 pub const Resize = struct {
     cols: u16,
     rows: u16,
-    /// The pixel size of one cell, if the host knows it. Images and pixel
-    /// size reports depend on it.
+    /// Null if the host doesn't know it. Images and pixel size reports
+    /// depend on it.
     cell_size_px: ?CellSize = null,
 
     pub const CellSize = struct {
@@ -66,15 +64,14 @@ pub const ReadError = error{
 pub const Log = struct {
     gpa: Allocator,
     capacity: usize,
-    /// Bytes charged against `capacity`: every payload plus
-    /// `record_overhead` per record, so records without bytes are bounded
-    /// too.
+    /// Bytes charged against `capacity`.
     used: usize = 0,
     entries: std.Deque(Entry) = .empty,
     /// The seq of `entries.at(0)`, or of the next append when empty.
     first_seq: u64 = 0,
 
-    /// What each record costs beyond its payload bytes.
+    /// Charged per record on top of its payload bytes, so records without
+    /// bytes still count against the capacity.
     pub const record_overhead = @sizeOf(Entry);
 
     const Entry = struct {
@@ -98,24 +95,23 @@ pub const Log = struct {
         self.* = undefined;
     }
 
-    /// The largest `output` payload a single record may carry.
+    /// The largest `output` payload a record can carry.
     pub fn maxOutputLen(self: *const Log) usize {
         return self.capacity -| record_overhead;
     }
 
-    /// The seq the next append gets.
     pub fn nextSeq(self: *const Log) u64 {
         return self.first_seq + self.entries.len;
     }
 
-    /// The oldest seq still in the ring. Equals `nextSeq` when empty.
+    /// Equals `nextSeq` when the log is empty.
     pub fn firstSeq(self: *const Log) u64 {
         return self.first_seq;
     }
 
-    /// Copy `payload` into the log, dropping the oldest records to make
-    /// room, and return its seq. Invalidates every `Record` and `Iterator`
-    /// obtained before.
+    /// Copies `payload` into the log, dropping the oldest records to make
+    /// room, and returns its seq. Invalidates all `Record`s and `Iterator`s
+    /// obtained earlier.
     pub fn append(self: *Log, payload: Payload) AppendError!u64 {
         const owned: Payload = switch (payload) {
             .output => |bytes| owned: {
@@ -142,8 +138,8 @@ pub const Log = struct {
         return .{ .seq = seq, .payload = self.entries.at(@intCast(seq - self.first_seq)).payload };
     }
 
-    /// Iterate from `seq` to the newest record. `seq` may equal `nextSeq`,
-    /// which yields nothing. Invalidated by the next append.
+    /// `seq` may equal `nextSeq`, which yields nothing. Invalidated by the
+    /// next append.
     pub fn iterator(self: *const Log, seq: u64) ReadError!Iterator {
         try self.check(seq);
         return .{ .log = self, .seq = seq };
@@ -227,14 +223,14 @@ test "a full log drops its oldest records" {
     for (0..3) |_| _ = try log.append(.{ .output = "0123456789" });
     try testing.expectEqual(0, log.firstSeq());
 
-    // A fourth record of the same size pushes out exactly one.
+    // A fourth record of the same size drops one.
     try testing.expectEqual(3, try log.append(.{ .output = "abcdefghij" }));
     try testing.expectEqual(1, log.firstSeq());
     try testing.expectError(error.Trimmed, log.iterator(0));
     try testing.expectError(error.Trimmed, log.get(0));
     try testing.expectEqualStrings("abcdefghij", (try log.get(3)).payload.output);
 
-    // A record twice as big pushes out two.
+    // A record twice as big drops two.
     _ = try log.append(.{ .output = "0123456789" ++ "0123456789" });
     try testing.expectEqual(3, log.firstSeq());
     var it = try log.iterator(3);

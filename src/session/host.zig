@@ -1,16 +1,12 @@
-//! A session host: one program on a pseudo-terminal, and the primary
-//! terminal fed everything it writes.
+//! A session host: a program on a pseudo-terminal and the primary terminal
+//! its output feeds.
 //!
-//! The host is the only place the program's output enters tx. Each read
-//! from the pty goes to the `Primary`, which logs it and applies it, so
-//! replicas attached at any point can catch up from a snapshot and the log.
-//! It is also the only place the program's input leaves: the user's input
-//! and the primary's replies to queries share one queue to the pty, in
+//! Output read from the pty is logged and applied by the `Primary`. User
+//! input and the primary's query replies go to the pty through one queue, in
 //! the order they were produced.
 //!
-//! The host doesn't own an event loop. The caller polls `fd` for reading,
-//! and for writing while `wantsWrite`, and calls `readOutput` and
-//! `flushInput` when it is ready.
+//! The caller runs the event loop. It polls `fd` for reading, and for
+//! writing while `wantsWrite`, and calls `readOutput` and `flushInput`.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const term = @import("term");
@@ -28,7 +24,7 @@ pub const Options = struct {
     diagnostic: ?*pty_pkg.Diagnostic = null,
 
     size: term.log.Resize,
-    /// Everything but the size, which comes from `size`.
+    /// The terminal's size comes from `size`.
     terminal: TerminalOptions = .{},
 
     pub const TerminalOptions = struct {
@@ -46,16 +42,14 @@ pub const Host = struct {
     gpa: Allocator,
     pty: Pty,
     primary: *Primary,
-    /// Bytes for the program that the pty hasn't taken yet: the user's
-    /// input and the primary's replies. `input_start` is how much of
-    /// `input` has been written. Nothing bounds it here; the transport's
-    /// flow control has to stop reading input from a client while the
-    /// program isn't reading it.
+    /// User input and primary replies not yet written to the pty, from
+    /// `input_start`. Unbounded: the transport's flow control must stop
+    /// reading client input while the program isn't reading.
     input: std.ArrayList(u8) = .empty,
     input_start: usize = 0,
 
-    /// Start the program. The host is heap-allocated because the
-    /// primary's reply callback points back at it.
+    /// Start the program. Heap-allocated because the primary's reply
+    /// callback points to the host.
     pub fn create(gpa: Allocator, io: std.Io, options: Options) !*Host {
         const self = try gpa.create(Host);
         errdefer gpa.destroy(self);
@@ -71,8 +65,8 @@ pub const Host = struct {
             .continuation_max_bytes = t.continuation_max_bytes,
         });
         errdefer primary.destroy();
-        // The size the terminal starts with isn't a record, so a cell size
-        // has to be applied (and logged) like any later resize.
+        // The initial size isn't logged, so apply a cell size as a resize
+        // to log it.
         if (options.size.cell_size_px != null) try primary.resize(options.size);
 
         self.* = .{
@@ -92,8 +86,8 @@ pub const Host = struct {
         return self;
     }
 
-    /// Kill the program if it is still running, and free everything. Use
-    /// `pty.hangup` and `pty.wait` first to let it exit cleanly.
+    /// Kill the program if it is still running and free the host. Call
+    /// `pty.hangup` and `pty.wait` first for a clean exit.
     pub fn destroy(self: *Host) void {
         const gpa = self.gpa;
         self.pty.deinit();
@@ -102,21 +96,20 @@ pub const Host = struct {
         gpa.destroy(self);
     }
 
-    /// The pty master, to poll.
     pub fn fd(self: *const Host) std.posix.fd_t {
         return self.pty.master;
     }
 
-    /// Read what the program wrote, at most `buf.len` bytes, and feed it
-    /// to the primary. Returns the number of bytes read, 0 at end of
-    /// file. Replies the output asked for are queued; flush them.
+    /// Read up to `buf.len` bytes of output and feed them to the primary.
+    /// Returns the number read, 0 at end of file. Queues any replies; call
+    /// `flushInput` afterwards.
     pub fn readOutput(self: *Host, buf: []u8) ReadError!usize {
         const n = try self.pty.read(buf);
         if (n > 0) try self.primary.output(buf[0..n]);
         return n;
     }
 
-    /// Queue input for the program and write as much as it takes now.
+    /// Queue input and write as much as the pty accepts.
     pub fn sendInput(self: *Host, bytes: []const u8) Allocator.Error!void {
         try self.input.appendSlice(self.gpa, bytes);
         self.flushInput();
@@ -127,15 +120,14 @@ pub const Host = struct {
         return self.input_start < self.input.items.len;
     }
 
-    /// Write queued input until the pty stops taking it.
+    /// Write queued input until the pty would block.
     pub fn flushInput(self: *Host) void {
         while (self.wantsWrite()) {
             const n = self.pty.write(self.input.items[self.input_start..]) catch |err| switch (err) {
-                // Out of kernel buffers: like a full queue, try again
-                // when the pty is writable.
+                // Out of kernel buffers. Retry when the pty is writable.
                 error.WouldBlock, error.SystemResources => break,
-                // Nothing will read it any more. The program's exit shows
-                // up as end of file on the next read.
+                // Drop the input. The program's exit shows up as end of
+                // file on the next read.
                 error.BrokenPipe, error.Unexpected => {
                     self.input_start = self.input.items.len;
                     break;
@@ -147,8 +139,8 @@ pub const Host = struct {
             self.input.clearRetainingCapacity();
             self.input_start = 0;
         } else if (self.input_start > self.input.items.len / 2) {
-            // Drop the written half so a slow reader doesn't keep the
-            // whole history of its input alive.
+            // Discard written bytes so the buffer doesn't grow without
+            // bound behind a slow reader.
             const rest = self.input.items[self.input_start..];
             std.mem.copyForwards(u8, self.input.items[0..rest.len], rest);
             self.input.shrinkRetainingCapacity(rest.len);
@@ -156,9 +148,8 @@ pub const Host = struct {
         }
     }
 
-    /// Resize the terminal, then the pty. In that order, the program's
-    /// redraw after SIGWINCH is output the log records after the resize,
-    /// so replicas see it at the same size the primary did.
+    /// Resize the terminal before the pty, so the program's redraw after
+    /// SIGWINCH is logged after the resize.
     pub fn resize(self: *Host, size: term.log.Resize) !void {
         try self.primary.resize(size);
         try self.pty.resize(ptySize(size));
@@ -166,14 +157,14 @@ pub const Host = struct {
 
     fn writePty(h: *term.primary.Handler, data: []const u8) void {
         const self: *Host = @ptrCast(@alignCast(Primary.fromHandler(h).context.?));
-        // A reply that can't be queued is lost, like one the program
-        // never read. The program sees the same as from a slow terminal.
+        // A reply that can't be queued is dropped. To the program this
+        // looks like a terminal that didn't answer.
         self.input.appendSlice(self.gpa, data) catch return;
     }
 };
 
-/// The pty takes the pixel size of the whole grid; the terminal takes one
-/// cell's.
+/// Converts the cell size in `size` to the grid's pixel size, which the
+/// pty takes.
 fn ptySize(size: term.log.Resize) pty_pkg.Size {
     const cell = size.cell_size_px orelse return .{ .cols = size.cols, .rows = size.rows };
     return .{
@@ -186,7 +177,6 @@ fn ptySize(size: term.log.Resize) pty_pkg.Size {
 
 const testing = std.testing;
 
-/// Long enough for a loaded machine, short enough that a hung test fails.
 const test_timeout_ms = 10_000;
 
 fn testEnviron() !std.process.Environ.Map {
@@ -205,8 +195,8 @@ fn spawnTest(environ: *const std.process.Environ.Map, script: []const u8) !*Host
     });
 }
 
-/// Drive the host like an event loop would, until `done` or end of file.
-/// Fails instead of hanging when neither comes.
+/// Drive the host until `done` returns true or end of file, with a
+/// deadline.
 fn run(host: *Host, done: ?*const fn (*Host) bool) !void {
     const io = testing.io;
     const deadline = std.Io.Clock.awake.now(io).toMilliseconds() + test_timeout_ms;
@@ -248,7 +238,7 @@ fn screenContains(host: *Host, needle: []const u8) bool {
     return std.mem.indexOf(u8, text, needle) != null;
 }
 
-test "the program's output reaches the terminal and the log" {
+test "output reaches the terminal and the log" {
     var environ = try testEnviron();
     defer environ.deinit();
     const host = try spawnTest(&environ, "printf 'hello \\033[1mbold\\033[m'");
@@ -258,7 +248,7 @@ test "the program's output reaches the terminal and the log" {
     try testing.expectEqual(pty_pkg.Term{ .exited = 0 }, try waitTest(host));
     try testing.expect(screenContains(host, "hello bold"));
 
-    // The log holds exactly what the terminal consumed.
+    // The log holds the output unchanged.
     var logged: std.ArrayList(u8) = .empty;
     defer logged.deinit(testing.allocator);
     var it = try host.primary.log.iterator(0);
@@ -266,11 +256,11 @@ test "the program's output reaches the terminal and the log" {
     try testing.expectEqualStrings("hello \x1b[1mbold\x1b[m", logged.items);
 }
 
-test "the primary answers the program's queries through the pty" {
+test "primary answers queries through the pty" {
     var environ = try testEnviron();
     defer environ.deinit();
     // Ask for the cursor position (DSR 6) and print the 6-byte reply in
-    // hex. The terminal answers, not the test.
+    // hex.
     const host = try spawnTest(&environ,
         \\stty -icanon -echo min 1
         \\printf 'ab\033[6n'
@@ -285,11 +275,11 @@ test "the primary answers the program's queries through the pty" {
     try testing.expect(screenContains(host, "reply:1b 5b 31 3b 33 52"));
 }
 
-test "input reaches the program in order, however much it is" {
+test "large input reaches the program intact" {
     var environ = try testEnviron();
     defer environ.deinit();
-    // Far more than the tty's input queue holds, so most of it waits in
-    // the host's queue while the program reads.
+    // Larger than the tty's input queue, so most of it waits in the
+    // host's queue.
     const len = 256 * 1024;
     const host = try spawnTest(&environ,
         \\stty raw -echo
@@ -310,7 +300,7 @@ test "input reaches the program in order, however much it is" {
     try run(host, null);
     try testing.expectEqual(pty_pkg.Term{ .exited = 0 }, try waitTest(host));
 
-    // POSIX cksum of the same bytes, to compare with the program's.
+    // POSIX cksum of the input.
     var crc: u32 = 0;
     var table: [256]u32 = undefined;
     for (&table, 0..) |*e, i| {
@@ -325,11 +315,11 @@ test "input reaches the program in order, however much it is" {
     try testing.expect(screenContains(host, try std.fmt.bufPrint(&want, "{d} {d}", .{ ~crc, len })));
 }
 
-test "a replica attached partway through a session ends in the same state" {
+test "replica attached mid-session ends in the primary's state" {
     var environ = try testEnviron();
     defer environ.deinit();
-    // Some history, the alternate screen, a pause for input, a resize the
-    // program reports, and a return to the primary screen.
+    // Scrollback, the alternate screen, a read, a resize and a return to
+    // the primary screen.
     const host = try spawnTest(&environ,
         \\i=0
         \\while [ $i -lt 60 ]; do printf '\033[3%dmline %d\033[m\r\n' $((i % 8)) $i; i=$((i + 1)); done
@@ -347,7 +337,7 @@ test "a replica attached partway through a session ends in the same state" {
         }
     }.f);
 
-    // Attach: snapshot now, then apply everything logged after it.
+    // Snapshot here, then apply the records logged after it.
     var snapshot: std.Io.Writer.Allocating = .init(testing.allocator);
     defer snapshot.deinit();
     const seq = try host.primary.snapshot(testing.allocator, &snapshot.writer);

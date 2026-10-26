@@ -7,7 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Hybrid post-quantum first; plain X25519 for peers that lack it. */
+/* X25519MLKEM768 first, X25519 for peers without it. */
 static ptls_key_exchange_algorithm_t *key_exchanges[] = {&tx_x25519mlkem768, &tx_x25519, NULL};
 
 /* Without hardware AES, ChaCha20-Poly1305 is the faster suite. */
@@ -18,7 +18,7 @@ static ptls_cipher_suite_t *suites_chacha_first[] = {&tx_chacha20poly1305sha256,
 
 static ptls_iovec_t alpn = {(uint8_t *)TX_TLS_ALPN, sizeof(TX_TLS_ALPN) - 1};
 
-/* Agree on ALPN tx/1, or refuse the handshake. */
+/* Selects ALPN tx/1 or fails the handshake. */
 static int on_client_hello(ptls_on_client_hello_t *self, ptls_t *tls,
                            ptls_on_client_hello_parameters_t *params) {
   (void)self;

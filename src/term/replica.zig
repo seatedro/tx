@@ -1,11 +1,10 @@
-//! A replica: a Terminal restored from a primary's snapshot and kept in
-//! step by applying its log.
+//! A Terminal restored from a primary's snapshot and kept in step by
+//! applying the primary's log.
 //!
-//! The replica only reproduces state. Its handler has every effect callback
-//! null, so it never answers a query (the primary does) and never fires
-//! an external effect from restored or replayed bytes. It loads Kitty
-//! images only from inline data, so no byte it is given can make it open a
-//! file or shared memory.
+//! All effect callbacks are null, so a replica sends no query replies and
+//! fires no external effects. Kitty images load from inline data only
+//! (`setKittyGraphicsLoadingLimits(.direct)`), so replayed bytes can't open
+//! files or shared memory.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const vt = @import("ghostty-vt");
@@ -14,7 +13,7 @@ const log = @import("log.zig");
 pub const Stream = vt.TerminalStream;
 
 pub const Options = struct {
-    /// Must equal the primary's, which the snapshot doesn't carry.
+    /// Must equal the primary's. The snapshot doesn't carry it.
     kitty_image_storage_limit: usize = 320 * 1000 * 1000,
     /// The longest unfinished sequence accepted from a snapshot. Should be
     /// at least the primary's `continuation_max_bytes`.
@@ -28,22 +27,20 @@ pub const RestoreError = vt.snapshot.DecodeError || error{
 };
 
 pub const ApplyError = vt.Terminal.ResizeError || error{
-    /// The record isn't the next one. Records must be applied in seq order
-    /// without gaps; a replica that missed one needs a new snapshot.
+    /// The record's seq is not `next_seq`. A replica that missed a record
+    /// needs a new snapshot.
     OutOfOrder,
 };
 
 pub const Replica = struct {
     gpa: Allocator,
     terminal: vt.Terminal,
-    /// Points at `terminal`, which is why a Replica never moves.
+    /// Points at `terminal`. A Replica must not be moved.
     stream: Stream,
-    /// The seq of the next record to apply.
     next_seq: u64,
 
-    /// Restore from one snapshot read from `reader`, cut at `seq` (the value
-    /// `Primary.snapshot` returned). Reads exactly the snapshot, leaving
-    /// whatever follows it in `reader`.
+    /// `seq` is the value `Primary.snapshot` returned. Reads one snapshot
+    /// from `reader` and leaves the bytes after it unread.
     pub fn restore(
         gpa: Allocator,
         io: std.Io,
@@ -59,8 +56,8 @@ pub const Replica = struct {
 
         const self = try gpa.create(Replica);
         errdefer gpa.destroy(self);
-        // The stream must point at the Terminal's final address, so it is
-        // moved into place before the stream exists.
+        // The stream points at the Terminal, so the Terminal moves to its
+        // final address first.
         self.* = .{
             .gpa = gpa,
             .terminal = decoded.toOwned(),
@@ -71,9 +68,9 @@ pub const Replica = struct {
         if (comptime @TypeOf(self.terminal.screens.active.kitty_images) != void) {
             self.terminal.setKittyGraphicsLoadingLimits(.direct);
         }
-        // libghostty-vt gives an alternate screen it creates no line limit,
-        // but one it restores a limit of zero lines. The alternate screen
-        // keeps no scrollback either way, but match the primary's.
+        // libghostty-vt gives a created alternate screen no line limit and a
+        // restored one a limit of 0. Neither keeps scrollback; null matches
+        // the primary.
         if (self.terminal.screens.get(.alternate)) |alt| alt.pages.setMaxLines(null);
         self.stream = .init(.{
             .allocator = gpa,
@@ -86,8 +83,8 @@ pub const Replica = struct {
             .ground => {},
             .bytes => |bytes| {
                 self.stream.nextSlice(bytes);
-                // The snapshot docs ask for this check: replay must give back
-                // exactly the continuation it came from.
+                // The snapshot docs require checking that replay reproduces
+                // the continuation.
                 var buf: std.Io.Writer.Allocating = .init(gpa);
                 defer buf.deinit();
                 self.stream.writeContinuation(&buf.writer) catch return error.ContinuationMismatch;
@@ -104,7 +101,6 @@ pub const Replica = struct {
         gpa.destroy(self);
     }
 
-    /// Apply the next record of the primary's log.
     pub fn apply(self: *Replica, record: log.Record) ApplyError!void {
         if (record.seq != self.next_seq) return error.OutOfOrder;
         switch (record.payload) {

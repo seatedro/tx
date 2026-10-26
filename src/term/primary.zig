@@ -1,16 +1,13 @@
-//! The primary terminal: the one Terminal fed the program's real
-//! output, and the log that lets replicas reproduce it.
+//! The Terminal fed the program's output, and the log replicas replay to
+//! reproduce it.
 //!
-//! Everything that changes terminal state goes through `output` or
-//! `resize`, which append to the log before applying, so the log is
-//! always exactly the history of this Terminal since it was created. A
-//! replica restored from `snapshot` and given the log from the returned seq
-//! on reaches the same state.
+//! State changes go through `output` and `resize`, which append to the log
+//! before applying. A replica restored from `snapshot` that applies the log
+//! from the returned seq reaches the same state.
 //!
-//! This is also the only terminal that answers the program. Query replies
-//! (DA, DSR, DECRQM and so on) and external effects come from the stream
-//! handler's effect callbacks, which the host installs through `handler`.
-//! The replica leaves all of them null.
+//! Query replies (DA, DSR, DECRQM and so on) and external effects come from
+//! the stream handler's effect callbacks, which the host installs through
+//! `handler`. Replicas leave them null.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const vt = @import("ghostty-vt");
@@ -24,13 +21,13 @@ pub const Handler = Stream.Handler;
 pub const Options = struct {
     cols: u16,
     rows: u16,
-    /// Scrollback limits. They travel in the snapshot, so replicas match.
+    /// Carried in the snapshot.
     max_scrollback_bytes: ?usize = 10_000_000,
     max_scrollback_lines: ?usize = null,
-    /// Not carried by the snapshot: the replica must be given the same value
-    /// (`replica.Options.kitty_image_storage_limit`).
+    /// Not carried in the snapshot. Pass the same value as
+    /// `replica.Options.kitty_image_storage_limit`.
     kitty_image_storage_limit: usize = 320 * 1000 * 1000,
-    /// The log's capacity in bytes.
+    /// In bytes.
     log_capacity: usize = 8 * 1024 * 1024,
     /// The longest unfinished sequence a snapshot can carry. A snapshot cut
     /// inside a longer one fails with `ContinuationUnavailable` until the
@@ -47,10 +44,10 @@ pub const SnapshotError = vt.snapshot.EncodeError || Allocator.Error || error{
 pub const Primary = struct {
     gpa: Allocator,
     terminal: vt.Terminal,
-    /// Points at `terminal`, which is why a Primary never moves.
+    /// Points at `terminal`. A Primary must not be moved.
     stream: Stream,
     log: Log,
-    /// For the host's effect callbacks, which get only the handler; see
+    /// Host data for effect callbacks, which receive only the handler. See
     /// `fromHandler`.
     context: ?*anyopaque = null,
 
@@ -85,9 +82,9 @@ pub const Primary = struct {
         gpa.destroy(self);
     }
 
-    /// The stream handler, for installing effect callbacks such as
-    /// `write_pty`. Callbacks may also set `title_report` and the other
-    /// reply policies; none of them change terminal state.
+    /// For installing effect callbacks such as `write_pty`. The reply
+    /// policies such as `title_report` may also be set. None of these
+    /// change terminal state.
     pub fn handler(self: *Primary) *Handler {
         return &self.stream.handler;
     }
@@ -98,9 +95,8 @@ pub const Primary = struct {
         return @fieldParentPtr("stream", stream);
     }
 
-    /// Feed program output: append it to the log and apply it. Output
-    /// longer than one record allows is split, which the terminal can't
-    /// tell apart from one record.
+    /// Appends program output to the log and applies it. Output longer than
+    /// `Log.maxOutputLen` is split across records.
     pub fn output(self: *Primary, bytes: []const u8) log_pkg.AppendError!void {
         var rest = bytes;
         while (rest.len > 0) {
@@ -111,19 +107,19 @@ pub const Primary = struct {
         }
     }
 
-    /// Resize: append it to the log and apply it. The host resizes the PTY
+    /// Appends a resize to the log and applies it. The host resizes the PTY
     /// at the same point.
     pub fn resize(self: *Primary, size: log_pkg.Resize) (log_pkg.AppendError || vt.Terminal.ResizeError)!void {
-        // Rejected before logging, so the log never holds a record that
-        // fails to apply.
+        // Checked before logging so the log holds no record that fails to
+        // apply.
         if (size.cols == 0 or size.rows == 0) return error.InvalidValue;
         _ = try self.log.append(.{ .resize = size });
         try self.stream.handler.resize(size.terminal());
     }
 
-    /// Encode a snapshot of the current state, including the stream's
-    /// unfinished sequence, and return the seq of the first record a
-    /// replica restored from it must apply.
+    /// Encodes the current state, including the stream's unfinished
+    /// sequence. Returns the seq of the first record a replica restored
+    /// from it must apply.
     pub fn snapshot(self: *Primary, gpa: Allocator, writer: *std.Io.Writer) SnapshotError!u64 {
         var continuation: std.Io.Writer.Allocating = .init(gpa);
         defer continuation.deinit();
@@ -175,7 +171,7 @@ test "output longer than a record is split" {
     try testing.expectEqual(1, (try primary.log.get(primary.log.nextSeq() - 1)).payload.output.len);
 }
 
-test "effect callbacks reach the primary" {
+test "fromHandler finds the primary from an effect callback" {
     const primary: *Primary = try .create(testing.allocator, testing.io, .{ .cols = 10, .rows = 3 });
     defer primary.destroy();
 
@@ -214,7 +210,7 @@ test "a snapshot cut inside a sequence carries it" {
     try testing.expectEqualStrings("\x1b]2;ti", decoded.continuation.bytes);
 }
 
-test "a snapshot inside a sequence too long to carry waits for it to end" {
+test "a snapshot inside a sequence too long to carry fails until the sequence ends" {
     const primary: *Primary = try .create(testing.allocator, testing.io, .{
         .cols = 10,
         .rows = 3,

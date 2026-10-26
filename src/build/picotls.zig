@@ -1,9 +1,6 @@
-//! Builds picotls (h2o/picotls) from its upstream sources.
-//!
-//! picotls is a TLS 1.3 state machine with pluggable cryptography. tx links
-//! only the core and supplies the cryptography itself (src/crypto). The
-//! minicrypto backend is built separately so tests can check tx's backend
-//! against an independent implementation.
+//! Builds picotls (h2o/picotls) from its upstream sources. tx supplies the
+//! cryptography (src/crypto). The minicrypto backend is built for the tests
+//! that compare tx's backend against it.
 const std = @import("std");
 
 const flags = &[_][]const u8{ "-std=gnu99", "-fno-sanitize=undefined" };
@@ -33,7 +30,7 @@ pub fn core(
     return lib;
 }
 
-/// The bundled minicrypto backend (cifra and micro-ecc). Used by tests only.
+/// The bundled minicrypto backend (cifra and micro-ecc), for tests.
 pub fn minicrypto(
     b: *std.Build,
     dep: *std.Build.Dependency,
