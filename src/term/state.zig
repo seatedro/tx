@@ -113,7 +113,8 @@ const Dumper = struct {
     }
 
     fn flags(d: *Dumper, t: *const Terminal) Error!void {
-        // Skips the renderer's and search thread's dirty bits.
+        // `dirty` and `search_viewport_dirty` are scratch flags for Ghostty's
+        // renderer and search thread, which set and clear them between frames.
         const f = t.flags;
         try d.print("flags", .{});
         inline for (@typeInfo(@TypeOf(f)).@"struct".field_names) |name| {
