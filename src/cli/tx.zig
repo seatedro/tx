@@ -1,10 +1,14 @@
 //! tx: a session on a tx-session server.
 //!
-//! Usage: tx [-p PORT] [-l USER] [--attach ID] [USER@]HOST
+//! Usage: tx [-p PORT] [-l USER] [--attach ID] [--server COMMAND] [--ssh PATH] [USER@]HOST
 //!
 //! The server's key is checked against `~/.config/tx/known_hosts` and
-//! `~/.ssh/known_hosts`. A host in neither is asked about, as ssh does, and
-//! added to the first. The login uses the SSH agent's Ed25519 keys.
+//! `~/.ssh/known_hosts`. For a host in neither, tx reads the key over ssh
+//! with `tx-session --print-host-key`, so ssh's own host check vouches for
+//! it. If that fails, tx asks, as ssh does. The key is added to the first
+//! file.
+//!
+//! The login uses the SSH agent's Ed25519 keys, then `~/.ssh/id_ed25519`.
 //!
 //! Exits with the program's exit status, or 255 for tx's own failures, as
 //! ssh does.
@@ -19,9 +23,17 @@ const paths = @import("paths.zig");
 /// tx-session's default port.
 const default_port = 8739;
 
-const usage_text = "usage: tx [-p PORT] [-l USER] [--attach ID] [USER@]HOST";
+const usage_text = "usage: tx [-p PORT] [-l USER] [--attach ID] [--server COMMAND] [--ssh PATH] [USER@]HOST";
+
+/// Key files tried after the agent's keys, under HOME.
+const default_key_files = [_][]const u8{".ssh/id_ed25519"};
 
 pub fn main(init: std.process.Init) !u8 {
+    // First, so every thread inherits the mask: name lookups can start
+    // threads, and a terminating signal must reach the session's signal
+    // thread, which restores the terminal.
+    _ = client.tty.blockSignals();
+
     const gpa = init.gpa;
     const io = init.io;
     const environ = init.environ_map;
@@ -31,6 +43,8 @@ pub fn main(init: std.process.Init) !u8 {
     var port: u16 = default_port;
     var user: ?[]const u8 = null;
     var session_id: ?u64 = null;
+    var server_command: []const u8 = "tx-session";
+    var ssh_path: []const u8 = "ssh";
     var destination: ?[]const u8 = null;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -44,6 +58,12 @@ pub fn main(init: std.process.Init) !u8 {
         } else if (std.mem.eql(u8, arg, "--attach") and i + 1 < args.len) {
             i += 1;
             session_id = std.fmt.parseInt(u64, args[i], 10) catch return usage("invalid session id");
+        } else if (std.mem.eql(u8, arg, "--server") and i + 1 < args.len) {
+            i += 1;
+            server_command = args[i];
+        } else if (std.mem.eql(u8, arg, "--ssh") and i + 1 < args.len) {
+            i += 1;
+            ssh_path = args[i];
         } else if (destination == null and !std.mem.startsWith(u8, arg, "-")) {
             destination = arg;
         } else return usage("unknown argument");
@@ -60,18 +80,26 @@ pub fn main(init: std.process.Init) !u8 {
 
     const address = resolve(io, host, port) catch |err| return fail("can't resolve {s}: {t}", .{ host, err });
 
-    // The agent's keys, before the network: without one there's no login.
-    const agent_path = environ.get("SSH_AUTH_SOCK") orelse return fail("SSH_AUTH_SOCK is not set; tx logs in with keys from the SSH agent", .{});
-    const keys = agentKeys(gpa, io, agent_path) catch |err| return fail("can't list the SSH agent's keys: {t}", .{err});
-    defer gpa.free(keys);
-    if (keys.len == 0) return fail("the SSH agent holds no Ed25519 keys", .{});
+    // The keys, before the network: without one there's no login.
+    const agent_path = environ.get("SSH_AUTH_SOCK");
+    var identities = try findIdentities(gpa, io, environ, agent_path);
+    defer identities.deinit(gpa);
+    if (identities.list.items.len == 0) return fail("no keys to log in with: the SSH agent has no Ed25519 keys, and there is no ~/.ssh/id_ed25519", .{});
+
+    // ssh logs in to the same account, unless its config says otherwise.
+    var ssh_buf: [512]u8 = undefined;
+    const ssh_destination = if (user) |u| std.fmt.bufPrint(&ssh_buf, "{s}@{s}", .{ u, host }) catch host else host;
 
     // The keys known_hosts lists for the host, or the one the user accepts.
     var name_buf: [512]u8 = undefined;
     const known_name = auth.known_hosts.hostName(&name_buf, host, port, default_port) catch return fail("host name too long", .{});
     const tx_known_hosts = try paths.config(gpa, environ, "known_hosts");
     defer gpa.free(tx_known_hosts);
-    const host_keys = trustedKeys(gpa, io, environ, tx_known_hosts, known_name, address) catch |err| switch (err) {
+    const host_keys = trustedKeys(gpa, io, environ, tx_known_hosts, known_name, address, .{
+        .ssh = ssh_path,
+        .destination = ssh_destination,
+        .server_command = server_command,
+    }) catch |err| switch (err) {
         error.Declined => return 255,
         else => return fail("checking the host key failed: {t}", .{err}),
     };
@@ -82,7 +110,7 @@ pub fn main(init: std.process.Init) !u8 {
         .host_keys = host_keys,
         .user = login_user,
         .agent = agent_path,
-        .keys = keys,
+        .identities = identities.list.items,
         .session_id = session_id,
         .show_session_id = true,
         .term = environ.get("TERM") orelse "xterm-256color",
@@ -96,7 +124,9 @@ pub fn main(init: std.process.Init) !u8 {
             // default.
             var port_buf: [16]u8 = undefined;
             const port_arg = if (port == default_port) "" else std.fmt.bufPrint(&port_buf, "-p {d} ", .{port}) catch unreachable;
-            if (id) |n| std.debug.print("tx: detached from session {d}; reattach with tx {s}--attach {d} {s}\n", .{ n, port_arg, n, destination.? });
+            // Before the attach, there's no session to come back to.
+            const n = id orelse return fail("interrupted before the session started", .{});
+            std.debug.print("tx: detached from session {d}; reattach with tx {s}--attach {d} {s}\n", .{ n, port_arg, n, destination.? });
             return 0;
         },
         .disconnected => |reason| return fail("connection closed: {t}", .{reason}),
@@ -131,24 +161,132 @@ fn resolve(io: Io, host: []const u8, port: u16) !IpAddress {
     }
 }
 
-/// The agent's Ed25519 keys, in its order.
-fn agentKeys(gpa: Allocator, io: Io, path: []const u8) ![]auth.Key {
-    var agent: auth.Agent = try .connect(io, path);
-    defer agent.close();
-    var ids = try agent.identities(gpa);
-    defer ids.deinit(gpa);
+const Identities = struct {
+    list: std.ArrayList(client.session.Identity) = .empty,
+    /// The paths of key file identities.
+    paths: std.ArrayList([]u8) = .empty,
 
-    var keys: std.ArrayList(auth.Key) = .empty;
-    errdefer keys.deinit(gpa);
-    for (ids.blobs) |blob| {
-        const key = auth.ssh.parseKeyBlob(blob) catch continue;
-        try keys.append(gpa, key);
+    fn deinit(ids: *Identities, gpa: Allocator) void {
+        for (ids.paths.items) |p| gpa.free(p);
+        ids.paths.deinit(gpa);
+        ids.list.deinit(gpa);
     }
-    return keys.toOwnedSlice(gpa);
+
+    fn has(ids: *const Identities, key: auth.Key) bool {
+        for (ids.list.items) |id| if (std.mem.eql(u8, &id.key, &key)) return true;
+        return false;
+    }
+};
+
+/// The agent's Ed25519 keys in its order, then the default key files that
+/// hold other keys. A key file's public key reads without its passphrase.
+fn findIdentities(gpa: Allocator, io: Io, environ: *const std.process.Environ.Map, agent_path: ?[]const u8) !Identities {
+    var ids: Identities = .{};
+    errdefer ids.deinit(gpa);
+
+    // An agent that can't be reached leaves the key files.
+    if (agent_path) |path| agent: {
+        var agent: auth.Agent = auth.Agent.connect(io, path) catch |err| {
+            std.debug.print("tx: can't connect to the SSH agent: {t}\n", .{err});
+            break :agent;
+        };
+        defer agent.close();
+        var agent_ids = agent.identities(gpa) catch |err| {
+            std.debug.print("tx: can't list the SSH agent's keys: {t}\n", .{err});
+            break :agent;
+        };
+        defer agent_ids.deinit(gpa);
+        for (agent_ids.blobs) |blob| {
+            const key = auth.ssh.parseKeyBlob(blob) catch continue;
+            try ids.list.append(gpa, .{ .key = key, .source = .agent });
+        }
+    }
+
+    for (default_key_files) |sub_path| {
+        const path = paths.home(gpa, environ, sub_path) catch continue;
+        const key = keyFilePublicKey(gpa, io, path) catch |err| {
+            if (err != error.FileNotFound) std.debug.print("tx: skipping {s}: {t}\n", .{ path, err });
+            gpa.free(path);
+            continue;
+        };
+
+        // The agent may hold the same key.
+        if (ids.has(key)) {
+            gpa.free(path);
+            continue;
+        }
+
+        // `ids.paths` owns the path from here.
+        ids.list.ensureUnusedCapacity(gpa, 1) catch |err| {
+            gpa.free(path);
+            return err;
+        };
+        ids.paths.append(gpa, path) catch |err| {
+            gpa.free(path);
+            return err;
+        };
+        ids.list.appendAssumeCapacity(.{ .key = key, .source = .{ .file = path } });
+    }
+    return ids;
 }
 
-/// The keys tx accepts from the host. When no file lists one, learns the
-/// host's key, asks the user, and records it in `tx_known_hosts`.
+fn keyFilePublicKey(gpa: Allocator, io: Io, path: []const u8) !auth.Key {
+    const text = try Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 << 10));
+    defer {
+        std.crypto.secureZero(u8, text);
+        gpa.free(text);
+    }
+    var file = try auth.private_key.PrivateKeyFile.parse(gpa, text);
+    defer file.deinit(gpa);
+    return file.public_key;
+}
+
+/// Where to read the host key over ssh.
+const SshSource = struct {
+    /// The ssh client.
+    ssh: []const u8,
+    /// `host` or `user@host`, as ssh takes it.
+    destination: []const u8,
+    /// tx-session on the remote side.
+    server_command: []const u8,
+};
+
+/// Reads tx-session's host key from the remote account over ssh. ssh's own
+/// host key check vouches for the connection, so the key needs no prompt.
+fn hostKeyOverSsh(gpa: Allocator, io: Io, source: SshSource) !auth.Key {
+    const command = try std.fmt.allocPrint(gpa, "{s} --print-host-key", .{source.server_command});
+    defer gpa.free(command);
+
+    // ssh asks for passwords and its own host keys on the terminal, not on
+    // stdin.
+    const result = try std.process.run(gpa, io, .{
+        .argv = &.{ source.ssh, "-T", "-o", "ConnectTimeout=10", "--", source.destination, command },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(16 << 10),
+    });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    const ok = switch (result.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+    if (!ok) {
+        const message = std.mem.trim(u8, result.stderr, " \t\r\n");
+        if (message.len > 0) std.debug.print("{s}\n", .{message});
+        return error.SshFailed;
+    }
+
+    // `ssh-ed25519 AAAA...`.
+    var fields = std.mem.tokenizeAny(u8, result.stdout, " \t\r\n");
+    const key_type = fields.next() orelse return error.NoKeyPrinted;
+    const text = fields.next() orelse return error.NoKeyPrinted;
+    return auth.ssh.parseKeyText(key_type, text);
+}
+
+/// The keys tx accepts from the host. When no file lists one, reads the
+/// host's key over ssh, or else learns it and asks the user, and records
+/// it in `tx_known_hosts`.
 fn trustedKeys(
     gpa: Allocator,
     io: Io,
@@ -156,6 +294,7 @@ fn trustedKeys(
     tx_known_hosts: []const u8,
     name: []const u8,
     address: IpAddress,
+    ssh: SshSource,
 ) ![]auth.Key {
     var known: auth.known_hosts.Known = .{};
     defer known.deinit(gpa);
@@ -169,7 +308,23 @@ fn trustedKeys(
     if (trusted.len > 0) return trusted;
     gpa.free(trusted);
 
-    // First contact.
+    // First contact, over ssh if it can log in.
+    if (hostKeyOverSsh(gpa, io, ssh)) |key| {
+        if (known.isRevoked(key)) {
+            std.debug.print("tx: {s} has a revoked key, {s}\n", .{ name, auth.Fingerprint.init(key).slice() });
+            return error.Declined;
+        }
+        try auth.known_hosts.append(io, tx_known_hosts, name, key);
+        std.debug.print("tx: added {s} to {s}, with the key read over ssh\n", .{ name, tx_known_hosts });
+
+        const keys = try gpa.alloc(auth.Key, 1);
+        keys[0] = key;
+        return keys;
+    } else |err| {
+        std.debug.print("tx: can't read the host key over ssh: {t}\n", .{err});
+    }
+
+    // Otherwise the server's own word, checked by the user.
     const key = switch (try client.scan.hostKey(gpa, io, address, 10 * std.time.ns_per_s)) {
         .key => |key| key,
         .failed => |reason| {
