@@ -72,12 +72,95 @@ pub fn build(b: *std.Build) void {
     });
     addTestRuns(b, proto_tests, test_step, test_network_step);
 
+    // One instance of each module for the executables and the end-to-end
+    // test, so that they share their dependencies' code and globals.
+    const term = termModule(b, target, optimize, ghostty_vt);
+    const transport = transportModule(b, target, optimize, transport_libs);
+    const proto = protoModule(b, target, optimize);
+    const session = sessionModule(b, target, optimize, term);
+    const client = clientModule(b, target, optimize, .{ .xev = xev, .transport = transport, .proto = proto });
+    const server = serverModule(b, target, optimize, .{
+        .xev = xev,
+        .transport = transport,
+        .proto = proto,
+        .session = session,
+        .term = term,
+    });
+
     const client_tests = b.addTest(.{
         .name = "client-test",
-        .root_module = clientModule(b, target, optimize),
+        .root_module = clientModule(b, target, optimize, .{ .xev = xev, .transport = transport, .proto = proto }),
     });
     addTestRuns(b, client_tests, test_step, test_network_step);
+
+    const e2e = b.createModule(.{
+        .root_source_file = b.path("src/e2e_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    e2e.addImport("xev", xev);
+    e2e.addImport("transport", transport);
+    e2e.addImport("server", server);
+    e2e.addImport("client", client);
+    e2e.addImport("term", term);
+    e2e.addImport("proto", proto);
+    addTestRuns(b, b.addTest(.{ .name = "e2e-test", .root_module = e2e }), test_step, test_network_step);
+
+    const tx = b.createModule(.{
+        .root_source_file = b.path("src/cli/tx.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    tx.addImport("client", client);
+    b.installArtifact(b.addExecutable(.{ .name = "tx", .root_module = tx }));
+
+    const tx_session = b.createModule(.{
+        .root_source_file = b.path("src/cli/tx_session.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    tx_session.addImport("xev", xev);
+    tx_session.addImport("server", server);
+    tx_session.addImport("transport", transport);
+    b.installArtifact(b.addExecutable(.{ .name = "tx-session", .root_module = tx_session }));
 }
+
+const ServerDeps = struct {
+    xev: *std.Build.Module,
+    transport: *std.Build.Module,
+    proto: *std.Build.Module,
+    session: *std.Build.Module,
+    term: *std.Build.Module,
+};
+
+fn serverModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    deps: ServerDeps,
+) *std.Build.Module {
+    const mod = b.createModule(.{
+        .root_source_file = b.path("src/server/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    mod.addImport("xev", deps.xev);
+    mod.addImport("transport", deps.transport);
+    mod.addImport("proto", deps.proto);
+    mod.addImport("session", deps.session);
+    mod.addImport("term", deps.term);
+    return mod;
+}
+
+const ClientDeps = struct {
+    xev: *std.Build.Module,
+    transport: *std.Build.Module,
+    proto: *std.Build.Module,
+};
 
 fn protoModule(
     b: *std.Build,
@@ -95,13 +178,18 @@ fn clientModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    deps: ClientDeps,
 ) *std.Build.Module {
-    return b.createModule(.{
+    const mod = b.createModule(.{
         .root_source_file = b.path("src/client/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
+    mod.addImport("xev", deps.xev);
+    mod.addImport("transport", deps.transport);
+    mod.addImport("proto", deps.proto);
+    return mod;
 }
 
 fn sessionModule(
