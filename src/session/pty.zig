@@ -233,16 +233,16 @@ pub const Pty = struct {
             .AGAIN, .NOMEM => error.SystemResources,
             else => |err| posix.unexpectedErrno(err),
         };
-        const failure = readChildError(err_pipe[0]) orelse {
-            self.pid = pid;
-            return self;
-        };
-        // If reading the pipe failed, the child may have exec'd and still be
-        // running.
-        _ = c.kill(pid, .KILL);
-        _ = reap(pid, 0) catch {};
-        if (options.diagnostic) |diagnostic| diagnostic.* = .{ .step = failure.step, .errno = failure.errno };
-        return failure.toError();
+        if (readChildError(err_pipe[0])) |failure| {
+            // If reading the pipe failed, the child may have exec'd and still
+            // be running.
+            _ = c.kill(pid, .KILL);
+            _ = reap(pid, 0) catch {};
+            if (options.diagnostic) |diagnostic| diagnostic.* = .{ .step = failure.step, .errno = failure.errno };
+            return failure.toError();
+        }
+        self.pid = pid;
+        return self;
     }
 
     /// Returns 0 at end of file, when all processes have closed the slave.
