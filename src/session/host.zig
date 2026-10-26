@@ -496,10 +496,11 @@ test "large input reaches the program intact" {
     var environ = try testEnviron();
     defer environ.deinit();
     // Larger than the tty's input queue, so most of it waits in the
-    // host's queue.
+    // host's queue. GNU stty's raw leaves IEXTEN set, and on macOS IEXTEN
+    // makes ^V and ^O special even in raw mode.
     const len = 256 * 1024;
     const host = try spawnTest(&environ,
-        \\stty raw -echo
+        \\stty raw -echo -iexten
         \\printf 'ready\r\n'
         \\head -c 262144 | cksum
     );

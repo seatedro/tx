@@ -212,6 +212,15 @@ const TestPty = struct {
         if (c.write(p.master, bytes.ptr, bytes.len) != bytes.len) return error.WriteFailed;
     }
 
+    /// Reads what the client writes to its terminal for up to `ms`.
+    fn readFor(p: *TestPty, ms: i32) !void {
+        var fds = [_]posix.pollfd{.{ .fd = p.master, .events = posix.POLL.IN, .revents = 0 }};
+        if (c.poll(&fds, 1, ms) != 1) return;
+        var buf: [4096]u8 = undefined;
+        const n = c.read(p.master, &buf, buf.len);
+        if (n > 0) try p.output.appendSlice(gpa, buf[0..@intCast(n)]);
+    }
+
     /// Reads what the client wrote to its terminal until it contains
     /// `needle`.
     fn readUntil(p: *TestPty, needle: []const u8) !void {
@@ -236,6 +245,7 @@ const TestPty = struct {
 const ClientThread = struct {
     options: client.session.Options,
     result: ?anyerror!client.session.Outcome = null,
+    done: std.atomic.Value(bool) = .init(false),
     thread: std.Thread = undefined,
 
     fn start(ct: *ClientThread) !void {
@@ -244,9 +254,14 @@ const ClientThread = struct {
 
     fn run(ct: *ClientThread) void {
         ct.result = client.session.run(gpa, testing.io, ct.options);
+        ct.done.store(true, .release);
     }
 
-    fn join(ct: *ClientThread) !client.session.Outcome {
+    /// Keeps reading the client's terminal until the client returns. On
+    /// macOS, restoring the terminal's attributes waits until its output
+    /// has been read, and a pty holds little output.
+    fn join(ct: *ClientThread, pty: *TestPty) !client.session.Outcome {
+        while (!ct.done.load(.acquire)) try pty.readFor(10);
         ct.thread.join();
         return ct.result.?;
     }
@@ -300,7 +315,7 @@ test "a session runs, detaches, reattaches and exits through tx-session and tx" 
 
     // `~.` detaches. The session keeps running.
     try first.type_("~.");
-    const detached = try a.join();
+    const detached = try a.join(&first);
     const session_id = detached.detached.?;
     try expectMatchesPrimary(&st, session_id, first.output.items);
 
@@ -315,7 +330,7 @@ test "a session runs, detaches, reattaches and exits through tx-session and tx" 
 
     // The program exits; the client reports its status.
     try second.type_("q\r");
-    const exited = try b.join();
+    const exited = try b.join(&second);
     try testing.expectEqual(3, exited.exited.status);
     try testing.expectEqual(null, try primaryDump(&st, session_id));
 }
@@ -336,7 +351,7 @@ test "a client accepting another server key is refused" {
     var ct: ClientThread = .{ .options = login.clientOptions(&st, &pty, &.{login.key.public_key.toBytes()}) };
     ct.options.host_keys = &.{Ed25519.KeyPair.generate(testing.io).public_key.toBytes()};
     try ct.start();
-    const outcome = try ct.join();
+    const outcome = try ct.join(&pty);
     try testing.expectEqual(st.host_keys[0], outcome.host_key_refused);
 }
 
@@ -365,7 +380,7 @@ test "the agent's keys are probed in order and only the accepted one signs" {
     try pty.readUntil("tx: session 1\r\n");
     try pty.readUntil("ready");
     try pty.type_("\r");
-    _ = try ct.join();
+    _ = try ct.join(&pty);
 
     try testing.expectEqual(1, login.agent.signatures.load(.monotonic));
 }
@@ -387,7 +402,7 @@ test "a client whose keys aren't in authorized_keys is refused" {
     defer pty.close();
     var ct: ClientThread = .{ .options = login.clientOptions(&st, &pty, &.{unlisted.public_key.toBytes()}) };
     try ct.start();
-    const outcome = try ct.join();
+    const outcome = try ct.join(&pty);
     try testing.expectEqualStrings("the server accepted none of the agent's keys for tx-test", outcome.refused.message.slice());
     try testing.expectEqual(0, login.agent.signatures.load(.monotonic));
 }
@@ -408,7 +423,7 @@ test "a client logging in as another user is refused" {
     var ct: ClientThread = .{ .options = login.clientOptions(&st, &pty, &.{login.key.public_key.toBytes()}) };
     ct.options.user = "root";
     try ct.start();
-    const outcome = try ct.join();
+    const outcome = try ct.join(&pty);
     try testing.expectEqualStrings("the server accepted none of the agent's keys for root", outcome.refused.message.slice());
 }
 
@@ -428,7 +443,7 @@ test "a refused signature fails the login" {
     defer pty.close();
     var ct: ClientThread = .{ .options = login.clientOptions(&st, &pty, &.{login.key.public_key.toBytes()}) };
     try ct.start();
-    const outcome = try ct.join();
+    const outcome = try ct.join(&pty);
     try testing.expectEqualStrings("the SSH agent refused to sign", outcome.refused.message.slice());
 }
 

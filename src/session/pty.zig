@@ -725,12 +725,17 @@ fn spawnTest(environ: *const std.process.Environ.Map, argv: []const []const u8) 
     return Pty.spawn(testing.allocator, .{ .argv = argv, .environ = environ, .size = test_size });
 }
 
-/// `Pty.wait` with a deadline.
+/// `Pty.wait` with a deadline. Output is read and dropped meanwhile: on
+/// macOS a program's exit waits until its terminal's output has been read.
 fn waitTest(pty: *Pty) !Term {
     const io = testing.io;
     const deadline = std.Io.Clock.awake.now(io).toMilliseconds() + test_timeout_ms;
     while (std.Io.Clock.awake.now(io).toMilliseconds() < deadline) {
         if (try pty.tryWait()) |term| return term;
+
+        // The master is nonblocking, and -1 after `hangup`.
+        var buf: [1024]u8 = undefined;
+        if (pty.master != -1) while (c.read(pty.master, &buf, buf.len) > 0) {};
         try io.sleep(.fromMilliseconds(10), .awake);
     }
     std.debug.print("timed out waiting for the child\n", .{});
