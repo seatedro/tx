@@ -10,6 +10,7 @@ const Io = std.Io;
 const client = @import("client");
 const keyfile = @import("keyfile.zig");
 
+/// tx-session's default port.
 const default_port = 8739;
 
 pub fn main(init: std.process.Init) !u8 {
@@ -17,6 +18,7 @@ pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
+    // Options, then one address.
     var port: u16 = default_port;
     var key_path: ?[]const u8 = null;
     var session_id: ?u64 = null;
@@ -37,12 +39,16 @@ pub fn main(init: std.process.Init) !u8 {
             host = arg;
         } else return usage("unknown argument");
     }
+
+    // No name resolution yet, apart from localhost.
     const name = host orelse return usage("no address");
     const address: Io.net.IpAddress = if (std.mem.eql(u8, name, "localhost"))
         try .parseIp4("127.0.0.1", port)
     else
         Io.net.IpAddress.parse(name, port) catch return usage("revision 0 takes an IP address");
 
+    // The server's key file, read from this machine. It stands in for
+    // known_hosts until host key checks exist.
     const path = key_path orelse try keyfile.defaultPath(gpa, init.environ_map);
     defer if (key_path == null) gpa.free(path);
     const identity = keyfile.load(io, path) catch |err| {
@@ -60,6 +66,7 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("tx: {t}\n", .{err});
         return 255;
     };
+
     switch (outcome) {
         .exited => |exit| return exit.status,
         .detached => |id| {

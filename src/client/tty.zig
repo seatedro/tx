@@ -46,6 +46,7 @@ pub const RawMode = struct {
     pub fn enter(fd: posix.fd_t) TerminalError!RawMode {
         var saved: posix.termios = undefined;
         try getAttrs(fd, &saved);
+
         const raw = makeRaw(saved);
         switch (setAttrs(fd, &raw)) {
             .SUCCESS => {},
@@ -66,6 +67,9 @@ pub const RawMode = struct {
 /// translation, and reads return after one byte.
 pub fn makeRaw(attrs: posix.termios) posix.termios {
     var raw = attrs;
+
+    // Input: bytes pass through unchanged, and ^S and ^Q are not flow
+    // control. IGNPAR drops bytes with parity errors.
     raw.iflag.IGNPAR = true;
     raw.iflag.ISTRIP = false;
     raw.iflag.INLCR = false;
@@ -74,7 +78,11 @@ pub fn makeRaw(attrs: posix.termios) posix.termios {
     raw.iflag.IXON = false;
     raw.iflag.IXANY = false;
     raw.iflag.IXOFF = false;
+    // Linux only.
     if (@hasField(@TypeOf(raw.iflag), "IUCLC")) raw.iflag.IUCLC = false;
+
+    // Local: no ^C or ^Z signals, no line editing, no echo. The remote
+    // terminal does these.
     raw.lflag.ISIG = false;
     raw.lflag.ICANON = false;
     raw.lflag.ECHO = false;
@@ -82,9 +90,15 @@ pub fn makeRaw(attrs: posix.termios) posix.termios {
     raw.lflag.ECHOK = false;
     raw.lflag.ECHONL = false;
     raw.lflag.IEXTEN = false;
+
+    // Output: no \n to \r\n translation. The server's output already has
+    // what the remote terminal produced.
     raw.oflag.OPOST = false;
+
+    // A read returns as soon as one byte is available.
     raw.cc[@backingInt(posix.V.MIN)] = 1;
     raw.cc[@backingInt(posix.V.TIME)] = 0;
+
     return raw;
 }
 
@@ -109,6 +123,7 @@ fn signalSet() posix.sigset_t {
 }
 
 fn signalsBlocked() bool {
+    // Blocking an empty set changes nothing and returns the current mask.
     const empty = posix.sigemptyset();
     var mask: posix.sigset_t = undefined;
     _ = c.pthread_sigmask(posix.SIG.BLOCK, &empty, &mask);
@@ -161,10 +176,14 @@ pub const Signals = struct {
         var set = signalSet();
         var terminating = false;
         while (true) {
+            // Every thread blocks these signals. sigwait receives them.
             var signo: c_int = undefined;
             const rc = c.sigwait(&set, &signo);
             assert(rc == 0);
+
+            // `stop` wakes the thread with a SIGWINCH.
             if (s.stopping.load(.acquire)) return;
+
             const sig = std.enums.fromInt(posix.SIG, signo).?;
             switch (sig) {
                 .WINCH => {
@@ -172,9 +191,14 @@ pub const Signals = struct {
                     s.options.callback(s.options.context, .{ .resize = size });
                 },
                 else => {
+                    // The terminal is restored first, in case the process
+                    // dies before the main thread gets to it.
                     if (s.options.raw_mode) |raw| raw.restore();
+
+                    // The second terminating signal ends the process at once.
                     if (terminating) defaultAction(sig);
                     terminating = true;
+
                     s.options.callback(s.options.context, .{ .terminate = sig });
                 },
             }
@@ -184,6 +208,7 @@ pub const Signals = struct {
     fn defaultAction(sig: posix.SIG) void {
         var action: posix.Sigaction = .{ .handler = .{ .handler = posix.SIG.DFL }, .mask = posix.sigemptyset(), .flags = 0 };
         _ = c.sigaction(sig, &action, null);
+
         // raise makes the signal pending on this thread, and unblocking it
         // delivers it before pthread_sigmask returns.
         _ = c.raise(sig);
@@ -239,13 +264,19 @@ pub const Reader = struct {
 
     fn run(r: *Reader) void {
         const fd = r.options.fd;
+
+        // Cleared if the fd turns out not to support poll. Reads then block
+        // and `stop` waits for the next byte.
         var poll_fd = true;
+
         while (true) {
+            // Wait for input or for `stop`.
             if (poll_fd) switch (waitFor(fd, posix.POLL.IN, r.wake.read_fd)) {
                 .ready => {},
                 .woken => return,
                 .unsupported => poll_fd = false,
             };
+
             const rc = c.read(fd, &r.buf, r.buf.len);
             const err: ReadError = switch (posix.errno(rc)) {
                 .SUCCESS => {
@@ -276,11 +307,13 @@ pub const Writer = struct {
     wake: Wake,
     thread: std.Thread,
 
+    /// Guards the fields below, which `write` and the thread share.
     mutex: Io.Mutex,
     /// A ring buffer. The queued bytes start at `head` and wrap.
     buf: []u8,
     head: usize,
     len: usize,
+    /// `above_high_water` was sent and `below_low_water` wasn't yet.
     above_high_water: bool,
     failed: bool,
     stopping: ?StopMode,
@@ -330,6 +363,7 @@ pub const Writer = struct {
     pub fn start(w: *Writer, gpa: Allocator, io: Io, options: Options) (StartError || Allocator.Error)!void {
         assert(options.low_water <= options.high_water);
         assert(options.high_water < options.capacity);
+
         const buf = try gpa.alloc(u8, options.capacity);
         errdefer gpa.free(buf);
         w.* = .{
@@ -355,6 +389,7 @@ pub const Writer = struct {
         w.mutex.lockUncancelable(w.io);
         w.stopping = mode;
         w.mutex.unlock(w.io);
+
         w.wake.notify();
         w.thread.join();
         w.wake.deinit();
@@ -371,15 +406,20 @@ pub const Writer = struct {
         if (bytes.len > w.buf.len - w.len) return error.QueueFull;
         if (bytes.len == 0) return;
         const was_empty = w.len == 0;
+
+        // Copy to the end of the ring buffer, then wrap to its start.
         const tail = (w.head + w.len) % w.buf.len;
         const first = @min(bytes.len, w.buf.len - tail);
         @memcpy(w.buf[tail..][0..first], bytes[0..first]);
         @memcpy(w.buf[0 .. bytes.len - first], bytes[first..]);
         w.len += bytes.len;
+
         if (!w.above_high_water and w.len > w.options.high_water) {
             w.above_high_water = true;
             w.options.callback(w.options.context, .above_high_water);
         }
+
+        // A thread with an empty queue is waiting for the wake pipe.
         if (was_empty) w.wake.notify();
     }
 
@@ -392,21 +432,29 @@ pub const Writer = struct {
 
     fn run(w: *Writer) void {
         const fd = w.options.fd;
+
+        // Cleared if the fd turns out not to support poll.
         var poll_fd = true;
+
         while (true) {
-            // `write` appends after the queued bytes, so the chunk can be
-            // written without the lock.
+            // The next chunk stops at the end of the ring buffer. `write`
+            // appends after the queued bytes, so the chunk can be written
+            // without the lock.
             w.mutex.lockUncancelable(w.io);
             const stopping = w.stopping;
             const chunk = w.buf[w.head..][0..@min(w.len, w.buf.len - w.head, max_write)];
             w.mutex.unlock(w.io);
             if (stopping == .discard or (stopping == .drain and chunk.len == 0)) return;
 
+            // Nothing queued: wait for `write` or `stop`.
             if (chunk.len == 0) {
                 waitForWake(w.wake.read_fd);
                 w.wake.drain();
                 continue;
             }
+
+            // Wait until the terminal takes more. A wakeup goes back to the
+            // top to check `stopping`.
             if (poll_fd) switch (waitFor(fd, posix.POLL.OUT, w.wake.read_fd)) {
                 .ready => {},
                 .woken => {
@@ -415,6 +463,7 @@ pub const Writer = struct {
                 },
                 .unsupported => poll_fd = false,
             };
+
             const rc = c.write(fd, chunk.ptr, chunk.len);
             const err: WriteError = switch (posix.errno(rc)) {
                 .SUCCESS => {
@@ -449,6 +498,8 @@ pub const Writer = struct {
         w.mutex.lockUncancelable(w.io);
         defer w.mutex.unlock(w.io);
         w.failed = true;
+
+        // The terminal is gone. The queued bytes are dropped.
         w.head = 0;
         w.len = 0;
         w.options.callback(w.options.context, .{ .failed = err });
@@ -476,6 +527,8 @@ fn waitFor(fd: posix.fd_t, events: i16, wake_fd: posix.fd_t) Ready {
             .INTR, .AGAIN => continue,
             else => return .ready,
         };
+
+        // A wakeup is checked first. `stop` isn't delayed by a busy fd.
         if (fds[0].revents != 0) return .woken;
         if (fds[1].revents & posix.POLL.NVAL != 0) return .unsupported;
         if (fds[1].revents != 0) return .ready;

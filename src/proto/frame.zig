@@ -8,8 +8,10 @@ const messages = @import("messages.zig");
 const Message = messages.Message;
 const DecodeError = wire.DecodeError;
 
+/// The type and length varints.
 pub const max_header_len = 2 * wire.max_varint_len;
 
+/// The encoded size of `m`, header included.
 pub fn encodedLen(m: Message) usize {
     const body_len = m.encodedLen();
     return wire.varintLen(m.typeId()) + wire.varintLen(body_len) + body_len;
@@ -28,10 +30,15 @@ const Header = struct {
     len: usize,
 };
 
+/// Returns error.Truncated if `bytes` ends inside the header.
 fn readHeader(bytes: []const u8, max_body_len: usize) DecodeError!Header {
     const type_id = try wire.readVarint(bytes);
     const body_len = try wire.readVarint(bytes[type_id.len..]);
+
+    // Checked before the body arrives. An oversized message is not
+    // buffered.
     if (body_len.value > max_body_len) return error.Oversize;
+
     return .{
         .type_id = type_id.value,
         .body_len = @intCast(body_len.value),
@@ -90,9 +97,13 @@ pub const Decoder = struct {
         return try Message.decode(header.type_id, bytes[header.len..][0..header.body_len]);
     }
 
+    /// Returns the next message's header and its bytes, header included.
     fn nextFrame(d: *Decoder) Error!?struct { Header, []const u8 } {
+        // A message started in an earlier chunk is finished first.
         if (d.pending.items.len > 0) return d.continuePending();
         if (d.input.len == 0) return null;
+
+        // The chunk ends inside a header: keep what there is.
         const header = readHeader(d.input, d.max_body_len) catch |err| switch (err) {
             error.Truncated => {
                 try d.pending.appendSlice(d.gpa, d.input);
@@ -101,12 +112,17 @@ pub const Decoder = struct {
             },
             else => return err,
         };
+
+        // The whole message is in the chunk: return it without copying.
         const total = header.len + header.body_len;
         if (d.input.len >= total) {
             const bytes = d.input[0..total];
             d.input = d.input[total..];
             return .{ header, bytes };
         }
+
+        // The chunk ends inside the body. The rest of the chunk belongs to
+        // this message.
         try d.pending.ensureTotalCapacity(d.gpa, total);
         d.pending.appendSliceAssumeCapacity(d.input);
         d.input = &.{};
@@ -127,6 +143,8 @@ pub const Decoder = struct {
             try d.pending.append(d.gpa, d.input[0]);
             d.input = d.input[1..];
         };
+
+        // Take as much of the body as this chunk has, and no more.
         const total = header.len + header.body_len;
         try d.pending.ensureTotalCapacity(d.gpa, total);
         const n = @min(total - d.pending.items.len, d.input.len);
@@ -137,6 +155,9 @@ pub const Decoder = struct {
         // `pending` completes at most one message per feed. After it does,
         // bytes go to `pending` only from the end of the chunk.
         std.debug.assert(d.completed.items.len == 0);
+
+        // The message moves to `completed`, which stays valid until the
+        // next `feed`, and `pending` is free for the next split message.
         std.mem.swap(std.ArrayList(u8), &d.pending, &d.completed);
         return .{ header, d.completed.items };
     }

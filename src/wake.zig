@@ -10,6 +10,9 @@ pub const Wake = struct {
 
     pub fn init() error{ ProcessFdQuotaExceeded, SystemFdQuotaExceeded, Unexpected }!Wake {
         var fds: [2]posix.fd_t = undefined;
+
+        // Non-blocking: `notify` can't block on a full pipe, and `drain`
+        // stops when it's empty.
         const rc = if (@TypeOf(c.pipe2) != void)
             c.pipe2(&fds, .{ .CLOEXEC = true, .NONBLOCK = true })
         else
@@ -19,6 +22,7 @@ pub const Wake = struct {
             .NFILE => error.SystemFdQuotaExceeded,
             else => |err| posix.unexpectedErrno(err),
         };
+
         // macOS has no pipe2.
         if (@TypeOf(c.pipe2) == void) {
             const nonblock: c_int = @bitCast(posix.O{ .NONBLOCK = true });
@@ -33,6 +37,7 @@ pub const Wake = struct {
                 }
             }
         }
+
         return .{ .read_fd = fds[0], .write_fd = fds[1] };
     }
 
@@ -48,8 +53,11 @@ pub const Wake = struct {
         while (posix.errno(c.write(wake.write_fd, &byte, 1)) == .INTR) {}
     }
 
+    /// Empties the pipe. The next poll then waits for the next `notify`.
     pub fn drain(wake: *Wake) void {
         var buf: [64]u8 = undefined;
+
+        // A short read means the pipe is empty. EAGAIN ends it too.
         while (true) {
             const rc = c.read(wake.read_fd, &buf, buf.len);
             switch (posix.errno(rc)) {

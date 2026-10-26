@@ -31,12 +31,17 @@ pub const DecodeError = error{
     WrongType,
 };
 
+/// The largest value a varint holds: 62 bits.
 pub const max_varint: u64 = (1 << 62) - 1;
 
 pub const max_varint_len = 8;
 
+/// The shortest encoding of `value`, which `writeVarint` uses.
 pub fn varintLen(value: u64) usize {
     std.debug.assert(value <= max_varint);
+
+    // Each length holds 6, 14, 30 or 62 value bits: the length's bits minus
+    // the 2-bit prefix.
     if (value < 1 << 6) return 1;
     if (value < 1 << 14) return 2;
     if (value < 1 << 30) return 4;
@@ -45,6 +50,9 @@ pub fn varintLen(value: u64) usize {
 
 /// Asserts `value <= max_varint`.
 pub fn writeVarint(w: *Writer, value: u64) Writer.Error!void {
+    // The value is written big-endian, with the length's 2-bit prefix in
+    // the top bits of the first byte: 0b01 for 2 bytes, 0b10 for 4 and
+    // 0b11 for 8. A 1-byte value fits in 6 bits and has prefix 0b00.
     switch (varintLen(value)) {
         1 => try w.writeByte(@intCast(value)),
         2 => try w.writeInt(u16, @as(u16, @intCast(value)) | 0x4000, .big),
@@ -63,19 +71,34 @@ pub const Varint = struct {
 /// Decodes the varint at the start of `bytes`.
 pub fn readVarint(bytes: []const u8) DecodeError!Varint {
     if (bytes.len == 0) return error.Truncated;
+
+    // The two high bits of the first byte give the length: 0b00 is 1 byte,
+    // 0b01 is 2, 0b10 is 4 and 0b11 is 8.
     const len = @as(usize, 1) << @intCast(bytes[0] >> 6);
     if (bytes.len < len) return error.Truncated;
+
+    // The value is big-endian. It starts with the low 6 bits of the first
+    // byte, and each following byte adds 8 more.
     var value: u64 = bytes[0] & 0x3f;
     for (bytes[1..len]) |b| value = (value << 8) | b;
+
+    // Reject a value that fits a shorter encoding. Each value then has one
+    // encoding; RFC 9000 accepts the longer ones. A 1-byte varint is always
+    // minimal.
     if (len > 1 and varintLen(value) != len) return error.NonMinimal;
+
     return .{ .value = value, .len = len };
 }
 
+/// The bytes an integer field's value takes: the value's significant
+/// bytes, 0 for zero.
 pub fn uintLen(value: u64) usize {
     return (64 - @clz(value) + 7) / 8;
 }
 
 pub fn writeUint(w: *Writer, value: u64) Writer.Error!void {
+    // Write the low `len` bytes of the big-endian value, which drops its
+    // leading zero bytes.
     const len = uintLen(value);
     var buf: [8]u8 = undefined;
     std.mem.writeInt(u64, &buf, value, .big);
@@ -85,12 +108,16 @@ pub fn writeUint(w: *Writer, value: u64) Writer.Error!void {
 /// Decodes an integer field's value as `T`.
 pub fn readUint(comptime T: type, value: []const u8) DecodeError!T {
     if (value.len > 8) return error.WrongType;
+
+    // A leading zero byte means the encoder didn't use the shortest form.
     if (value.len > 0 and value[0] == 0) return error.NonMinimal;
+
     var n: u64 = 0;
     for (value) |b| n = (n << 8) | b;
     return std.math.cast(T, n) orelse error.WrongType;
 }
 
+/// The encoded size of a field with a `value_len`-byte value.
 pub fn fieldLen(tag: u64, value_len: usize) usize {
     return varintLen(tag) + varintLen(value_len) + value_len;
 }
@@ -128,12 +155,19 @@ pub const FieldIterator = struct {
 
     pub fn next(it: *FieldIterator) DecodeError!?Field {
         if (it.pos == it.bytes.len) return null;
+
+        // A field is a tag varint, a length varint and that many bytes of
+        // value.
         const rest = it.bytes[it.pos..];
         const tag = try readVarint(rest);
         const len = try readVarint(rest[tag.len..]);
         const start = tag.len + len.len;
+
+        // Compare before converting: the length is a u64 from the wire and
+        // may not fit in usize.
         if (len.value > rest.len - start) return error.Truncated;
         const end = start + @as(usize, @intCast(len.value));
+
         it.pos += end;
         return .{ .tag = tag.value, .value = rest[start..end] };
     }

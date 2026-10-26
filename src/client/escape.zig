@@ -38,29 +38,41 @@ pub const Escape = struct {
     /// the previous call can be forwarded with the first byte of `input`.
     pub fn feed(e: *Escape, input: []const u8, out: []u8) Result {
         assert(out.len >= input.len + 1);
+
+        // Escapes are off: forward everything.
         const char = e.char orelse {
             @memcpy(out[0..input.len], input);
             return .{ .forward = out[0..input.len] };
         };
+
         var len: usize = 0;
         for (input) |byte| {
             switch (e.state) {
+                // Hold back an escape character at the start of a line until
+                // the next byte shows what it is.
                 .line_start => if (byte == char) {
                     e.state = .pending;
                     continue;
                 },
+
                 .mid_line => {},
+
                 .pending => {
                     if (byte == '.') {
                         e.state = .mid_line;
                         return .{ .forward = out[0..len], .action = .disconnect };
                     }
+
+                    // `~~` forwards one `~`. Any other byte forwards the held
+                    // `~` before it. This is the one place `out` gains a byte
+                    // over `input`.
                     if (byte != char) {
                         out[len] = char;
                         len += 1;
                     }
                 },
             }
+
             out[len] = byte;
             len += 1;
             e.state = if (byte == '\r' or byte == '\n') .line_start else .mid_line;
