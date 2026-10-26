@@ -1,11 +1,10 @@
 //! The ordered records of what the primary terminal consumed: output bytes,
 //! and events outside the byte stream that change terminal state. The client
-//! stream is built from them, and a replica restored from a snapshot applies
-//! them to reach the primary's current state.
+//! stream is built from them.
 //!
 //! Seqs number records from 0 without gaps. A reader whose next seq has
-//! been dropped from the ring gets `error.Trimmed`: a client then needs a
-//! repaint, and a replica a new snapshot.
+//! been dropped from the ring gets `error.Trimmed`, and a client then needs
+//! a repaint.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const vt = @import("ghostty-vt");
@@ -54,7 +53,7 @@ pub const AppendError = Allocator.Error || error{
 };
 
 pub const ReadError = error{
-    /// The seq was dropped from the ring. The reader needs a snapshot.
+    /// The seq was dropped from the ring.
     Trimmed,
     /// The seq has not been appended yet.
     Ahead,

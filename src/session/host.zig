@@ -34,7 +34,6 @@ pub const Options = struct {
         max_scrollback_lines: ?usize = null,
         kitty_image_storage_limit: usize = 320 * 1000 * 1000,
         log_capacity: usize = 8 * 1024 * 1024,
-        continuation_max_bytes: usize = 1024 * 1024,
     };
 };
 
@@ -67,7 +66,6 @@ pub const Host = struct {
             .max_scrollback_lines = t.max_scrollback_lines,
             .kitty_image_storage_limit = t.kitty_image_storage_limit,
             .log_capacity = t.log_capacity,
-            .continuation_max_bytes = t.continuation_max_bytes,
         });
         errdefer primary.destroy();
         // The initial size isn't logged, so apply a cell size as a resize
@@ -339,7 +337,7 @@ test "large input reaches the program intact" {
     try testing.expect(screenContains(host, try std.fmt.bufPrint(&want, "{d} {d}", .{ ~crc, len })));
 }
 
-test "replica attached mid-session ends in the primary's state" {
+test "a terminal fed the log ends in the primary's state" {
     var environ = try testEnviron();
     defer environ.deinit();
     // Scrollback, the alternate screen, a read, a resize and a return to
@@ -360,15 +358,6 @@ test "replica attached mid-session ends in the primary's state" {
             return screenContains(h, "waiting");
         }
     }.f);
-
-    // Snapshot here, then apply the records logged after it.
-    var snapshot: std.Io.Writer.Allocating = .init(testing.allocator);
-    defer snapshot.deinit();
-    const seq = try host.primary.snapshot(testing.allocator, &snapshot.writer);
-    var reader: std.Io.Reader = .fixed(snapshot.written());
-    const replica: *term.Replica = try .restore(testing.allocator, testing.io, &reader, seq, .{});
-    defer replica.destroy();
-
     try host.resize(.{ .cols = 100, .rows = 30, .cell_size_px = .{ .width = 9, .height = 18 } });
     try host.sendInput("yes\r");
     try run(host, null);
@@ -376,12 +365,19 @@ test "replica attached mid-session ends in the primary's state" {
     try testing.expect(screenContains(host, "got yes, size 30 100"));
     try testing.expect(screenContains(host, "back on the primary screen"));
 
-    var it = try host.primary.log.iterator(seq);
-    while (it.next()) |record| try replica.apply(record);
+    // A second Primary with no effect callbacks stands in for the client's
+    // terminal.
+    const stand_in: *Primary = try .create(testing.allocator, testing.io, .{ .cols = 80, .rows = 24 });
+    defer stand_in.destroy();
+    var it = try host.primary.log.iterator(0);
+    while (it.next()) |record| switch (record.payload) {
+        .output => |bytes| try stand_in.output(bytes),
+        .resize => |size| try stand_in.resize(size),
+    };
 
     const want = try term.state.dumpAlloc(testing.allocator, &host.primary.terminal);
     defer testing.allocator.free(want);
-    const got = try term.state.dumpAlloc(testing.allocator, &replica.terminal);
+    const got = try term.state.dumpAlloc(testing.allocator, &stand_in.terminal);
     defer testing.allocator.free(got);
     try testing.expectEqualStrings(want, got);
 }
