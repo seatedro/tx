@@ -261,6 +261,93 @@ pub const Error = struct {
     }
 };
 
+/// Asks whether the server would accept `key` for `user`. The client probes
+/// before it signs: a signature can cost the user a touch or a prompt.
+pub const AuthProbe = struct {
+    user: []const u8,
+    /// An SSH public key blob.
+    key: []const u8,
+
+    pub const type_id = 12;
+    pub const tags = .{ .user = 1, .key = 2 };
+
+    pub fn encodedLen(m: AuthProbe) usize {
+        return bodyLen(AuthProbe, m);
+    }
+
+    pub fn encode(m: AuthProbe, w: *Writer) Writer.Error!void {
+        return encodeBody(AuthProbe, m, w);
+    }
+
+    pub fn decode(bytes: []const u8) DecodeError!AuthProbe {
+        return decodeBody(AuthProbe, bytes);
+    }
+};
+
+pub const AuthProbeReply = struct {
+    /// The probed key.
+    key: []const u8,
+    accepted: bool,
+
+    pub const type_id = 13;
+    pub const tags = .{ .key = 1, .accepted = 2 };
+
+    pub fn encodedLen(m: AuthProbeReply) usize {
+        return bodyLen(AuthProbeReply, m);
+    }
+
+    pub fn encode(m: AuthProbeReply, w: *Writer) Writer.Error!void {
+        return encodeBody(AuthProbeReply, m, w);
+    }
+
+    pub fn decode(bytes: []const u8) DecodeError!AuthProbeReply {
+        return decodeBody(AuthProbeReply, bytes);
+    }
+};
+
+/// Logs in as `user` with a signature over the connection's login
+/// transcript (see `auth.login`).
+pub const AuthSignature = struct {
+    user: []const u8,
+    /// An SSH public key blob.
+    key: []const u8,
+    /// An SSH signature blob.
+    signature: []const u8,
+
+    pub const type_id = 14;
+    pub const tags = .{ .user = 1, .key = 2, .signature = 3 };
+
+    pub fn encodedLen(m: AuthSignature) usize {
+        return bodyLen(AuthSignature, m);
+    }
+
+    pub fn encode(m: AuthSignature, w: *Writer) Writer.Error!void {
+        return encodeBody(AuthSignature, m, w);
+    }
+
+    pub fn decode(bytes: []const u8) DecodeError!AuthSignature {
+        return decodeBody(AuthSignature, bytes);
+    }
+};
+
+/// The login succeeded.
+pub const AuthOk = struct {
+    pub const type_id = 15;
+    pub const tags = .{};
+
+    pub fn encodedLen(m: AuthOk) usize {
+        return bodyLen(AuthOk, m);
+    }
+
+    pub fn encode(m: AuthOk, w: *Writer) Writer.Error!void {
+        return encodeBody(AuthOk, m, w);
+    }
+
+    pub fn decode(bytes: []const u8) DecodeError!AuthOk {
+        return decodeBody(AuthOk, bytes);
+    }
+};
+
 pub const Message = union(enum) {
     hello: Hello,
     hello_reply: HelloReply,
@@ -273,6 +360,10 @@ pub const Message = union(enum) {
     detach: Detach,
     exit: Exit,
     @"error": Error,
+    auth_probe: AuthProbe,
+    auth_probe_reply: AuthProbeReply,
+    auth_signature: AuthSignature,
+    auth_ok: AuthOk,
     /// A message type this revision does not define.
     unknown: Unknown,
 
@@ -354,13 +445,13 @@ fn checkSchema(comptime M: type) void {
                     @compileError(@typeName(M) ++ "." ++ name ++ " reuses a tag");
             }
 
-            // Fields are byte strings or unsigned integers of up to 64
-            // bits, optional or not.
+            // Fields are byte strings, bools or unsigned integers of up to
+            // 64 bits, optional or not.
             const V = switch (@typeInfo(T)) {
                 .optional => |o| o.child,
                 else => T,
             };
-            if (V != []const u8 and !(@typeInfo(V) == .int and
+            if (V != []const u8 and V != bool and !(@typeInfo(V) == .int and
                 @typeInfo(V).int.signedness == .unsigned and @typeInfo(V).int.bits <= 64))
                 @compileError(@typeName(M) ++ "." ++ name ++ " has an unsupported type");
         }
@@ -370,17 +461,21 @@ fn checkSchema(comptime M: type) void {
 /// The encoded size of one field. `T` is a field type without the optional.
 fn valueLen(comptime T: type, tag: u64, value: T) usize {
     if (T == []const u8) return wire.fieldLen(tag, value.len);
+    if (T == bool) return wire.uintFieldLen(tag, @intFromBool(value));
     return wire.uintFieldLen(tag, value);
 }
 
 fn writeValue(comptime T: type, w: *Writer, tag: u64, value: T) Writer.Error!void {
     if (T == []const u8) return wire.writeBytesField(w, tag, value);
+    if (T == bool) return wire.writeUintField(w, tag, @intFromBool(value));
     return wire.writeUintField(w, tag, value);
 }
 
 fn readValue(comptime T: type, bytes: []const u8) DecodeError!T {
     if (@typeInfo(T) == .optional) return try readValue(@typeInfo(T).optional.child, bytes);
     if (T == []const u8) return bytes;
+    // A bool is the integer 0 or 1.
+    if (T == bool) return try wire.readUint(u1, bytes) == 1;
     return wire.readUint(T, bytes);
 }
 
@@ -478,6 +573,11 @@ test "every message round trips" {
         .{ .exit = .{ .status = 255 } },
         .{ .exit = .{ .signal = "KILL" } },
         .{ .@"error" = .{ .code = 4, .message = "no such session" } },
+        .{ .auth_probe = .{ .user = "rohit", .key = "blob" } },
+        .{ .auth_probe_reply = .{ .key = "blob", .accepted = true } },
+        .{ .auth_probe_reply = .{ .key = "blob", .accepted = false } },
+        .{ .auth_signature = .{ .user = "rohit", .key = "blob", .signature = "sig" } },
+        .{ .auth_ok = .{} },
         .{ .unknown = .{ .type_id = 1000, .body = "\x01\x00" } },
     };
     var buf: [256]u8 = undefined;
@@ -510,6 +610,11 @@ test "a field value of the wrong type is an error" {
     // A nine-byte integer.
     try testing.expectError(error.WrongType, Ack.decode(&.{ 0x01, 0x09, 1, 0, 0, 0, 0, 0, 0, 0, 0 }));
     try testing.expectError(error.NonMinimal, Ack.decode(&.{ 0x01, 0x01, 0x00 }));
+}
+
+test "a bool is 0 or 1" {
+    try testing.expectError(error.WrongType, AuthProbeReply.decode(&.{ 0x01, 0x00, 0x02, 0x01, 0x02 }));
+    try testing.expectEqual(false, (try AuthProbeReply.decode(&.{ 0x01, 0x00, 0x02, 0x00 })).accepted);
 }
 
 test "unknown fields are skipped" {
