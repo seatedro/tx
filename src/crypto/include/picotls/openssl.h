@@ -1,8 +1,8 @@
 /*
- * Stands in for picotls's <picotls/openssl.h> when building ngtcp2's picotls
- * adapter (crypto/picotls/picotls.c). The adapter names picotls's OpenSSL
- * backend objects directly; these macros point it at tx's backend instead,
- * so the upstream file compiles unmodified. Nothing else includes this.
+ * Replaces picotls's <picotls/openssl.h> when building ngtcp2's picotls adapter
+ * (crypto/picotls/picotls.c), which refers to the OpenSSL backend objects by
+ * name. These macros map those names to tx's backend. Nothing else includes
+ * this header.
  */
 #ifndef TX_PICOTLS_OPENSSL_SHIM_H
 #define TX_PICOTLS_OPENSSL_SHIM_H

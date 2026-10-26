@@ -7,7 +7,6 @@ const version_num = 0x011900;
 
 const flags = &[_][]const u8{ "-std=gnu11", "-fno-sanitize=undefined" };
 
-/// The QUIC library itself.
 pub fn core(
     b: *std.Build,
     dep: *std.Build.Dependency,
@@ -40,10 +39,9 @@ pub fn core(
 pub const CryptoOptions = struct {
     /// picotls's public headers.
     picotls_include: std.Build.LazyPath,
-    /// A directory providing `picotls/openssl.h`, searched before
-    /// `picotls_include`. ngtcp2's picotls adapter names picotls's OpenSSL
-    /// backend objects directly; tx's header maps those names onto its own
-    /// backend, so the adapter compiles unmodified.
+    /// Directory containing tx's `picotls/openssl.h`, which maps the OpenSSL
+    /// backend names used by ngtcp2's picotls adapter onto tx's backend.
+    /// Searched before `picotls_include`.
     backend_include: std.Build.LazyPath,
 };
 
@@ -120,20 +118,20 @@ fn versionHeader(b: *std.Build, dep: *std.Build.Dependency) *std.Build.Step.Conf
 }
 
 const lib_files = [_][]const u8{
-    "ngtcp2_acktr.c",       "ngtcp2_addr.c",        "ngtcp2_balloc.c",
-    "ngtcp2_bbr.c",         "ngtcp2_buf.c",         "ngtcp2_callbacks.c",
-    "ngtcp2_cc.c",          "ngtcp2_cid.c",         "ngtcp2_conn.c",
-    "ngtcp2_conn_info.c",   "ngtcp2_conv.c",        "ngtcp2_crypto.c",
-    "ngtcp2_dcidtr.c",      "ngtcp2_err.c",         "ngtcp2_fmt.c",
-    "ngtcp2_frame_chain.c", "ngtcp2_gaptr.c",       "ngtcp2_idtr.c",
-    "ngtcp2_ksl.c",         "ngtcp2_log.c",         "ngtcp2_map.c",
-    "ngtcp2_mem.c",         "ngtcp2_objalloc.c",    "ngtcp2_opl.c",
-    "ngtcp2_path.c",        "ngtcp2_pcg.c",         "ngtcp2_pkt.c",
-    "ngtcp2_pmtud.c",       "ngtcp2_ppe.c",         "ngtcp2_pq.c",
-    "ngtcp2_pv.c",          "ngtcp2_qlog.c",        "ngtcp2_range.c",
-    "ngtcp2_ratelim.c",     "ngtcp2_ringbuf.c",     "ngtcp2_rob.c",
-    "ngtcp2_rst.c",         "ngtcp2_rtb.c",         "ngtcp2_settings.c",
-    "ngtcp2_str.c",         "ngtcp2_strm.c",        "ngtcp2_transport_params.c",
-    "ngtcp2_unreachable.c", "ngtcp2_vec.c",         "ngtcp2_version.c",
+    "ngtcp2_acktr.c",       "ngtcp2_addr.c",     "ngtcp2_balloc.c",
+    "ngtcp2_bbr.c",         "ngtcp2_buf.c",      "ngtcp2_callbacks.c",
+    "ngtcp2_cc.c",          "ngtcp2_cid.c",      "ngtcp2_conn.c",
+    "ngtcp2_conn_info.c",   "ngtcp2_conv.c",     "ngtcp2_crypto.c",
+    "ngtcp2_dcidtr.c",      "ngtcp2_err.c",      "ngtcp2_fmt.c",
+    "ngtcp2_frame_chain.c", "ngtcp2_gaptr.c",    "ngtcp2_idtr.c",
+    "ngtcp2_ksl.c",         "ngtcp2_log.c",      "ngtcp2_map.c",
+    "ngtcp2_mem.c",         "ngtcp2_objalloc.c", "ngtcp2_opl.c",
+    "ngtcp2_path.c",        "ngtcp2_pcg.c",      "ngtcp2_pkt.c",
+    "ngtcp2_pmtud.c",       "ngtcp2_ppe.c",      "ngtcp2_pq.c",
+    "ngtcp2_pv.c",          "ngtcp2_qlog.c",     "ngtcp2_range.c",
+    "ngtcp2_ratelim.c",     "ngtcp2_ringbuf.c",  "ngtcp2_rob.c",
+    "ngtcp2_rst.c",         "ngtcp2_rtb.c",      "ngtcp2_settings.c",
+    "ngtcp2_str.c",         "ngtcp2_strm.c",     "ngtcp2_transport_params.c",
+    "ngtcp2_unreachable.c", "ngtcp2_vec.c",      "ngtcp2_version.c",
     "ngtcp2_wf.c",
 };

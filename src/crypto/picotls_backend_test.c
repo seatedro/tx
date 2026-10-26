@@ -1,19 +1,16 @@
 /*
- * Tests for the picotls backend (picotls_backend.c), run from root.zig.
- *
- * Every check compares against something independent of tx:
+ * Tests for picotls_backend.c, called from root.zig. Each entry point returns
+ * the number of failures and prints the failures.
  *
  * - Known-answer vectors: FIPS-197 AES, GCM spec test case 3, and RFC 9001
  *   appendix A (QUIC Initial key derivation, AES header protection, and the
  *   ChaCha20-Poly1305 short-header packet, which exercises the
- *   IV-XOR-sequence nonce). Each value is also computed by picotls's
- *   minicrypto backend, so a disagreement says which side is wrong.
- * - TLS 1.3 handshakes in memory between tx and minicrypto, both directions,
- *   both cipher suites, then application data each way.
- * - A real TLS 1.3 handshake with cloudflare.com offering only
- *   X25519MLKEM768 (network; only when TX_TEST_NETWORK is set).
- *
- * Each entry point returns the number of failures and prints only failures.
+ *   IV-XOR-sequence nonce). picotls's minicrypto backend computes each value
+ *   too, to show which side is wrong on a mismatch.
+ * - In-memory TLS 1.3 handshakes between tx and minicrypto in both directions
+ *   with both cipher suites, followed by application data each way.
+ * - A TLS 1.3 handshake with cloudflare.com offering only X25519MLKEM768.
+ *   Runs when TX_TEST_NETWORK is set.
  */
 #include <tx/picotls_backend.h>
 
@@ -194,7 +191,8 @@ static void kat_rfc9001_chacha(void) {
 static ptls_key_exchange_algorithm_t *tx_kx[] = {&tx_x25519, NULL};
 static ptls_key_exchange_algorithm_t *mini_kx[] = {&ptls_minicrypto_x25519, NULL};
 
-/* Feed `buf` into `tls` as handshake input. Returns the handshake status. */
+/* Feeds `in` to `tls` as handshake input and drops the consumed bytes. Returns
+   the handshake status. */
 static int feed(ptls_t *tls, ptls_buffer_t *out, ptls_buffer_t *in) {
   size_t consumed = in->off;
   int ret = ptls_handshake(tls, out, in->base, &consumed, NULL);
@@ -258,8 +256,8 @@ static void tls_pair(const char *name, int client_tx, int server_tx, int chacha,
   ptls_buffer_init(&c2s, "", 0);
   ptls_buffer_init(&s2c, "", 0);
   int cret = ptls_handshake(client, &c2s, NULL, NULL, NULL), sret = -1;
-  /* A picotls server returns 0 once it has sent its Finished, before it has
-     read the client's, so loop on completeness, not on return values. */
+  /* A picotls server returns 0 after sending its Finished, before it reads the
+     client's. Loop until both sides report the handshake complete. */
   for (int i = 0;
        i < 8 && !(ptls_handshake_is_complete(client) && ptls_handshake_is_complete(server)); ++i) {
     if (c2s.off)
@@ -284,7 +282,7 @@ static void tls_pair(const char *name, int client_tx, int server_tx, int chacha,
 
 static int accept_sign(void *ctx, uint16_t algo, ptls_iovec_t data, ptls_iovec_t sig) {
   (void)ctx, (void)algo, (void)data, (void)sig;
-  return 0; /* not checking Cloudflare's certificate: this tests key exchange */
+  return 0; /* The certificate is not checked; this test covers key exchange. */
 }
 
 static int accept_cert(ptls_verify_certificate_t *self, ptls_t *tls, const char *name,
@@ -354,7 +352,7 @@ static void hybrid_cloudflare(void) {
     send(fd, out.base, out.off, 0);
   out.off = 0;
 
-  /* Prove application data decrypts: ask for a page and read the status. */
+  /* Check that application data decrypts by reading an HTTP status line. */
   int got_http = 0;
   if (ret == 0) {
     char req[128];

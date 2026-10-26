@@ -1,5 +1,5 @@
-//! Loopback tests for quic.zig: a client and a server on two UDP sockets on
-//! 127.0.0.1, driven by one single-threaded loop.
+//! Loopback tests for quic.zig. The client and server use UDP sockets on
+//! 127.0.0.1 and run in one single-threaded loop.
 const std = @import("std");
 const testing = std.testing;
 const Io = std.Io;
@@ -10,7 +10,6 @@ const quic = @import("quic.zig");
 
 const Socket = Io.net.Socket;
 
-/// One endpoint: a socket and, once established, its connection.
 const Peer = struct {
     socket: Socket,
     conn: ?*quic.Connection = null,
@@ -35,13 +34,12 @@ const Peer = struct {
     }
 };
 
-/// Echoes everything received on a stream back on the same stream, and
-/// finishes it once the peer has.
+/// Echoes stream data back on the same stream and sends FIN after the
+/// peer's FIN.
 const Echo = struct {
     stream_id: ?i64 = null,
-    /// Everything received. ngtcp2 keeps pointers into what it has sent
-    /// until it is acknowledged, so this buffer is preallocated and never
-    /// moves or shrinks.
+    /// ngtcp2 keeps pointers into sent data until it is acknowledged. The
+    /// buffer is preallocated so those pointers stay valid.
     received: []u8,
     received_len: usize = 0,
     sent: usize = 0,
@@ -70,8 +68,7 @@ const Echo = struct {
     }
 };
 
-/// Sends `payload` on one stream once the handshake completes, and collects
-/// what comes back.
+/// Sends `payload` on one stream after the handshake and collects the reply.
 const Sender = struct {
     gpa: std.mem.Allocator,
     payload: []const u8,
@@ -106,7 +103,7 @@ fn flushPlain(conn: *quic.Connection, socket: *Socket, io: Io, buf: []u8) !void 
     while (try conn.send(buf)) |d| try socket.send(io, &d.to, buf[0..d.len]);
 }
 
-test "a client pinning the server's key connects, and a stream echoes both ways" {
+test "client pinning the server key connects and a stream echoes" {
     const io = testing.io;
     const gpa = testing.allocator;
     crypto.init(io);
@@ -163,11 +160,11 @@ test "a client pinning the server's key connects, and a stream echoes both ways"
 
     try testing.expect(client.conn.?.isHandshakeComplete());
     try testing.expectEqualSlices(u8, payload, sender.received.items);
-    // Both ends count the hybrid post-quantum key exchange.
+    // Client and server each count one X25519MLKEM768 exchange.
     try testing.expect(c.tx_tls_mlkem_exchanges() >= mlkem_before + 2);
 }
 
-test "a client pinning another key refuses the server" {
+test "client pinning a different key fails the handshake" {
     const io = testing.io;
     const gpa = testing.allocator;
     crypto.init(io);

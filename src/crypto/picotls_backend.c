@@ -1,10 +1,7 @@
 /*
- * A picotls crypto backend on Zig's std.crypto.
- *
- * picotls's algorithm structs contain C bitfields, which Zig can't express,
- * so they are defined here; every primitive is a call into primitives.zig.
- * This file only adapts picotls's calling conventions (nonce construction,
- * context lifetimes, key-share layout) and implements no cryptography.
+ * picotls crypto backend on Zig's std.crypto. The algorithm objects are defined
+ * in C because picotls's structs contain bitfields, which Zig can't express.
+ * The primitives are in primitives.zig.
  */
 #include <tx/picotls_backend.h>
 
@@ -60,8 +57,8 @@ static void aes_ecb_dispose(ptls_cipher_context_t *_ctx) {
   ptls_clear_memory(&ctx->st, sizeof(ctx->st));
 }
 
-/* ECB takes no IV, but ngtcp2's picotls adapter calls ptls_cipher_init on
-   ECB contexts, as picotls's OpenSSL backend allows. */
+/* ECB takes no IV. ngtcp2's picotls adapter calls ptls_cipher_init on ECB
+   contexts anyway, which picotls's OpenSSL backend accepts. */
 static void aes_ecb_init(ptls_cipher_context_t *ctx, const void *iv) { (void)ctx, (void)iv; }
 
 static void aes_ecb_transform(ptls_cipher_context_t *_ctx, void *out, const void *in, size_t len) {
@@ -174,9 +171,8 @@ static void aead_set_iv(ptls_aead_context_t *_ctx, const void *iv) {
 }
 
 /*
- * Gather the input vectors into `output`, then seal in place. The nonce is
- * the static IV XORed with the record sequence number (ptls_aead__build_iv),
- * exactly as picotls's other backends do.
+ * Gathers the input vectors into `output` and seals in place. The nonce is the
+ * static IV XORed with the record sequence number.
  */
 static void aead_encrypt_v(ptls_aead_context_t *_ctx, void *_output, ptls_iovec_t *input,
                            size_t incnt, uint64_t seq, const void *aad, size_t aadlen) {
@@ -305,11 +301,12 @@ ptls_cipher_suite_t tx_chacha20poly1305sha256 = {
 /* --- Key exchange ------------------------------------------------------------ */
 
 /*
- * One context type serves both groups. For X25519MLKEM768 the client's key
- * share is the ML-KEM-768 public key followed by the X25519 public key, the
- * server's is the ML-KEM ciphertext followed by its X25519 public key, and
- * the shared secret is the ML-KEM secret followed by the X25519 secret
- * (draft-ietf-tls-ecdhe-mlkem: ML-KEM comes first for X25519MLKEM768).
+ * Used for X25519 and X25519MLKEM768. X25519MLKEM768 (draft-ietf-tls-ecdhe-mlkem)
+ * puts ML-KEM first in each value:
+ *
+ *   client key share  ML-KEM-768 public key || X25519 public key
+ *   server key share  ML-KEM-768 ciphertext || X25519 public key
+ *   shared secret     ML-KEM-768 secret || X25519 secret
  */
 struct tx_kx_ctx {
   ptls_key_exchange_context_t super;
@@ -397,7 +394,7 @@ static int kx_create(ptls_key_exchange_algorithm_t *algo, ptls_key_exchange_cont
   return 0;
 }
 
-/* Server side: answer the client's key share in one step. */
+/* Server side. Computes the server's key share and the shared secret from the client's share. */
 static int kx_exchange(ptls_key_exchange_algorithm_t *algo, ptls_iovec_t *pubkey,
                        ptls_iovec_t *secret, ptls_iovec_t peerkey) {
   int hybrid = algo->id == PTLS_GROUP_X25519MLKEM768;
