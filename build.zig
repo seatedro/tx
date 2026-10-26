@@ -60,9 +60,16 @@ pub fn build(b: *std.Build) void {
     });
     addTestRuns(b, term_tests, test_step, test_network_step);
 
+    const wake = b.createModule(.{
+        .root_source_file = b.path("src/wake.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
     const session_tests = b.addTest(.{
         .name = "session-test",
-        .root_module = sessionModule(b, target, optimize, termModule(b, target, optimize, ghostty_vt)),
+        .root_module = sessionModule(b, target, optimize, termModule(b, target, optimize, ghostty_vt), wake),
     });
     addTestRuns(b, session_tests, test_step, test_network_step);
 
@@ -77,8 +84,8 @@ pub fn build(b: *std.Build) void {
     const term = termModule(b, target, optimize, ghostty_vt);
     const transport = transportModule(b, target, optimize, transport_libs);
     const proto = protoModule(b, target, optimize);
-    const session = sessionModule(b, target, optimize, term);
-    const client = clientModule(b, target, optimize, .{ .xev = xev, .transport = transport, .proto = proto });
+    const session = sessionModule(b, target, optimize, term, wake);
+    const client = clientModule(b, target, optimize, .{ .xev = xev, .transport = transport, .proto = proto, .wake = wake });
     const server = serverModule(b, target, optimize, .{
         .xev = xev,
         .transport = transport,
@@ -89,7 +96,7 @@ pub fn build(b: *std.Build) void {
 
     const client_tests = b.addTest(.{
         .name = "client-test",
-        .root_module = clientModule(b, target, optimize, .{ .xev = xev, .transport = transport, .proto = proto }),
+        .root_module = clientModule(b, target, optimize, .{ .xev = xev, .transport = transport, .proto = proto, .wake = wake }),
     });
     addTestRuns(b, client_tests, test_step, test_network_step);
 
@@ -160,6 +167,7 @@ const ClientDeps = struct {
     xev: *std.Build.Module,
     transport: *std.Build.Module,
     proto: *std.Build.Module,
+    wake: *std.Build.Module,
 };
 
 fn protoModule(
@@ -189,6 +197,7 @@ fn clientModule(
     mod.addImport("xev", deps.xev);
     mod.addImport("transport", deps.transport);
     mod.addImport("proto", deps.proto);
+    mod.addImport("wake", deps.wake);
     return mod;
 }
 
@@ -197,6 +206,7 @@ fn sessionModule(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     term: *std.Build.Module,
+    wake: *std.Build.Module,
 ) *std.Build.Module {
     const mod = b.createModule(.{
         .root_source_file = b.path("src/session/root.zig"),
@@ -205,6 +215,7 @@ fn sessionModule(
         .link_libc = true,
     });
     mod.addImport("term", term);
+    mod.addImport("wake", wake);
     return mod;
 }
 

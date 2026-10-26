@@ -3,6 +3,7 @@
 //! the user's terminal: the client uses the slave, and the test types into
 //! and reads from the master.
 const std = @import("std");
+const builtin = @import("builtin");
 const testing = std.testing;
 const Io = std.Io;
 const posix = std.posix;
@@ -123,7 +124,9 @@ const TestPty = struct {
         const slave = c.open(name[0..len :0], .{ .ACCMODE = .RDWR, .NOCTTY = true });
         if (slave == -1) return error.OpenPtyFailed;
         var ws: posix.winsize = .{ .row = 24, .col = 80, .xpixel = 0, .ypixel = 0 };
-        _ = ioctl(master, c.T.IOCSWINSZ, @intFromPtr(&ws));
+        // std.c has no TIOCSWINSZ for macOS.
+        const tiocswinsz: c_ulong = if (builtin.os.tag.isDarwin()) 0x80087467 else c.T.IOCSWINSZ;
+        _ = ioctl(master, tiocswinsz, @intFromPtr(&ws));
         return .{ .master = master, .slave = slave };
     }
 
@@ -296,6 +299,7 @@ const RawClient = struct {
     decoder: proto.Decoder,
     hello: proto.Hello,
     attached: ?u64 = null,
+    output: std.ArrayList(u8) = .empty,
 
     fn init(rc: *RawClient, server: Io.net.IpAddress, pinned: [32]u8, hello: proto.Hello) !void {
         rc.* = .{
@@ -318,15 +322,17 @@ const RawClient = struct {
         rc.loop.run(.until_done) catch {};
         rc.endpoint.deinit();
         rc.decoder.deinit();
+        rc.output.deinit(gpa);
         rc.tls.deinit();
         rc.loop.deinit();
     }
 
     fn send(stream: *transport.endpoint.Stream, message: proto.Message) void {
-        var buf: [256]u8 = undefined;
-        var w: Io.Writer = .fixed(&buf);
+        const buf = gpa.alloc(u8, proto.encodedLen(message)) catch @panic("OOM");
+        defer gpa.free(buf);
+        var w: Io.Writer = .fixed(buf);
         proto.encode(&w, message) catch unreachable;
-        stream.write(w.buffered()) catch @panic("OOM");
+        stream.write(buf) catch @panic("OOM");
     }
 
     fn onConnected(ctx: ?*anyopaque, conn: *transport.endpoint.Conn) void {
@@ -343,6 +349,7 @@ const RawClient = struct {
         rc.decoder.feed(bytes);
         while (rc.decoder.next() catch null) |message| switch (message) {
             .attached => |m| rc.attached = m.session_id,
+            .output => |m| rc.output.appendSlice(gpa, m.bytes) catch @panic("OOM"),
             else => {},
         };
     }
@@ -355,6 +362,15 @@ const RawClient = struct {
             testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
         }
         return rc.attached.?;
+    }
+
+    fn waitOutput(rc: *RawClient, needle: []const u8) !void {
+        const deadline = nowMs() + timeout_ms;
+        while (std.mem.indexOf(u8, rc.output.items, needle) == null) {
+            if (nowMs() > deadline) return error.Timeout;
+            try rc.loop.run(.no_wait);
+            testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+        }
     }
 };
 
@@ -404,4 +420,68 @@ test "a server bounds the terminal size a client sends" {
         try testing.expectEqual(want_cols, got_cols);
         try testing.expectEqual(want_rows, got_rows);
     }
+}
+
+fn testEnviron() !std.process.Environ.Map {
+    var environ: std.process.Environ.Map = .init(gpa);
+    errdefer environ.deinit();
+    try environ.put("PATH", testing.environ.getPosix("PATH") orelse "/usr/bin:/bin");
+    return environ;
+}
+
+test "input larger than the terminal's input queue reaches the program" {
+    transport.crypto.init(testing.io);
+    var environ = try testEnviron();
+    defer environ.deinit();
+    var st: ServerThread = undefined;
+    try st.init(.{
+        .listen = try .parseIp4("127.0.0.1", 0),
+        .identity = Ed25519.KeyPair.generate(testing.io),
+        .environ = &environ,
+        .argv = &.{ "/bin/sh", "-c", "stty raw -echo; printf 'ready\\r\\n'; head -c 262144 | wc -c" },
+    });
+    defer st.deinit();
+
+    var rc: RawClient = undefined;
+    try rc.init(st.server.address(), st.server.options.identity.public_key.toBytes(), .{
+        .revision = proto.revision,
+        .term = "xterm-256color",
+        .cols = 80,
+        .rows = 24,
+    });
+    defer rc.deinit();
+    _ = try rc.waitAttached();
+    try rc.waitOutput("ready");
+    const input = try gpa.alloc(u8, 262144);
+    defer gpa.free(input);
+    @memset(input, 'x');
+    RawClient.send(rc.stream.?, .{ .input = .{ .bytes = input } });
+    try rc.waitOutput("262144");
+}
+
+test "stopping the server kills a program that ignores SIGHUP" {
+    transport.crypto.init(testing.io);
+    var environ = try testEnviron();
+    defer environ.deinit();
+    var st: ServerThread = undefined;
+    try st.init(.{
+        .listen = try .parseIp4("127.0.0.1", 0),
+        .identity = Ed25519.KeyPair.generate(testing.io),
+        .environ = &environ,
+        .argv = &.{ "/bin/sh", "-c", "trap '' HUP; printf 'ready\\r\\n'; while :; do sleep 1; done" },
+    });
+
+    var rc: RawClient = undefined;
+    try rc.init(st.server.address(), st.server.options.identity.public_key.toBytes(), .{
+        .revision = proto.revision,
+        .term = "xterm-256color",
+        .cols = 80,
+        .rows = 24,
+    });
+    defer rc.deinit();
+    _ = try rc.waitAttached();
+    try rc.waitOutput("ready");
+    const start = nowMs();
+    st.deinit();
+    try testing.expect(nowMs() - start < 5000);
 }

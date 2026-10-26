@@ -67,12 +67,8 @@ fn boundedSize(cols: u16, rows: u16, cell: ?term.log.Resize.CellSize) ?term.log.
     return .{ .cols = @min(cols, max_cols), .rows = @min(rows, max_rows), .cell_size_px = cell };
 }
 
-/// How long to wait before retrying input the pty didn't take, or reaping a
-/// program whose terminal closed.
-const retry_ms = 5;
-
-/// How long `Server.stop` gives a program to exit after SIGHUP before it
-/// closes the terminal.
+/// How long `Server.stop` gives a program to exit after SIGHUP. Programs
+/// still running then are killed by `Server.deinit`.
 const stop_grace_ms = 1000;
 
 pub const Server = struct {
@@ -117,8 +113,9 @@ pub const Server = struct {
         return self.endpoint.local;
     }
 
-    /// Closes every connection and hangs up every session. Run the loop
-    /// until it has no active completions, then call `deinit`.
+    /// Closes every connection and sends every session's program SIGHUP.
+    /// Run the loop until it has no active completions, which takes at most
+    /// `stop_grace_ms`, then call `deinit`. It kills programs still running.
     pub fn stop(self: *Server) void {
         self.endpoint.stop();
         for (self.sessions.values()) |s| s.stop();
@@ -191,22 +188,26 @@ pub const Server = struct {
 
         const s = try self.gpa.create(Session);
         errdefer self.gpa.destroy(s);
-        s.* = .{
-            .server = self,
-            .id = self.next_id,
-            .host = try Host.create(self.gpa, self.io, .{
-                .argv = self.options.argv,
-                .program = self.options.program,
-                .environ = &environ,
-                .cwd = self.options.cwd,
-                .size = hello.size,
-            }),
-            .retry = try .init(),
-        };
+        var wake: xev.Async = try .init();
+        errdefer wake.deinit();
+        var grace: xev.Timer = try .init();
+        errdefer grace.deinit();
+        // The host's thread can notify as soon as it starts, so `wake` is
+        // set up first.
+        s.* = .{ .server = self, .id = self.next_id, .host = undefined, .wake = wake, .grace = grace };
+        s.host = try Host.create(self.gpa, self.io, .{
+            .argv = self.options.argv,
+            .program = self.options.program,
+            .environ = &environ,
+            .cwd = self.options.cwd,
+            .size = hello.size,
+            .notify = Session.onHostNotify,
+            .context = s,
+        });
         errdefer s.host.destroy();
         try self.sessions.put(self.gpa, s.id, s);
         self.next_id += 1;
-        s.poll();
+        s.wake.wait(self.loop, &s.wake_c, Session, s, Session.onWake);
         return s;
     }
 };
@@ -321,22 +322,19 @@ const Session = struct {
     client: ?*Client = null,
     /// The next log seq to send to `client`.
     next_seq: u64 = 0,
-    /// Reading stopped because the client's stream holds `high_water`
-    /// bytes.
+    /// Output processing stopped because the client's stream holds
+    /// `high_water` bytes. The host's thread stops reading the pty once its
+    /// queue fills.
     paused: bool = false,
-    polling: bool = false,
-    eof: bool = false,
-    stopping: bool = false,
-    /// Removed from `Server.sessions` after the program exited.
-    ended: bool = false,
-    poll_c: xev.Completion = .{},
-    retry: xev.Timer,
-    retry_c: xev.Completion = .{},
-    retrying: bool = false,
+    /// Notified by the host's thread.
+    wake: xev.Async,
+    wake_c: xev.Completion = .{},
+    grace: xev.Timer,
     grace_c: xev.Completion = .{},
-    in_grace: bool = false,
-    cancel_c: xev.Completion = .{},
-    buf: [16 * 1024]u8 = undefined,
+    /// `Server.stop` was called and the grace period is over.
+    grace_over: bool = false,
+    /// The program exited and the session left `Server.sessions`.
+    ended: bool = false,
 
     fn attach(s: *Session, client: *Client) void {
         s.client = client;
@@ -353,8 +351,7 @@ const Session = struct {
     }
 
     fn input(s: *Session, bytes: []const u8) void {
-        s.host.sendInput(bytes) catch return log.warn("session {d}: input dropped", .{s.id});
-        if (s.host.wantsWrite()) s.retryLater();
+        s.host.sendInput(bytes) catch log.warn("session {d}: input dropped", .{s.id});
     }
 
     fn resize(s: *Session, size: term.log.Resize) void {
@@ -379,81 +376,41 @@ const Session = struct {
         if (stream.buffered() > high_water) s.paused = true;
     }
 
-    fn poll(s: *Session) void {
-        if (s.polling or s.eof or s.stopping) return;
-        s.polling = true;
-        const stream: xev.Stream = .initFd(s.host.fd());
-        stream.poll(s.server.loop, &s.poll_c, .read, Session, s, onReadable);
-    }
-
     fn resume_(s: *Session) void {
         if (!s.paused) return;
         s.paused = false;
-        s.poll();
+        s.process();
     }
 
-    fn onReadable(s_: ?*Session, _: *xev.Loop, _: *xev.Completion, _: xev.Stream, result: xev.PollError!xev.PollEvent) xev.CallbackAction {
+    fn process(s: *Session) void {
+        if (s.paused or s.ended) return;
+        s.host.processOutput() catch |err| log.warn("session {d}: output dropped: {t}", .{ s.id, err });
+        s.pump();
+        if (s.host.finished) s.reap();
+    }
+
+    /// Runs on the host's thread.
+    fn onHostNotify(context: ?*anyopaque) void {
+        const s: *Session = @ptrCast(@alignCast(context.?));
+        s.wake.notify() catch |err| log.warn("session {d}: wakeup failed: {t}", .{ s.id, err });
+    }
+
+    fn onWake(s_: ?*Session, _: *xev.Loop, _: *xev.Completion, result: xev.Async.WaitError!void) xev.CallbackAction {
         const s = s_.?;
-        s.polling = false;
-        if (s.stopping) {
+        result catch |err| log.warn("session {d}: wakeup failed: {t}", .{ s.id, err });
+        if (!s.grace_over) s.process();
+        if (s.ended or s.grace_over) {
             s.freeIfEnded();
             return .disarm;
         }
-        _ = result catch |err| log.warn("session {d}: poll failed: {t}", .{ s.id, err });
-        while (true) {
-            const n = s.host.readOutput(&s.buf) catch |err| switch (err) {
-                error.WouldBlock => break,
-                else => {
-                    log.warn("session {d}: read failed: {t}", .{ s.id, err });
-                    s.eof = true;
-                    break;
-                },
-            };
-            if (n == 0) {
-                s.eof = true;
-                break;
-            }
-        }
-        s.host.flushInput();
-        s.pump();
-        if (s.eof) {
-            s.reap();
-            return .disarm;
-        }
-        if (s.paused) return .disarm;
-        s.polling = true;
         return .rearm;
     }
 
-    fn retryLater(s: *Session) void {
-        if (s.retrying or s.stopping) return;
-        s.retrying = true;
-        s.retry.run(s.server.loop, &s.retry_c, retry_ms, Session, s, onRetry);
-    }
-
-    fn onRetry(s_: ?*Session, _: *xev.Loop, _: *xev.Completion, _: xev.Timer.RunError!void) xev.CallbackAction {
-        const s = s_.?;
-        s.retrying = false;
-        if (s.stopping) {
-            s.freeIfEnded();
-            return .disarm;
-        }
-        s.host.flushInput();
-        if (s.eof) {
-            s.reap();
-        } else if (s.host.wantsWrite()) {
-            s.retryLater();
-        }
-        return .disarm;
-    }
-
-    /// The terminal closed. The program has exited, or is about to.
     fn reap(s: *Session) void {
-        const waited = s.host.pty.tryWait() catch |err| {
+        const t = s.host.reap() catch |err| {
             log.warn("session {d}: wait failed: {t}", .{ s.id, err });
             return s.end(.{ .status = 255 });
         };
-        const t = waited orelse return s.retryLater();
         s.end(switch (t) {
             .exited => |code| .{ .status = code },
             .signal => |sig| .{ .status = 128 +| @as(u8, @truncate(@backingInt(sig))), .signal = @tagName(sig) },
@@ -461,6 +418,7 @@ const Session = struct {
         });
     }
 
+    /// The `wake` callback frees the session.
     fn end(s: *Session, exit: proto.Exit) void {
         if (s.client) |client| {
             client.send(.{ .exit = exit });
@@ -469,31 +427,23 @@ const Session = struct {
         }
         s.client = null;
         _ = s.server.sessions.swapRemove(s.id);
-        s.stopping = true;
         s.ended = true;
-        s.freeIfEnded();
+        s.wake.notify() catch {};
     }
 
-    /// Sends the program SIGHUP. The pending poll then completes with end of
-    /// file once the program and its jobs close the terminal. libxev reports
-    /// a cancelled io_uring poll as an unexpected error, so cancelling waits
-    /// for a grace period.
+    /// Sends the program SIGHUP. A program that exits within the grace
+    /// period ends its session as usual.
     fn stop(s: *Session) void {
-        s.stopping = true;
-        if (!s.polling) return;
+        if (s.ended) return;
         s.host.pty.kill(.HUP) catch {};
-        s.in_grace = true;
-        s.retry.run(s.server.loop, &s.grace_c, stop_grace_ms, Session, s, onGraceOver);
+        s.grace.run(s.server.loop, &s.grace_c, stop_grace_ms, Session, s, onGraceOver);
     }
 
-    fn onGraceOver(s_: ?*Session, loop: *xev.Loop, _: *xev.Completion, _: xev.Timer.RunError!void) xev.CallbackAction {
+    fn onGraceOver(s_: ?*Session, _: *xev.Loop, _: *xev.Completion, _: xev.Timer.RunError!void) xev.CallbackAction {
         const s = s_.?;
-        s.in_grace = false;
-        if (s.polling) {
-            s.host.pty.hangup();
-            s.cancel_c = .{ .op = .{ .cancel = .{ .c = &s.poll_c } } };
-            loop.add(&s.cancel_c);
-        }
+        s.grace_over = true;
+        // Ends the `wake` wait, so the loop can finish.
+        s.wake.notify() catch {};
         s.freeIfEnded();
         return .disarm;
     }
@@ -501,12 +451,13 @@ const Session = struct {
     /// Frees an ended session once no completion holds a pointer to it.
     /// Sessions still in `Server.sessions` are freed by `Server.deinit`.
     fn freeIfEnded(s: *Session) void {
-        if (s.ended and !s.polling and !s.retrying and !s.in_grace) s.destroy();
+        if (s.ended and s.wake_c.state() == .dead and s.grace_c.state() == .dead) s.destroy();
     }
 
     fn destroy(s: *Session) void {
         s.host.destroy();
-        s.retry.deinit();
+        s.wake.deinit();
+        s.grace.deinit();
         s.server.gpa.destroy(s);
     }
 };
