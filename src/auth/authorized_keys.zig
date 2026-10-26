@@ -24,7 +24,7 @@ const max_file_len = 1 << 20;
 
 /// Looks `key` up in the first of `paths` that exists. sshd uses the first
 /// line that lists a key, so later lines don't override it.
-pub fn check(io: Io, gpa: Allocator, paths: []const []const u8, key: ssh.Key) !Match {
+pub fn check(io: Io, gpa: Allocator, paths: []const []const u8, key: *const ssh.PublicKey) !Match {
     for (paths) |path| {
         const contents = Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(max_file_len)) catch |err| switch (err) {
             error.FileNotFound => continue,
@@ -36,7 +36,7 @@ pub fn check(io: Io, gpa: Allocator, paths: []const []const u8, key: ssh.Key) !M
     return .absent;
 }
 
-pub fn find(contents: []const u8, key: ssh.Key) Match {
+pub fn find(contents: []const u8, key: *const ssh.PublicKey) Match {
     var lines = std.mem.splitScalar(u8, contents, '\n');
     while (lines.next()) |raw| {
         const line = std.mem.trim(u8, raw, " \t\r");
@@ -51,10 +51,10 @@ pub fn find(contents: []const u8, key: ssh.Key) Match {
         rest = std.mem.trimStart(u8, rest[key_type.len..], " \t");
         const text = firstField(rest);
 
-        // Lines that don't parse, or hold other key types, list no
-        // Ed25519 key.
-        const listed = ssh.parseKeyText(key_type, text) catch continue;
-        if (!std.mem.eql(u8, &listed, &key)) continue;
+        // Lines that don't parse, or hold types tx doesn't verify, list
+        // no key it can match.
+        const listed = ssh.parsePublicKeyText(key_type, text) catch continue;
+        if (!listed.eql(key)) continue;
         return if (has_options) .restricted else .allowed;
     }
     return .absent;
@@ -107,35 +107,42 @@ const testing = std.testing;
 const key_text = "AAAAC3NzaC1lZDI1NTE5AAAAICwLzobQsiT0GtH1xeKcMJ3KbPb38YiHHQef9Jr2O9+G";
 
 test "a listed key is allowed" {
-    const key = try ssh.parseKeyText(ssh.ed25519, key_text);
-    try testing.expectEqual(.allowed, find("ssh-ed25519 " ++ key_text ++ " me@laptop\n", key));
-    try testing.expectEqual(.allowed, find("# keys\n\n  ssh-ed25519\t" ++ key_text ++ "\r\n", key));
-    try testing.expectEqual(.allowed, find("ssh-ed25519 " ++ key_text, key));
+    const key = try ssh.parsePublicKeyText(ssh.ed25519, key_text);
+    try testing.expectEqual(.allowed, find("ssh-ed25519 " ++ key_text ++ " me@laptop\n", &key));
+    try testing.expectEqual(.allowed, find("# keys\n\n  ssh-ed25519\t" ++ key_text ++ "\r\n", &key));
+    try testing.expectEqual(.allowed, find("ssh-ed25519 " ++ key_text, &key));
 }
 
 test "an unlisted key is absent" {
-    const key = try ssh.parseKeyText(ssh.ed25519, key_text);
-    var other = key;
-    other[0] ^= 1;
-    try testing.expectEqual(.absent, find("ssh-ed25519 " ++ key_text ++ "\n", other));
-    try testing.expectEqual(.absent, find("# ssh-ed25519 " ++ key_text ++ "\n", key));
-    try testing.expectEqual(.absent, find("ssh-ed25519 garbage\nssh-rsa " ++ key_text ++ "\n", key));
+    const key = try ssh.parsePublicKeyText(ssh.ed25519, key_text);
+    var other_bytes = key.ed25519Key();
+    other_bytes[0] ^= 1;
+    const other: ssh.PublicKey = .fromEd25519(other_bytes);
+    try testing.expectEqual(.absent, find("ssh-ed25519 " ++ key_text ++ "\n", &other));
+    try testing.expectEqual(.absent, find("# ssh-ed25519 " ++ key_text ++ "\n", &key));
+    try testing.expectEqual(.absent, find("ssh-ed25519 garbage\nssh-rsa " ++ key_text ++ "\n", &key));
+}
+
+test "an RSA key is matched by its whole blob" {
+    const key = try ssh.parsePublicKeyText(ssh.rsa, ssh.test_rsa_text);
+    try testing.expectEqual(.allowed, find("ssh-rsa " ++ ssh.test_rsa_text ++ " old laptop\n", &key));
+    try testing.expectEqual(.absent, find("ssh-ed25519 " ++ key_text ++ "\n", &key));
 }
 
 test "a key whose first line has options is restricted" {
-    const key = try ssh.parseKeyText(ssh.ed25519, key_text);
-    try testing.expectEqual(.restricted, find("restrict ssh-ed25519 " ++ key_text ++ "\n", key));
-    try testing.expectEqual(.restricted, find("from=\"10.0.0.0/8,!10.1.0.0/16\",no-pty ssh-ed25519 " ++ key_text ++ "\n", key));
-    try testing.expectEqual(.restricted, find("command=\"echo \\\"a b\\\"\" ssh-ed25519 " ++ key_text ++ "\n", key));
+    const key = try ssh.parsePublicKeyText(ssh.ed25519, key_text);
+    try testing.expectEqual(.restricted, find("restrict ssh-ed25519 " ++ key_text ++ "\n", &key));
+    try testing.expectEqual(.restricted, find("from=\"10.0.0.0/8,!10.1.0.0/16\",no-pty ssh-ed25519 " ++ key_text ++ "\n", &key));
+    try testing.expectEqual(.restricted, find("command=\"echo \\\"a b\\\"\" ssh-ed25519 " ++ key_text ++ "\n", &key));
 
     // A later line without options doesn't lift the restriction.
-    try testing.expectEqual(.restricted, find("no-pty ssh-ed25519 " ++ key_text ++ "\nssh-ed25519 " ++ key_text ++ "\n", key));
+    try testing.expectEqual(.restricted, find("no-pty ssh-ed25519 " ++ key_text ++ "\nssh-ed25519 " ++ key_text ++ "\n", &key));
 }
 
 test "the first existing file is used" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const key = try ssh.parseKeyText(ssh.ed25519, key_text);
+    const key = try ssh.parsePublicKeyText(ssh.ed25519, key_text);
 
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "b", .data = "ssh-ed25519 " ++ key_text ++ "\n" });
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "c", .data = "" });
@@ -150,7 +157,7 @@ test "the first existing file is used" {
     const c = try std.fs.path.join(testing.allocator, &.{ dir, "c" });
     defer testing.allocator.free(c);
 
-    try testing.expectEqual(.allowed, try check(testing.io, testing.allocator, &.{ a, b }, key));
-    try testing.expectEqual(.absent, try check(testing.io, testing.allocator, &.{ c, b }, key));
-    try testing.expectEqual(.absent, try check(testing.io, testing.allocator, &.{a}, key));
+    try testing.expectEqual(.allowed, try check(testing.io, testing.allocator, &.{ a, b }, &key));
+    try testing.expectEqual(.absent, try check(testing.io, testing.allocator, &.{ c, b }, &key));
+    try testing.expectEqual(.absent, try check(testing.io, testing.allocator, &.{a}, &key));
 }
