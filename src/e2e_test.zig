@@ -488,6 +488,10 @@ const RawClient = struct {
     output: std.ArrayList(u8) = .empty,
 
     fn init(rc: *RawClient, st: *const ServerThread, key: Ed25519.KeyPair, hello: proto.Hello) !void {
+        return rc.initTo(st, st.server.address(), key, hello);
+    }
+
+    fn initTo(rc: *RawClient, st: *const ServerThread, server: Io.net.IpAddress, key: Ed25519.KeyPair, hello: proto.Hello) !void {
         rc.* = .{
             .loop = try .init(.{}),
             .tls = try .init(.{ .keys = &.{st.server.options.identity.public_key.toBytes()} }),
@@ -497,11 +501,14 @@ const RawClient = struct {
             .key = key,
         };
         try rc.endpoint.init(gpa, testing.io, &rc.loop, .{
-            .local = try .parseIp4("127.0.0.1", 0),
+            .local = switch (server) {
+                .ip4 => try .parseIp4("0.0.0.0", 0),
+                .ip6 => try .parseIp6("::", 0),
+            },
             .role = .{ .client = &rc.tls },
             .handler = .{ .ctx = rc, .connected = onConnected, .data = onData },
         });
-        _ = try rc.endpoint.connect(st.server.address());
+        _ = try rc.endpoint.connect(server);
     }
 
     fn deinit(rc: *RawClient) void {
@@ -599,6 +606,33 @@ const RawClient = struct {
         }
     }
 };
+
+test "a server on a wildcard address answers on each address it binds" {
+    transport.crypto.init(testing.io);
+    var environ: std.process.Environ.Map = .init(gpa);
+    defer environ.deinit();
+    var login: Login = undefined;
+    try login.init(null);
+    defer login.deinit();
+    var options = try login.serverOptions(&environ, &.{ "/bin/sh", "-c", "sleep 10" });
+    options.listen = try .parseIp6("::", 0);
+    var st: ServerThread = undefined;
+    try st.init(options);
+    defer st.deinit();
+
+    // Read before the first rescan can change the list.
+    var bound: std.ArrayList(Io.net.IpAddress) = .empty;
+    defer bound.deinit(gpa);
+    for (st.server.endpoints.items) |e| try bound.append(gpa, e.local);
+    try testing.expect(bound.items.len > 0);
+
+    for (bound.items) |address| {
+        var rc: RawClient = undefined;
+        try rc.initTo(&st, address, login.key, .{ .revision = proto.revision, .term = "xterm-256color", .cols = 80, .rows = 24 });
+        defer rc.deinit();
+        _ = try rc.waitAttached();
+    }
+}
 
 /// The size of a session's primary terminal, read on the server thread.
 fn primarySize(st: *ServerThread, session_id: u64) !struct { u16, u16 } {

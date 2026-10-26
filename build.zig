@@ -103,6 +103,19 @@ pub fn build(b: *std.Build) void {
         .term = term,
     });
 
+    const server_tests = b.addTest(.{
+        .name = "server-test",
+        .root_module = serverModule(b, target, optimize, .{
+            .xev = xev,
+            .transport = transport,
+            .proto = proto,
+            .auth = auth,
+            .session = session,
+            .term = term,
+        }),
+    });
+    addTestRuns(b, server_tests, test_step, test_network_step);
+
     const client_tests = b.addTest(.{
         .name = "client-test",
         .root_module = clientModule(b, target, optimize, .{ .xev = xev, .transport = transport, .proto = proto, .auth = auth, .wake = wake }),

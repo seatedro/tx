@@ -90,7 +90,7 @@ pub fn main(init: std.process.Init) !u8 {
     });
     defer server.deinit();
 
-    std.log.info("listening on {f} for {s}, host key {s}", .{ server.address(), user, auth.Fingerprint.init(identity.public_key.toBytes()).slice() });
+    std.log.info("serving {s}, host key {s}", .{ user, auth.Fingerprint.init(identity.public_key.toBytes()).slice() });
     try loop.run(.until_done);
     return 0;
 }

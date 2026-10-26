@@ -10,6 +10,9 @@
 //! A connection that closes leaves its session running, detached. A
 //! session ends when its program exits; the attached client gets `Exit`.
 //!
+//! Listening on a wildcard address binds each address it covers, and
+//! follows addresses as they come and go (see `addresses`).
+//!
 //! Revision 0 replays a session's log from seq 0 on attach, so a session
 //! whose log has been trimmed can't be reattached yet.
 const std = @import("std");
@@ -23,6 +26,7 @@ const proto = @import("proto");
 const session = @import("session");
 const term = @import("term");
 const auth = @import("auth");
+const addresses = @import("addresses.zig");
 
 const Endpoint = transport.endpoint.Endpoint;
 const Conn = transport.endpoint.Conn;
@@ -91,15 +95,36 @@ fn boundedSize(cols: u16, rows: u16, cell: ?term.log.Resize.CellSize) ?term.log.
 /// still running then are killed by `Server.deinit`.
 const stop_grace_ms = 1000;
 
+/// How often a server listening on a wildcard address looks for addresses
+/// that came or went.
+const rescan_ms = 5000;
+
 pub const Server = struct {
     gpa: Allocator,
     io: Io,
     loop: *xev.Loop,
     options: Options,
     tls: transport.quic.Server,
-    endpoint: Endpoint,
+    /// One per address listened on. They don't move.
+    endpoints: std.ArrayList(*Endpoint) = .empty,
+    /// Endpoints whose address went away, freed once stopped.
+    retired: std.ArrayList(*Endpoint) = .empty,
+    /// Set when `Options.listen` is a wildcard address.
+    rescan: ?Rescan = null,
+    stopping: bool = false,
     sessions: std.AutoArrayHashMapUnmanaged(u64, *Session) = .empty,
     next_id: u64 = 1,
+
+    const Rescan = struct {
+        /// `Options.listen`, with the port the first bind got if it asked
+        /// for 0.
+        wildcard: IpAddress,
+        /// Loopback addresses for the host name, found once at startup.
+        host_loopback: []IpAddress,
+        timer: xev.Timer,
+        c: xev.Completion = .{},
+        cancel_c: xev.Completion = .{},
+    };
 
     /// The server must not move while the loop runs.
     pub fn init(self: *Server, gpa: Allocator, io: Io, loop: *xev.Loop, options: Options) !void {
@@ -109,13 +134,66 @@ pub const Server = struct {
             .loop = loop,
             .options = options,
             .tls = try .init(options.identity),
-            .endpoint = undefined,
         };
-        errdefer self.tls.deinit();
-        try self.endpoint.init(gpa, io, loop, .{
-            .local = options.listen,
+        errdefer self.deinit();
+
+        if (!addresses.isWildcard(options.listen)) {
+            _ = try self.listen(options.listen);
+            return;
+        }
+
+        // A wildcard: each address it covers, and again as they change.
+        self.rescan = .{
+            .wildcard = options.listen,
+            .host_loopback = try addresses.hostLoopback(gpa, io, options.listen),
+            .timer = try .init(),
+        };
+        try self.listenOnNewAddresses(.initial);
+        if (self.endpoints.items.len == 0) return error.NoAddresses;
+        self.rescan.?.timer.run(loop, &self.rescan.?.c, rescan_ms, Server, self, onRescan);
+    }
+
+    /// The first bound address, with the port the kernel picked.
+    pub fn address(self: *const Server) IpAddress {
+        return self.endpoints.items[0].local;
+    }
+
+    /// Closes every connection and sends every session's program SIGHUP.
+    /// Run the loop until it has no active completions, which takes at most
+    /// `stop_grace_ms`, then call `deinit`. It kills programs still running.
+    pub fn stop(self: *Server) void {
+        self.stopping = true;
+        for (self.endpoints.items) |e| e.stop();
+        if (self.rescan) |*r| if (r.c.state() == .active) {
+            r.cancel_c = .{ .op = .{ .cancel = .{ .c = &r.c } } };
+            self.loop.add(&r.cancel_c);
+        };
+        for (self.sessions.values()) |s| s.stop();
+    }
+
+    pub fn deinit(self: *Server) void {
+        for (self.sessions.values()) |s| s.destroy();
+        self.sessions.deinit(self.gpa);
+        for (self.endpoints.items) |e| self.destroyEndpoint(e);
+        self.endpoints.deinit(self.gpa);
+        for (self.retired.items) |e| self.destroyEndpoint(e);
+        self.retired.deinit(self.gpa);
+        if (self.rescan) |*r| {
+            self.gpa.free(r.host_loopback);
+            r.timer.deinit();
+        }
+        self.tls.deinit();
+        self.* = undefined;
+    }
+
+    /// Binds an endpoint to `local`.
+    fn listen(self: *Server, local: IpAddress) !*Endpoint {
+        const e = try self.gpa.create(Endpoint);
+        errdefer self.gpa.destroy(e);
+        try e.init(self.gpa, self.io, self.loop, .{
+            .local = local,
             .role = .{ .server = &self.tls },
-            .idle_timeout_ns = options.idle_timeout_ns,
+            .idle_timeout_ns = self.options.idle_timeout_ns,
             .handler = .{
                 .ctx = self,
                 .connected = onConnected,
@@ -126,27 +204,86 @@ pub const Server = struct {
                 .closed = onClosed,
             },
         });
+        errdefer e.deinit();
+        try self.endpoints.append(self.gpa, e);
+        return e;
     }
 
-    /// The bound address, with the port the kernel picked.
-    pub fn address(self: *const Server) IpAddress {
-        return self.endpoint.local;
+    fn destroyEndpoint(self: *Server, e: *Endpoint) void {
+        e.deinit();
+        self.gpa.destroy(e);
     }
 
-    /// Closes every connection and sends every session's program SIGHUP.
-    /// Run the loop until it has no active completions, which takes at most
-    /// `stop_grace_ms`, then call `deinit`. It kills programs still running.
-    pub fn stop(self: *Server) void {
-        self.endpoint.stop();
-        for (self.sessions.values()) |s| s.stop();
+    /// Binds the wildcard's addresses that have no endpoint, and stops the
+    /// endpoints of addresses that went away.
+    fn listenOnNewAddresses(self: *Server, when: enum { initial, rescan }) !void {
+        const r = &self.rescan.?;
+        const found = try addresses.interfaces(self.gpa, r.wildcard);
+        defer self.gpa.free(found);
+
+        // Bound endpoints whose address is gone. Their connections can't
+        // reach the server any more.
+        var i: usize = 0;
+        while (i < self.endpoints.items.len) {
+            const e = self.endpoints.items[i];
+            if (contains(found, e.local) or contains(r.host_loopback, e.local)) {
+                i += 1;
+                continue;
+            }
+            log.info("{f} went away", .{e.local});
+            e.stop();
+            try self.retired.append(self.gpa, e);
+            _ = self.endpoints.swapRemove(i);
+        }
+
+        for ([_][]const IpAddress{ found, r.host_loopback }) |list| for (list) |local| {
+            if (self.endpointFor(local) != null) continue;
+
+            // An IPv6 address still being checked for duplicates can't be
+            // bound yet. A later rescan tries again.
+            const e = self.listen(local) catch |err| {
+                if (when == .initial) log.warn("can't listen on {f}: {t}", .{ local, err });
+                continue;
+            };
+            log.info("listening on {f}", .{e.local});
+
+            // A port of 0 lets the first bind pick one. The others use it.
+            if (r.wildcard.getPort() == 0) r.wildcard.setPort(e.local.getPort());
+        };
     }
 
-    pub fn deinit(self: *Server) void {
-        for (self.sessions.values()) |s| s.destroy();
-        self.sessions.deinit(self.gpa);
-        self.endpoint.deinit();
-        self.tls.deinit();
-        self.* = undefined;
+    fn endpointFor(self: *const Server, local: IpAddress) ?*Endpoint {
+        for (self.endpoints.items) |e| if (addresses.eql(e.local, local)) return e;
+        return null;
+    }
+
+    fn contains(list: []const IpAddress, wanted: IpAddress) bool {
+        for (list) |a| if (addresses.eql(a, wanted)) return true;
+        return false;
+    }
+
+    fn onRescan(self_: ?*Server, _: *xev.Loop, _: *xev.Completion, result: xev.Timer.RunError!void) xev.CallbackAction {
+        const self = self_.?;
+        result catch return .disarm;
+        if (self.stopping) return .disarm;
+
+        self.listenOnNewAddresses(.rescan) catch |err| log.warn("looking for addresses failed: {t}", .{err});
+
+        // Retired endpoints are freed once the loop has finished with them.
+        var i: usize = 0;
+        while (i < self.retired.items.len) {
+            const e = self.retired.items[i];
+            if (!e.isStopped()) {
+                i += 1;
+                continue;
+            }
+            self.destroyEndpoint(e);
+            _ = self.retired.swapRemove(i);
+        }
+
+        const r = &self.rescan.?;
+        r.timer.run(self.loop, &r.c, rescan_ms, Server, self, onRescan);
+        return .disarm;
     }
 
     fn fromCtx(ctx: ?*anyopaque) *Server {
@@ -639,3 +776,9 @@ const Session = struct {
         s.server.gpa.destroy(s);
     }
 };
+
+test {
+    _ = addresses;
+    // Analyzes the crypto module, whose exports the linked C code needs.
+    _ = &transport.crypto.init;
+}
