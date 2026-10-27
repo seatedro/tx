@@ -81,6 +81,9 @@ pub const Options = struct {
     /// Null disables `~.`.
     escape_char: ?u8 = '~',
     idle_timeout_ns: u64 = 30 * std.time.ns_per_s,
+    /// How long the first connection waits for an address that doesn't
+    /// answer. Null leaves it to the idle timeout.
+    handshake_timeout_ns: ?u64 = null,
     /// The server answers each keep-alive, so an attached client hears
     /// from it at least this often.
     keep_alive_ns: u64 = 2 * std.time.ns_per_s,
@@ -122,6 +125,8 @@ pub const Outcome = union(enum) {
     /// `~.`, a terminating signal, or the user's terminal going away. The
     /// session keeps running.
     detached: ?u64,
+    /// No handshake completed. The reason is the last attempt's.
+    no_connection: CloseReason,
     /// The connection closed before the session ended.
     disconnected: CloseReason,
     /// The server presented a key that isn't in `Options.host_keys`.
@@ -372,7 +377,7 @@ const Run = struct {
         try r.signals.start(.{ .fd = options.in_fd, .raw_mode = if (r.raw) |*raw| raw else null, .context = r, .callback = onSignal });
         errdefer r.signals.stop();
 
-        r.racer = try r.startRacer(null);
+        r.racer = try r.startRacer(options.handshake_timeout_ns);
     }
 
     /// Starts racing connections to the server's addresses.
@@ -833,7 +838,7 @@ const Run = struct {
         };
 
         if (r.resume_key != null) return r.retry(reason);
-        r.outcome = .{ .disconnected = reason };
+        r.outcome = if (r.racer.winner == null) .{ .no_connection = reason } else .{ .disconnected = reason };
     }
 
     /// Tries to connect again after the delay for the tries so far.

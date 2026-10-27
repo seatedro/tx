@@ -114,7 +114,18 @@ pub const Endpoint = struct {
     pub fn init(self: *Endpoint, gpa: Allocator, io: Io, loop: *xev.Loop, options: Options) !void {
         const udp = try xev.UDP.init(options.local);
         errdefer _ = std.c.close(udp.fd);
-        try udp.bind(options.local);
+
+        // `xev.UDP.bind` sets SO_REUSEPORT and SO_REUSEADDR, which let a
+        // second server bind the same port and take some of the first's
+        // packets. A plain bind fails with `AddressInUse`.
+        var addr: PosixAddress = undefined;
+        const addr_len = Io.Threaded.addressToPosix(&options.local, &addr);
+        if (std.c.bind(udp.fd, &addr.any, addr_len) != 0) return switch (std.posix.errno(-1)) {
+            .ADDRINUSE => error.AddressInUse,
+            .ADDRNOTAVAIL => error.AddressUnavailable,
+            .ACCES => error.AccessDenied,
+            else => |e| std.posix.unexpectedErrno(e),
+        };
         try std.posix.setsockopt(udp.fd, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, &std.mem.toBytes(options.receive_buffer));
 
         // Read back the address to learn the port when `local` asked for 0.
