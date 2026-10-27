@@ -26,6 +26,7 @@ const Wake = @import("wake").Wake;
 const tty = @import("tty.zig");
 const escape = @import("escape.zig");
 const passphrase = @import("passphrase.zig");
+const connect = @import("connect.zig");
 
 const Endpoint = transport.endpoint.Endpoint;
 const Conn = transport.endpoint.Conn;
@@ -35,7 +36,8 @@ const CloseReason = transport.endpoint.CloseReason;
 const log = std.log.scoped(.client);
 
 pub const Options = struct {
-    server: IpAddress,
+    /// The server's addresses, raced as `connect.Racer` does. At least one.
+    servers: []const IpAddress,
     /// The server keys the client accepts.
     host_keys: []const [32]u8,
     /// The account to log in as.
@@ -167,8 +169,8 @@ const Run = struct {
     loop: *xev.Loop,
     options: Options,
     size: tty.Size,
-    tls: transport.quic.Client,
-    endpoint: Endpoint,
+    racer: connect.Racer,
+    /// The winner's connection, once its handshake completes.
     conn: ?*Conn = null,
     /// The terminal's attributes from before the session. Raw mode is
     /// applied once `terminal` is set.
@@ -244,8 +246,7 @@ const Run = struct {
             .loop = loop,
             .options = options,
             .size = terminalSize(options),
-            .tls = try .init(.{ .keys = options.host_keys }),
-            .endpoint = undefined,
+            .racer = undefined,
             .raw = try .save(options.in_fd),
             .decoder = .init(gpa, max_message),
             .escape = .{ .char = options.escape_char },
@@ -253,17 +254,17 @@ const Run = struct {
         };
         errdefer r.wake.deinit();
         errdefer r.decoder.deinit();
-        errdefer r.tls.deinit();
+        r.wake.wait(loop, &r.wake_c, Run, r, onWake);
 
-        // Any local address of the server's family. The kernel picks the
-        // port.
-        const local: IpAddress = switch (options.server) {
-            .ip4 => try .parseIp4("0.0.0.0", 0),
-            .ip6 => try .parseIp6("::", 0),
-        };
-        try r.endpoint.init(gpa, io, loop, .{
-            .local = local,
-            .role = .{ .client = &r.tls },
+        // From the start, so a terminating signal during the login ends it.
+        // Restoring the saved attributes before raw mode turns echo back on
+        // after a passphrase prompt.
+        try r.signals.start(.{ .fd = options.in_fd, .raw_mode = &r.raw, .context = r, .callback = onSignal });
+        errdefer r.signals.stop();
+
+        try r.racer.init(gpa, io, loop, .{
+            .addresses = options.servers,
+            .accept = .{ .keys = options.host_keys },
             .idle_timeout_ns = options.idle_timeout_ns,
             .keep_alive_ns = options.keep_alive_ns,
             .stream_window = stream_window,
@@ -275,13 +276,6 @@ const Run = struct {
                 .closed = onClosed,
             },
         });
-        r.wake.wait(loop, &r.wake_c, Run, r, onWake);
-
-        // From the start, so a terminating signal during the login ends it.
-        // Restoring the saved attributes before raw mode turns echo back on
-        // after a passphrase prompt.
-        try r.signals.start(.{ .fd = options.in_fd, .raw_mode = &r.raw, .context = r, .callback = onSignal });
-        r.conn = try r.endpoint.connect(options.server);
     }
 
     /// Enters raw mode and starts reading and writing the terminal.
@@ -318,16 +312,16 @@ const Run = struct {
         }
         if (r.inbox.signature) |result| if (result) |sig| r.gpa.free(sig) else |_| {};
 
-        // Stop the endpoint, then run the loop until its completions finish.
-        r.endpoint.stop();
+        // Stop the connections, then run the loop until their completions
+        // finish.
+        r.racer.stop();
         // `onWake` disarms once the outcome is set. Cancelling the wait would
         // end it with an ECANCELED that libxev's poll doesn't map.
         if (r.wake_c.state() == .active) r.wake.notify() catch {};
         r.loop.run(.until_done) catch {};
-        r.endpoint.deinit();
+        r.racer.deinit();
         r.wake.deinit();
         r.decoder.deinit();
-        r.tls.deinit();
         r.inbox.input.deinit(r.gpa);
         r.early_input.deinit(r.gpa);
         if (r.terminal) r.raw.restore();
@@ -372,6 +366,7 @@ const Run = struct {
 
     fn onConnected(ctx: ?*anyopaque, conn: *Conn) void {
         const r = fromCtx(ctx);
+        r.conn = conn;
         r.stream = conn.openStream(.bidi) catch return r.finish(.{ .disconnected = .failed });
 
         // Hello and the first probe go together. The server answers both,
@@ -418,7 +413,7 @@ const Run = struct {
         // The transcript as this end sees the connection.
         var transcript: auth.login.Transcript = .{
             .exporter = undefined,
-            .host_key = r.tls.presentedKey().?,
+            .host_key = r.racer.presentedKey().?,
             .user = r.options.user,
             .alpn = transport.quic.alpn,
             .revision = proto.revision,
@@ -612,11 +607,10 @@ const Run = struct {
         }
         if (r.outcome != null) return;
 
-        // A refused key fails the handshake after the server presented it.
-        if (reason == .handshake_failed) if (r.tls.presentedKey()) |key| {
-            for (r.options.host_keys) |k| {
-                if (std.mem.eql(u8, &k, &key)) break;
-            } else return r.finish(.{ .host_key_refused = key });
+        // Every attempt failed. One that met a refused key says more than
+        // the last failure.
+        if (r.conn == null and r.session_id == null) if (r.racer.refusedKey()) |key| {
+            return r.finish(.{ .host_key_refused = key });
         };
         r.outcome = .{ .disconnected = reason };
     }
