@@ -110,10 +110,10 @@ pub const Primary = struct {
     /// terminal's size, to this terminal's state. When the output ends
     /// inside a sequence, they end with its start, so the next record
     /// finishes it.
-    pub fn rebuild(self: *const Primary, w: *std.Io.Writer) RebuildError!void {
+    pub fn rebuild(self: *const Primary, w: *std.Io.Writer, kind: rebuild_pkg.Kind) RebuildError!void {
         // Before the rebuild is written, which would be discarded.
         if (self.stream.continuation.?.broken) return error.Unfinished;
-        try rebuild_pkg.write(w, &self.terminal);
+        try rebuild_pkg.write(w, &self.terminal, kind);
         self.stream.writeContinuation(w) catch |err| switch (err) {
             error.ContinuationUnavailable => return error.Unfinished,
             error.ContinuationDisabled => unreachable,
@@ -188,7 +188,7 @@ test "a rebuild ends inside the sequence the output ends in" {
 
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
-    try primary.rebuild(&out.writer);
+    try primary.rebuild(&out.writer, .attach);
     try testing.expect(std.mem.endsWith(u8, out.written(), "\x1b]2;ti"));
 
     // The rest of the title arrives after the rebuild.
@@ -205,11 +205,11 @@ test "a rebuild inside a sequence too long to keep waits for its end" {
 
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
-    try testing.expectError(error.Unfinished, primary.rebuild(&out.writer));
+    try testing.expectError(error.Unfinished, primary.rebuild(&out.writer, .attach));
 
     try primary.output("\x1b\\");
     out.clearRetainingCapacity();
-    try primary.rebuild(&out.writer);
+    try primary.rebuild(&out.writer, .attach);
     try expectRebuildMatches(primary, out.written());
 }
 

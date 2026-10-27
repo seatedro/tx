@@ -83,6 +83,14 @@ pub const Decoder = struct {
         d.* = undefined;
     }
 
+    /// Drops what was fed and a message received in part, for a new
+    /// stream.
+    pub fn reset(d: *Decoder) void {
+        d.input = &.{};
+        d.pending.clearRetainingCapacity();
+        d.completed.clearRetainingCapacity();
+    }
+
     /// Asserts that `next` returned null or an error since the last feed.
     pub fn feed(d: *Decoder, chunk: []const u8) void {
         std.debug.assert(d.input.len == 0);
@@ -169,7 +177,7 @@ const samples = [_]Message{
     .{ .hello = .{ .revision = messages.revision, .term = "xterm-ghostty", .cols = 80, .rows = 24 } },
     .{ .hello_reply = .{ .revision = 0 } },
     .{ .attach = .{} },
-    .{ .attached = .{ .session_id = 0xfedc_ba98_7654_3210 } },
+    .{ .attached = .{ .session_id = 0xfedc_ba98_7654_3210, .resume_key = "k" } },
     .{ .output = .{ .seq = 0, .bytes = &@as([200]u8, @splat('x')) } },
     .{ .unknown = .{ .type_id = 4000, .body = "\x01\x02\xff\xff" } },
     .{ .unknown = .{ .type_id = 1 << 20, .body = &@as([70]u8, @splat('u')) } },
@@ -178,7 +186,7 @@ const samples = [_]Message{
     .{ .ack = .{ .seq = 1 } },
     .{ .input = .{ .bytes = "\x1b[A" } },
     .{ .resize = .{ .cols = 100, .rows = 30, .cell_width_px = 9, .cell_height_px = 18 } },
-    .{ .unknown = .{ .type_id = messages.Rebuild.type_id + 1, .body = "" } },
+    .{ .unknown = .{ .type_id = messages.Resume.type_id + 1, .body = "" } },
     .{ .detach = .{} },
     .{ .exit = .{ .signal = "HUP" } },
     .{ .@"error" = .{ .code = 1, .message = "bye" } },
