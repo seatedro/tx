@@ -137,6 +137,10 @@ fn systemd(gpa: Allocator, io: Io, environ: *const Environ.Map, options: Options
 
     if (serving(options.listen)) return .serving;
 
+    // After five failed starts in ten seconds, systemd refuses to start the
+    // service until its failures are reset.
+    _ = try succeeds(gpa, io, &.{ "systemctl", "--user", "reset-failed", name ++ ".service" }, .quiet);
+
     // `start` leaves a running server alone, and it may have another port.
     const verb = if (changed) "restart" else "start";
     if (!try succeeds(gpa, io, &.{ "systemctl", "--user", verb, name ++ ".service" }, .show)) {
