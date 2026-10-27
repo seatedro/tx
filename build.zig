@@ -150,17 +150,18 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(b.addExecutable(.{ .name = "tx", .root_module = tx }));
     addTestRuns(b, b.addTest(.{ .name = "cli-test", .root_module = tx }), test_step, test_network_step);
 
-    const tx_session = b.createModule(.{
-        .root_source_file = b.path("src/cli/tx_session.zig"),
+    const txd = b.createModule(.{
+        .root_source_file = b.path("src/cli/txd.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    tx_session.addImport("xev", xev);
-    tx_session.addImport("server", server);
-    tx_session.addImport("transport", transport);
-    tx_session.addImport("auth", auth);
-    b.installArtifact(b.addExecutable(.{ .name = "tx-session", .root_module = tx_session }));
+    txd.addImport("xev", xev);
+    txd.addImport("server", server);
+    txd.addImport("transport", transport);
+    txd.addImport("auth", auth);
+    b.installArtifact(b.addExecutable(.{ .name = "txd", .root_module = txd }));
+    addTestRuns(b, b.addTest(.{ .name = "txd-test", .root_module = txd }), test_step, test_network_step);
 }
 
 const ServerDeps = struct {
