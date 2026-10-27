@@ -1,9 +1,9 @@
-//! tx-session: serves the user's sessions over QUIC.
+//! txd: serves the user's sessions over QUIC.
 //!
-//! Usage: tx-session [--listen ADDRESS:PORT] [--key PATH] [--print-host-key]
-//!                   [--install]
+//! Usage: txd [--listen ADDRESS:PORT] [--key PATH] [--print-host-key]
+//!            [--install]
 //!
-//! Personal mode: clients log in as the user running tx-session, with a key
+//! Personal mode: clients log in as the user running txd, with a key
 //! from `~/.config/tx/authorized_keys` if that file exists, or else from
 //! `~/.ssh/authorized_keys`. It listens on every address by default.
 //!
@@ -11,7 +11,7 @@
 //! and exits, creating the key if there is none. `tx` runs it over ssh to
 //! learn a new host's key.
 //!
-//! `--install` sets up a service that keeps tx-session running with the
+//! `--install` sets up a service that keeps txd running with the
 //! given `--listen` and `--key`, starts it if it isn't running, and exits;
 //! see `install.zig`. With `--print-host-key`, the key is printed first.
 const std = @import("std");
@@ -27,7 +27,7 @@ const paths = @import("paths.zig");
 /// Below the ephemeral port ranges of Linux and macOS.
 pub const default_port = 8739;
 
-/// Variables a session inherits from tx-session's environment.
+/// Variables a session inherits from txd's environment.
 const inherited = [_][]const u8{ "HOME", "USER", "LOGNAME", "SHELL", "PATH", "TZ", "LANG" };
 
 pub fn main(init: std.process.Init) !u8 {
@@ -75,7 +75,7 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     const user = paths.userName(init.environ_map) orelse {
-        std.debug.print("tx-session: can't tell the user name\n", .{});
+        std.debug.print("txd: can't tell the user name\n", .{});
         return 1;
     };
 
@@ -97,7 +97,7 @@ pub fn main(init: std.process.Init) !u8 {
             .listen = listen,
             .user = user,
         }) catch |err| {
-            std.debug.print("tx-session: --install failed: {t}\n", .{err});
+            std.debug.print("txd: --install failed: {t}\n", .{err});
             return 1;
         };
         return 0;
@@ -139,7 +139,7 @@ pub fn main(init: std.process.Init) !u8 {
         .cwd = if (init.environ_map.get("HOME")) |home| .{ .path = home } else .inherit,
     }) catch |err| switch (err) {
         error.AddressInUse => {
-            std.debug.print("tx-session: port {d} is in use, by another tx-session or another program\n", .{listen.getPort()});
+            std.debug.print("txd: port {d} is in use, by another txd or another program\n", .{listen.getPort()});
             return 1;
         },
         else => |e| return e,
@@ -152,7 +152,7 @@ pub fn main(init: std.process.Init) !u8 {
 }
 
 fn usage(reason: []const u8) u8 {
-    std.debug.print("tx-session: {s}\nusage: tx-session [--listen ADDRESS:PORT] [--key PATH] [--print-host-key] [--install]\n", .{reason});
+    std.debug.print("txd: {s}\nusage: txd [--listen ADDRESS:PORT] [--key PATH] [--print-host-key] [--install]\n", .{reason});
     return 2;
 }
 

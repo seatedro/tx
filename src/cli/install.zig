@@ -1,13 +1,13 @@
-//! `tx-session --install`: keeps tx-session running for the user, and
+//! `txd --install`: keeps txd running for the user, and
 //! starts it if it isn't running. tx runs it over ssh the first time it
 //! connects to a host, and whenever nothing answers on the server's port.
 //!
 //! On Linux with a systemd user manager, it installs the user service
-//! `tx-session.service` and turns on lingering, so that the user's manager
+//! `txd.service` and turns on lingering, so that the user's manager
 //! starts at boot and keeps running after they log out. On macOS, it
-//! installs the LaunchAgent `tx-session`, which starts at each login.
+//! installs the LaunchAgent `txd`, which starts at each login.
 //! Elsewhere, when lingering can't be turned on, or when launchctl fails,
-//! it starts tx-session in the background, where it runs until the
+//! it starts txd in the background, where it runs until the
 //! machine restarts.
 //!
 //! Running it again starts the server only if nothing has its port. A
@@ -25,13 +25,13 @@ const Environ = std.process.Environ;
 const paths = @import("paths.zig");
 
 /// The systemd unit and the launchd label.
-const name = "tx-session";
+const name = "txd";
 
 /// How long a started server has to bind its port.
 const start_timeout_ms = 5000;
 
 pub const Options = struct {
-    /// The path of the tx-session binary the service runs.
+    /// The path of the txd binary the service runs.
     exe: []const u8,
     /// The server's arguments, after `exe`.
     args: []const []const u8,
@@ -51,12 +51,12 @@ pub fn install(gpa: Allocator, io: Io, environ: *const Environ.Map, options: Opt
     var waited: u64 = 0;
     while (!serving(options.listen)) : (waited += 50) {
         if (waited >= start_timeout_ms) {
-            std.debug.print("tx-session: the server started, but hasn't bound {f} after {d} s\n", .{ options.listen, start_timeout_ms / 1000 });
+            std.debug.print("txd: the server started, but hasn't bound {f} after {d} s\n", .{ options.listen, start_timeout_ms / 1000 });
             return error.NotServing;
         }
         try io.sleep(.fromMilliseconds(50), .awake);
     }
-    std.debug.print("tx-session: started the server on {f}\n", .{options.listen});
+    std.debug.print("txd: started the server on {f}\n", .{options.listen});
 }
 
 const Start = enum {
@@ -70,7 +70,7 @@ const Start = enum {
 const probe_timeout_ms = 200;
 
 /// True when something has bound the port of `address`. For a wildcard,
-/// the port is checked on 127.0.0.1, which tx-session binds too.
+/// the port is checked on 127.0.0.1, which txd binds too.
 ///
 /// A datagram to a port nobody has bound draws an ICMP port unreachable,
 /// which a connected socket reports as ECONNREFUSED. Binding the port would
@@ -116,10 +116,10 @@ fn systemd(gpa: Allocator, io: Io, environ: *const Environ.Map, options: Options
     const lingering = if (linger) |text| std.mem.eql(u8, std.mem.trim(u8, text, " \n"), "yes") else false;
     if (!lingering) {
         if (!try succeeds(gpa, io, &.{ "loginctl", "enable-linger", options.user }, .show)) {
-            std.debug.print("tx-session: can't turn on lingering, and without it a systemd service stops at logout. Starting the server in the background.\n", .{});
+            std.debug.print("txd: can't turn on lingering, and without it a systemd service stops at logout. Starting the server in the background.\n", .{});
             return null;
         }
-        std.debug.print("tx-session: turned on lingering for {s}, so the user's services run without a login\n", .{options.user});
+        std.debug.print("txd: turned on lingering for {s}, so the user's services run without a login\n", .{options.user});
     }
 
     // The user manager reads ~/.config/systemd/user whatever this
@@ -131,7 +131,7 @@ fn systemd(gpa: Allocator, io: Io, environ: *const Environ.Map, options: Options
     const changed = try writeIfChanged(gpa, io, path, unit);
     if (changed) {
         if (!try succeeds(gpa, io, &.{ "systemctl", "--user", "daemon-reload" }, .show)) return error.SystemctlFailed;
-        std.debug.print("tx-session: installed {s}\n", .{path});
+        std.debug.print("txd: installed {s}\n", .{path});
     }
     if (!try succeeds(gpa, io, &.{ "systemctl", "--user", "--quiet", "enable", name ++ ".service" }, .show)) return error.SystemctlFailed;
 
@@ -140,7 +140,7 @@ fn systemd(gpa: Allocator, io: Io, environ: *const Environ.Map, options: Options
     // `start` leaves a running server alone, and it may have another port.
     const verb = if (changed) "restart" else "start";
     if (!try succeeds(gpa, io, &.{ "systemctl", "--user", verb, name ++ ".service" }, .show)) {
-        std.debug.print("tx-session: see journalctl --user -u {s}\n", .{name});
+        std.debug.print("txd: see journalctl --user -u {s}\n", .{name});
         return error.SystemctlFailed;
     }
     return .started;
@@ -166,7 +166,7 @@ fn launchd(gpa: Allocator, io: Io, environ: *const Environ.Map, options: Options
     const plist = try launchdPlist(gpa, options.exe, options.args, log_path);
     defer gpa.free(plist);
     const changed = try writeIfChanged(gpa, io, path, plist);
-    if (changed) std.debug.print("tx-session: installed {s}\n", .{path});
+    if (changed) std.debug.print("txd: installed {s}\n", .{path});
 
     if (serving(options.listen)) return .serving;
 
@@ -184,14 +184,14 @@ fn launchd(gpa: Allocator, io: Io, environ: *const Environ.Map, options: Options
         try succeeds(gpa, io, &.{ "launchctl", "enable", target }, .show) and
             try succeeds(gpa, io, &.{ "launchctl", "bootstrap", domain, path }, .show);
     if (!started) {
-        std.debug.print("tx-session: launchctl can't start {s}. Starting the server in the background.\n", .{target});
+        std.debug.print("txd: launchctl can't start {s}. Starting the server in the background.\n", .{target});
         return null;
     }
     return .started;
 }
 
 /// Starts the server in its own process group, with its output going to
-/// `tx-session.log` in the state directory. It outlives the ssh session
+/// `txd.log` in the state directory. It outlives the ssh session
 /// unless logind kills a user's processes at logout (`KillUserProcesses`).
 fn background(gpa: Allocator, io: Io, environ: *const Environ.Map, options: Options) !Start {
     if (serving(options.listen)) return .serving;
@@ -215,7 +215,7 @@ fn background(gpa: Allocator, io: Io, environ: *const Environ.Map, options: Opti
         .stderr = .{ .file = log_file },
         .pgid = 0,
     });
-    std.debug.print("tx-session: the server runs in the background until the machine restarts. Its log is {s}\n", .{log_path});
+    std.debug.print("txd: the server runs in the background until the machine restarts. Its log is {s}\n", .{log_path});
     return .started;
 }
 
@@ -271,7 +271,7 @@ fn systemdUnit(gpa: Allocator, exe: []const u8, args: []const []const u8) ![]u8 
     errdefer out.deinit();
     const w = &out.writer;
     try w.writeAll(
-        \\# Written by tx-session --install.
+        \\# Written by txd --install.
         \\[Unit]
         \\Description=tx sessions
         \\
@@ -313,7 +313,7 @@ fn launchdPlist(gpa: Allocator, exe: []const u8, args: []const []const u8, log_p
     try w.writeAll(
         \\<?xml version="1.0" encoding="UTF-8"?>
         \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-        \\<!-- Written by tx-session --install. -->
+        \\<!-- Written by txd --install. -->
         \\<plist version="1.0">
         \\<dict>
         \\    <key>Label</key>
@@ -369,7 +369,7 @@ fn writeXmlString(w: *Io.Writer, text: []const u8) !void {
 }
 
 /// The path of the running binary, without resolving symlinks, so that a
-/// service names `/opt/homebrew/bin/tx-session` and keeps working after an
+/// service names `/opt/homebrew/bin/txd` and keeps working after an
 /// upgrade replaces the binary it points to. Falls back to the resolved
 /// path.
 pub fn exePath(gpa: Allocator, io: Io, environ: *const Environ.Map, arg0: []const u8) ![]u8 {
@@ -395,15 +395,15 @@ pub fn exePath(gpa: Allocator, io: Io, environ: *const Environ.Map, arg0: []cons
 const testing = std.testing;
 
 test systemdUnit {
-    const unit = try systemdUnit(testing.allocator, "/home/a b/bin/tx-session", &.{ "--key", "/k/100%\"$x" });
+    const unit = try systemdUnit(testing.allocator, "/home/a b/bin/txd", &.{ "--key", "/k/100%\"$x" });
     defer testing.allocator.free(unit);
     try testing.expectEqualStrings(
-        \\# Written by tx-session --install.
+        \\# Written by txd --install.
         \\[Unit]
         \\Description=tx sessions
         \\
         \\[Service]
-        \\ExecStart="/home/a b/bin/tx-session" "--key" "/k/100%%\"$$x"
+        \\ExecStart="/home/a b/bin/txd" "--key" "/k/100%%\"$$x"
         \\Restart=on-failure
         \\
         \\[Install]
@@ -413,19 +413,19 @@ test systemdUnit {
 }
 
 test launchdPlist {
-    const plist = try launchdPlist(testing.allocator, "/opt/tx&co/tx-session", &.{ "--listen", "[::]:9000" }, "/Users/a/Library/Logs/tx-session.log");
+    const plist = try launchdPlist(testing.allocator, "/opt/tx&co/txd", &.{ "--listen", "[::]:9000" }, "/Users/a/Library/Logs/txd.log");
     defer testing.allocator.free(plist);
     try testing.expectEqualStrings(
         \\<?xml version="1.0" encoding="UTF-8"?>
         \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-        \\<!-- Written by tx-session --install. -->
+        \\<!-- Written by txd --install. -->
         \\<plist version="1.0">
         \\<dict>
         \\    <key>Label</key>
-        \\    <string>tx-session</string>
+        \\    <string>txd</string>
         \\    <key>ProgramArguments</key>
         \\    <array>
-        \\        <string>/opt/tx&amp;co/tx-session</string>
+        \\        <string>/opt/tx&amp;co/txd</string>
         \\        <string>--listen</string>
         \\        <string>[::]:9000</string>
         \\    </array>
@@ -439,7 +439,7 @@ test launchdPlist {
         \\    <key>ProcessType</key>
         \\    <string>Interactive</string>
         \\    <key>StandardErrorPath</key>
-        \\    <string>/Users/a/Library/Logs/tx-session.log</string>
+        \\    <string>/Users/a/Library/Logs/txd.log</string>
         \\</dict>
         \\</plist>
         \\

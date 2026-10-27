@@ -1,4 +1,4 @@
-//! tx: a session on a tx-session server.
+//! tx: a session on a txd server.
 //!
 //! Usage: tx [-p PORT] [-l USER] [--attach ID | --new | --list | --kill ID]
 //!           [--server COMMAND] [--ssh PATH] [USER@]HOST
@@ -9,12 +9,12 @@
 //!
 //! The server's key is checked against `~/.config/tx/known_hosts` and
 //! `~/.ssh/known_hosts`. For a host in neither, tx reads the key over ssh
-//! with `tx-session --print-host-key`, so ssh's own host check vouches for
+//! with `txd --print-host-key`, so ssh's own host check vouches for
 //! it. If that fails, tx asks, as ssh does. The key is added to the first
 //! file.
 //!
-//! The same ssh command runs `tx-session --install`, which sets up a
-//! service that keeps tx-session running on the host and starts it. tx
+//! The same ssh command runs `txd --install`, which sets up a
+//! service that keeps txd running on the host and starts it. tx
 //! runs the install over ssh again when nothing answers on the server's
 //! port.
 //!
@@ -32,13 +32,13 @@ const auth = @import("auth");
 const proto = @import("proto");
 const paths = @import("paths.zig");
 
-/// tx-session's default port.
+/// txd's default port.
 const default_port = 8739;
 
 const usage_text = "usage: tx [-p PORT] [-l USER] [--attach ID | --new | --list | --kill ID] [--server COMMAND] [--ssh PATH] [USER@]HOST";
 
 /// How long tx waits for an answer from the server's port before it
-/// starts tx-session over ssh, and after.
+/// starts txd over ssh, and after.
 const no_answer_timeout_ns = 5 * std.time.ns_per_s;
 
 /// Key files tried after the agent's keys, under HOME.
@@ -63,7 +63,7 @@ pub fn main(init: std.process.Init) !u8 {
     var new = false;
     // `--attach`, `--new`, `--list` and `--kill` exclude each other.
     var modes: usize = 0;
-    var server_command: []const u8 = "tx-session";
+    var server_command: []const u8 = "txd";
     var ssh_path: []const u8 = "ssh";
     var destination: ?[]const u8 = null;
     var i: usize = 1;
@@ -159,10 +159,10 @@ pub fn main(init: std.process.Init) !u8 {
     var install = trusted.install;
     var outcome = client.session.run(gpa, io, options) catch |err| return fail("{t}", .{err});
 
-    // tx-session may have stopped, or never been set up on a host already
+    // txd may have stopped, or never been set up on a host already
     // in known_hosts.
     if (outcome == .no_connection and install == .not_run) {
-        std.debug.print("tx: nothing answers on {s} port {d}; starting tx-session over ssh\n", .{ host, port });
+        std.debug.print("tx: nothing answers on {s} port {d}; starting txd over ssh\n", .{ host, port });
         install = installOverSsh(gpa, io, ssh);
         if (install == .done) outcome = client.session.run(gpa, io, options) catch |err| return fail("{t}", .{err});
     }
@@ -180,7 +180,7 @@ pub fn main(init: std.process.Init) !u8 {
             return 0;
         },
         .no_connection => |reason| {
-            if (install == .done) return fail("tx-session is running on {s}, but nothing answers on UDP port {d}. A firewall may be blocking it.", .{ host, port });
+            if (install == .done) return fail("txd is running on {s}, but nothing answers on UDP port {d}. A firewall may be blocking it.", .{ host, port });
             return fail("can't connect to {s} port {d}: {t}", .{ host, port, reason });
         },
         .disconnected => |reason| return fail("connection closed: {t}", .{reason}),
@@ -375,22 +375,22 @@ fn keyFilePublicKey(gpa: Allocator, io: Io, path: []const u8) !auth.ssh.PublicKe
     return .fromEd25519(file.public_key);
 }
 
-/// How to run tx-session in the remote account over ssh.
+/// How to run txd in the remote account over ssh.
 const SshSource = struct {
     /// The ssh client.
     ssh: []const u8,
     /// `host` or `user@host`, as ssh takes it.
     destination: []const u8,
-    /// tx-session on the remote side.
+    /// txd on the remote side.
     server_command: []const u8,
-    /// The port tx-session listens on.
+    /// The port txd listens on.
     port: u16,
 };
 
-/// Whether tx ran `tx-session --install` over ssh, and how it went.
+/// Whether tx ran `txd --install` over ssh, and how it went.
 const Install = enum { not_run, failed, done };
 
-/// Runs `tx-session OPTIONS` in the remote account over ssh, with
+/// Runs `txd OPTIONS` in the remote account over ssh, with
 /// `--listen` for a port other than the default. Returns its stdout and
 /// whether it succeeded. Its stderr, such as what `--install` did, goes to
 /// the user.
@@ -415,7 +415,7 @@ fn runOverSsh(gpa: Allocator, io: Io, source: SshSource, options: []const u8) !s
     return .{ .ok = result.term.success(), .stdout = result.stdout };
 }
 
-/// Starts tx-session on the host, and sets up its service.
+/// Starts txd on the host, and sets up its service.
 fn installOverSsh(gpa: Allocator, io: Io, source: SshSource) Install {
     const result = runOverSsh(gpa, io, source, "--install") catch |err| {
         std.debug.print("tx: can't run ssh: {t}\n", .{err});
@@ -425,15 +425,15 @@ fn installOverSsh(gpa: Allocator, io: Io, source: SshSource) Install {
     return if (result.ok) .done else .failed;
 }
 
-/// Reads tx-session's host key from the remote account over ssh, and
-/// installs tx-session there. ssh's own host key check vouches for the
+/// Reads txd's host key from the remote account over ssh, and
+/// installs txd there. ssh's own host key check vouches for the
 /// connection, so the key needs no prompt.
 fn hostKeyOverSsh(gpa: Allocator, io: Io, source: SshSource, install: *Install) !auth.Key {
     const result = try runOverSsh(gpa, io, source, "--print-host-key --install");
     defer gpa.free(result.stdout);
     install.* = if (result.ok) .done else .failed;
 
-    // `ssh-ed25519 AAAA...`. tx-session prints it before it installs, so
+    // `ssh-ed25519 AAAA...`. txd prints it before it installs, so
     // it arrives even when the install fails.
     var fields = std.mem.tokenizeAny(u8, result.stdout, " \t\r\n");
     const key_type = fields.next() orelse return error.NoKeyPrinted;
