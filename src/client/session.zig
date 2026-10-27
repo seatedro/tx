@@ -13,6 +13,9 @@
 //! the terminal is acknowledged to QUIC flow control only while the
 //! writer's queue is below its high-water mark, so a terminal that can't
 //! keep up slows the server down.
+//!
+//! Reattaching starts with the server's rebuild of the session's terminal,
+//! written after the screen is cleared for it.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -581,13 +584,18 @@ const Run = struct {
                 if (r.early_input.items.len > 0) r.send(.{ .input = .{ .bytes = r.early_input.items } });
                 r.early_input.clearAndFree(r.gpa);
             },
+            .rebuild => |m| {
+                if (!r.terminal) return r.refuse("the server sent a rebuild before the login");
+                // The rebuild expects a terminal in its initial state. Ghostty
+                // and kitty scroll the screen into scrollback with ED 22,
+                // which other terminals ignore.
+                if (m.first) r.writeTerminal("\x1b[0m\x1b[22J\x1b[2J\x1b[H") catch return;
+                r.writeTerminal(m.bytes) catch return;
+            },
             // Acked once queued for the terminal.
             .output => |m| {
                 if (!r.terminal) return r.refuse("the server sent output before the login");
-                r.writer.write(m.bytes) catch |err| switch (err) {
-                    error.Failed => return r.finish(.{ .detached = r.session_id }),
-                    error.QueueFull => log.warn("output dropped: the terminal queue is full", .{}),
-                };
+                r.writeTerminal(m.bytes) catch return;
                 r.send(.{ .ack = .{ .seq = m.seq } });
             },
             .exit => |m| r.finish(.{ .exited = .{
@@ -597,6 +605,18 @@ const Run = struct {
             .@"error" => |m| r.finish(.{ .refused = .{ .code = m.code, .message = .init(m.message) } }),
             else => {},
         }
+    }
+
+    /// Queues `bytes` for the user's terminal. Fails once the terminal has
+    /// gone away, which detaches.
+    fn writeTerminal(r: *Run, bytes: []const u8) error{Failed}!void {
+        r.writer.write(bytes) catch |err| switch (err) {
+            error.Failed => {
+                r.finish(.{ .detached = r.session_id });
+                return error.Failed;
+            },
+            error.QueueFull => log.warn("output dropped: the terminal queue is full", .{}),
+        };
     }
 
     fn onClosed(ctx: ?*anyopaque, conn: *Conn, reason: CloseReason) void {

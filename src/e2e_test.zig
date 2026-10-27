@@ -204,6 +204,51 @@ fn primaryDump(st: *ServerThread, session_id: u64) !?[]u8 {
     return d.result;
 }
 
+/// Writes `bytes` to a session's program as if a client had typed them.
+fn typeDetached(st: *ServerThread, session_id: u64, bytes: []const u8) !void {
+    const Input = struct {
+        req: ServerThread.Request = .{ .run = run },
+        session_id: u64,
+        bytes: []const u8,
+        result: anyerror!void = error.NoSession,
+
+        fn run(req: *ServerThread.Request, server_thread: *ServerThread) void {
+            const in: *@This() = @fieldParentPtr("req", req);
+            const s = server_thread.server.sessions.get(in.session_id) orelse return;
+            in.result = s.host.sendInput(in.bytes);
+        }
+    };
+    var in: Input = .{ .session_id = session_id, .bytes = bytes };
+    st.call(&in.req);
+    return in.result;
+}
+
+/// Waits until a session's primary terminal shows `needle`, as plain text.
+fn waitForPrimaryText(st: *ServerThread, session_id: u64, needle: []const u8) !void {
+    const Text = struct {
+        req: ServerThread.Request = .{ .run = run },
+        session_id: u64,
+        needle: []const u8,
+        found: bool = false,
+
+        fn run(req: *ServerThread.Request, server_thread: *ServerThread) void {
+            const t: *@This() = @fieldParentPtr("req", req);
+            const s = server_thread.server.sessions.get(t.session_id) orelse return;
+            const text = s.host.primary.terminal.plainString(gpa) catch return;
+            defer gpa.free(text);
+            t.found = std.mem.indexOf(u8, text, t.needle) != null;
+        }
+    };
+    const deadline = nowMs() + timeout_ms;
+    while (nowMs() < deadline) {
+        var t: Text = .{ .session_id = session_id, .needle = needle };
+        st.call(&t.req);
+        if (t.found) return;
+        try testing.io.sleep(.fromMilliseconds(10), .awake);
+    }
+    return error.Timeout;
+}
+
 /// A pseudo-terminal pair at 80x24.
 const TestPty = struct {
     master: posix.fd_t,
@@ -350,7 +395,7 @@ test "a session runs, detaches, reattaches and exits through tx-session and tx" 
     const session_id = detached.detached.?;
     try expectMatchesPrimary(&st, session_id, first.output.items);
 
-    // Reattach from another terminal: the log is replayed into it.
+    // Reattach from another terminal: the server rebuilds the session in it.
     var second: TestPty = try .open();
     defer second.close();
     var b: ClientThread = .{ .options = login.clientOptions(&st, &second, &keys) };
@@ -364,6 +409,101 @@ test "a session runs, detaches, reattaches and exits through tx-session and tx" 
     const exited = try b.join(&second);
     try testing.expectEqual(3, exited.exited.status);
     try testing.expectEqual(null, try primaryDump(&st, session_id));
+}
+
+test "a session whose log was trimmed reattaches with its scrollback" {
+    transport.crypto.init(testing.io);
+    var environ: std.process.Environ.Map = .init(gpa);
+    defer environ.deinit();
+    try environ.put("PATH", testing.environ.getPosix("PATH") orelse "/usr/bin:/bin");
+    var login: Login = undefined;
+    try login.init(null);
+    defer login.deinit();
+    const keys = [_]auth.Key{login.key.public_key.toBytes()};
+
+    // A 4 KiB log holds a few lines of the output, which comes once the
+    // client has detached. While a client is attached, a log must hold
+    // what the program writes between two sends.
+    var options = try login.serverOptions(&environ, &.{
+        "/bin/sh", "-c",
+        \\printf 'started\r\n'
+        \\read -r a
+        \\i=0; while [ $i -lt 2000 ]; do printf 'line %d\r\n' $i; i=$((i + 1)); done
+        \\printf 'ready\r\n'
+        \\read -r b
+    });
+    options.terminal.log_capacity = 4096;
+    var st: ServerThread = undefined;
+    try st.init(options);
+    defer st.deinit();
+
+    var first: TestPty = try .open();
+    defer first.close();
+    var a: ClientThread = .{ .options = login.clientOptions(&st, &first, &keys) };
+    try a.start();
+    try first.readUntil("started");
+    try first.type_("~.");
+    const session_id = (try a.join(&first)).detached.?;
+
+    // The output starts with no client attached.
+    try typeDetached(&st, session_id, "\r");
+    try waitForPrimaryText(&st, session_id, "ready");
+
+    // The first line is long gone from the log, but not from scrollback.
+    var second: TestPty = try .open();
+    defer second.close();
+    var b: ClientThread = .{ .options = login.clientOptions(&st, &second, &keys) };
+    b.options.session_id = session_id;
+    try b.start();
+    try second.readUntil("ready");
+    try testing.expect(std.mem.indexOf(u8, second.output.items, "line 0\r\n") != null);
+    try expectMatchesPrimary(&st, session_id, second.output.items);
+
+    try second.type_("~.");
+    _ = try b.join(&second);
+}
+
+test "reattaching inside an unfinished sequence finishes it" {
+    transport.crypto.init(testing.io);
+    var environ: std.process.Environ.Map = .init(gpa);
+    defer environ.deinit();
+    try environ.put("PATH", testing.environ.getPosix("PATH") orelse "/usr/bin:/bin");
+    var login: Login = undefined;
+    try login.init(null);
+    defer login.deinit();
+    const keys = [_]auth.Key{login.key.public_key.toBytes()};
+
+    // The title sequence is cut in two by the read.
+    var st: ServerThread = undefined;
+    try st.init(try login.serverOptions(&environ, &.{
+        "/bin/sh", "-c",
+        \\printf 'ready\r\n\033]2;ti'
+        \\read -r a
+        \\printf 'tle\033\\done\r\n'
+        \\read -r b
+    }));
+    defer st.deinit();
+
+    var first: TestPty = try .open();
+    defer first.close();
+    var a: ClientThread = .{ .options = login.clientOptions(&st, &first, &keys) };
+    try a.start();
+    try first.readUntil("\x1b]2;ti");
+    try first.type_("~.");
+    const session_id = (try a.join(&first)).detached.?;
+
+    var second: TestPty = try .open();
+    defer second.close();
+    var b: ClientThread = .{ .options = login.clientOptions(&st, &second, &keys) };
+    b.options.session_id = session_id;
+    try b.start();
+    try second.readUntil("\x1b]2;ti");
+    try second.type_("\r");
+    try second.readUntil("done");
+    try expectMatchesPrimary(&st, session_id, second.output.items);
+
+    try second.type_("~.");
+    _ = try b.join(&second);
 }
 
 test "a client accepting another server key is refused" {

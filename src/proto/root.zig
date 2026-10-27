@@ -25,6 +25,7 @@ pub const AuthProbe = messages.AuthProbe;
 pub const AuthProbeReply = messages.AuthProbeReply;
 pub const AuthSignature = messages.AuthSignature;
 pub const AuthOk = messages.AuthOk;
+pub const Rebuild = messages.Rebuild;
 
 pub const Decoder = frame.Decoder;
 pub const encode = frame.encode;

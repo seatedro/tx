@@ -413,9 +413,12 @@ fn testDump(t: *const Terminal) ![]u8 {
     return dumpAlloc(testing.allocator, t);
 }
 
+/// What a terminal is fed before each of `changes`.
+pub const changes_base = "ab\r\n";
+
 /// Each entry changes one piece of state of a terminal that has been fed
-/// `base`.
-const changes = [_]struct { []const u8, []const u8 }{
+/// `changes_base`. Used by the rebuild tests too.
+pub const changes = [_]struct { []const u8, []const u8 }{
     .{ "primary text", "x" },
     .{ "a wide character", "\u{4E2D}" },
     .{ "a grapheme cluster", "e\u{301}" },
@@ -476,7 +479,7 @@ const changes = [_]struct { []const u8, []const u8 }{
 
 test "each state change shows in the dump" {
     testing.log_level = .err;
-    const base = "ab\r\n";
+    const base = changes_base;
     var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 20, .rows = 5 });
     defer t.deinit(testing.allocator);
     var stream = t.vtStream();
