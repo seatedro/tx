@@ -106,6 +106,57 @@ pub const Datagram = struct {
     to: IpAddress,
 };
 
+/// What a client's Initial packet shows about its address: nothing, that
+/// it returned a Retry's token, or a token that doesn't verify.
+pub const RetryCheck = union(enum) {
+    none,
+    valid: Retry,
+    invalid,
+};
+
+/// A verified Retry token.
+pub const Retry = struct {
+    /// The connection ID the client's first Initial went to.
+    original_dcid: c.ngtcp2_cid,
+    /// Points into the packet.
+    token: []const u8,
+};
+
+/// How long a client has to return a Retry's token.
+const retry_token_timeout_ns = 10 * std.time.ns_per_s;
+
+/// The header of `packet` if it is an Initial a server can accept.
+pub fn initialHeader(packet: []const u8) ?c.ngtcp2_pkt_hd {
+    var hd: c.ngtcp2_pkt_hd = undefined;
+    if (c.ngtcp2_accept(&hd, packet.ptr, packet.len) != 0) return null;
+    return hd;
+}
+
+/// Checks the token of the Initial with header `hd`, which `remote` sent.
+pub fn checkRetryToken(io: Io, secret: *const [32]u8, hd: *const c.ngtcp2_pkt_hd, remote: IpAddress) RetryCheck {
+    if (hd.tokenlen == 0 or hd.token[0] != c.NGTCP2_CRYPTO_TOKEN_MAGIC_RETRY2) return .none;
+    var addr: PosixAddress = undefined;
+    const addr_len = Io.Threaded.addressToPosix(&remote, &addr);
+    var original_dcid: c.ngtcp2_cid = undefined;
+    if (c.ngtcp2_crypto_verify_retry_token2(&original_dcid, hd.token, hd.tokenlen, secret, secret.len, hd.version, @ptrCast(&addr.any), @intCast(addr_len), &hd.dcid, retry_token_timeout_ns, now(io)) != 0)
+        return .invalid;
+    return .{ .valid = .{ .original_dcid = original_dcid, .token = hd.token[0..hd.tokenlen] } };
+}
+
+/// Writes into `out` a Retry answering the Initial with header `hd`, which
+/// `remote` sent. Returns its length.
+pub fn writeRetry(io: Io, out: []u8, secret: *const [32]u8, hd: *const c.ngtcp2_pkt_hd, remote: IpAddress) Error!usize {
+    var addr: PosixAddress = undefined;
+    const addr_len = Io.Threaded.addressToPosix(&remote, &addr);
+    const scid = randomCid(16);
+    var token: [c.NGTCP2_CRYPTO_MAX_RETRY_TOKENLEN2]u8 = undefined;
+    const token_len = c.ngtcp2_crypto_generate_retry_token2(&token, secret, secret.len, hd.version, @ptrCast(&addr.any), @intCast(addr_len), &scid, &hd.dcid, now(io));
+    if (token_len < 0) return error.Quic;
+    const n = c.ngtcp2_crypto_write_retry(out.ptr, out.len, hd.version, &hd.scid, &scid, &hd.dcid, &token, @intCast(token_len));
+    if (n < 0) return error.Quic;
+    return @intCast(n);
+}
+
 pub const Connection = struct {
     gpa: Allocator,
     io: Io,
@@ -226,7 +277,8 @@ pub const Connection = struct {
         return self;
     }
 
-    /// Accept a client's first datagram on a server.
+    /// Accept a client's first datagram on a server. `retry` is set when
+    /// the datagram returned a Retry's token.
     pub fn accept(
         gpa: Allocator,
         io: Io,
@@ -234,6 +286,7 @@ pub const Connection = struct {
         local: IpAddress,
         remote: IpAddress,
         packet: []const u8,
+        retry: ?Retry,
         options: Options,
     ) Error!*Connection {
         var hd: c.ngtcp2_pkt_hd = undefined;
@@ -257,6 +310,16 @@ pub const Connection = struct {
         var params = defaultParams(options);
         params.original_dcid = hd.dcid;
         params.original_dcid_present = 1;
+        // After a Retry, the client's address is validated, and the
+        // parameters name both IDs, as RFC 9000 §7.3 requires.
+        if (retry) |r| {
+            params.original_dcid = r.original_dcid;
+            params.retry_scid = hd.dcid;
+            params.retry_scid_present = 1;
+            settings.token = r.token.ptr;
+            settings.tokenlen = r.token.len;
+            settings.token_type = c.NGTCP2_TOKEN_TYPE_RETRY;
+        }
         params.stateless_reset_token_present = 1;
         if (c.ngtcp2_crypto_generate_stateless_reset_token(&params.stateless_reset_token, &server.reset_secret, server.reset_secret.len, &scid) != 0)
             return error.Quic;

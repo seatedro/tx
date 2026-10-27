@@ -1157,6 +1157,92 @@ test "attaching before login is refused" {
     try testing.expectEqual(null, rc.attached);
 }
 
+const raw_hello: proto.Hello = .{ .revision = proto.revision, .term = "xterm-256color", .cols = 80, .rows = 24 };
+
+test "a client that doesn't log in in time is told so and closed" {
+    transport.crypto.init(testing.io);
+    var environ: std.process.Environ.Map = .init(gpa);
+    defer environ.deinit();
+    var login: Login = undefined;
+    try login.init(null);
+    defer login.deinit();
+    var options = try login.serverOptions(&environ, &.{ "/bin/sh", "-c", "sleep 10" });
+    options.pending.timeout_ns = 300 * std.time.ns_per_ms;
+    var st: ServerThread = undefined;
+    try st.init(options);
+    defer st.deinit();
+
+    var rc: RawClient = undefined;
+    try rc.init(&st, login.key, raw_hello);
+    defer rc.deinit();
+    rc.login = .idle;
+    const start = nowMs();
+    try testing.expectEqual(@backingInt(server_pkg.ErrorCode.auth), try rc.waitError());
+    try testing.expectEqualStrings("login timed out", rc.error_message[0..rc.error_message_len]);
+    try rc.waitClosed();
+
+    // The deadline, then the second the server gives the message.
+    const elapsed = nowMs() - start;
+    try testing.expect(elapsed >= 300 and elapsed < 3000);
+}
+
+test "connections from one address past the limit are dropped until one closes" {
+    transport.crypto.init(testing.io);
+    var environ: std.process.Environ.Map = .init(gpa);
+    defer environ.deinit();
+    var login: Login = undefined;
+    try login.init(null);
+    defer login.deinit();
+    var options = try login.serverOptions(&environ, &.{ "/bin/sh", "-c", "sleep 10" });
+    options.pending.max_per_source = 2;
+    var st: ServerThread = undefined;
+    try st.init(options);
+    defer st.deinit();
+
+    var first: RawClient = undefined;
+    try first.init(&st, login.key, raw_hello);
+    first.login = .idle;
+    try first.waitConnected();
+    var second: RawClient = undefined;
+    try second.init(&st, login.key, raw_hello);
+    defer second.deinit();
+    second.login = .idle;
+    try second.waitConnected();
+
+    // The server drops the third's packets.
+    var third: RawClient = undefined;
+    try third.init(&st, login.key, raw_hello);
+    defer third.deinit();
+    third.login = .idle;
+    try third.runFor(1000);
+    try testing.expectEqual(null, third.conn);
+
+    // Once the first closes, the third's retransmitted Initial gets in.
+    first.deinit();
+    try third.waitConnected();
+}
+
+test "past retry_from, a client logs in after a Retry" {
+    transport.crypto.init(testing.io);
+    var environ: std.process.Environ.Map = .init(gpa);
+    defer environ.deinit();
+    var login: Login = undefined;
+    try login.init(null);
+    defer login.deinit();
+    var options = try login.serverOptions(&environ, &.{ "/bin/sh", "-c", "sleep 10" });
+    options.pending.retry_from = 0;
+    var st: ServerThread = undefined;
+    try st.init(options);
+    defer st.deinit();
+
+    var rc: RawClient = undefined;
+    try rc.init(&st, login.key, raw_hello);
+    defer rc.deinit();
+    _ = try rc.waitAttached();
+    // Each Initial the client sends before the Retry arrives gets one.
+    try testing.expect(@atomicLoad(u64, &st.server.pending.retries, .monotonic) >= 1);
+}
+
 // From `ssh-keygen -t ed25519`, with no passphrase and with "correct horse".
 // They are the test keys of auth/private_key.zig.
 const plain_key_file =
@@ -1291,10 +1377,13 @@ const RawClient = struct {
     decoder: proto.Decoder,
     hello: proto.Hello,
     key: Ed25519.KeyPair,
-    /// Set before the loop first runs.
-    login: enum { normal, wrong_exporter, skip } = .normal,
+    /// Set before the loop first runs. `idle` says hello and nothing more.
+    login: enum { normal, wrong_exporter, skip, idle } = .normal,
     attached: ?u64 = null,
     error_code: ?u32 = null,
+    error_message: [64]u8 = undefined,
+    error_message_len: usize = 0,
+    closed: bool = false,
     output: std.ArrayList(u8) = .empty,
 
     fn init(rc: *RawClient, st: *const ServerThread, key: Ed25519.KeyPair, hello: proto.Hello) !void {
@@ -1316,7 +1405,7 @@ const RawClient = struct {
                 .ip6 => try .parseIp6("::", 0),
             },
             .role = .{ .client = &rc.tls },
-            .handler = .{ .ctx = rc, .connected = onConnected, .data = onData },
+            .handler = .{ .ctx = rc, .connected = onConnected, .data = onData, .closed = onClosed },
         });
         _ = try rc.endpoint.connect(server);
     }
@@ -1347,6 +1436,7 @@ const RawClient = struct {
         send(stream, .{ .hello = rc.hello });
         switch (rc.login) {
             .skip => send(stream, .{ .attach = .{} }),
+            .idle => {},
             else => send(stream, .{ .auth_probe = .{ .user = test_user, .key = &auth.ssh.keyBlob(rc.key.public_key.toBytes()) } }),
         }
     }
@@ -1382,9 +1472,45 @@ const RawClient = struct {
             .auth_probe_reply => |m| if (m.accepted) rc.signIn(stream),
             .attached => |m| rc.attached = m.session_id,
             .output => |m| rc.output.appendSlice(gpa, m.bytes) catch @panic("OOM"),
-            .@"error" => |m| rc.error_code = m.code,
+            .@"error" => |m| {
+                rc.error_code = m.code;
+                rc.error_message_len = @min(m.message.len, rc.error_message.len);
+                @memcpy(rc.error_message[0..rc.error_message_len], m.message[0..rc.error_message_len]);
+            },
             else => {},
         };
+    }
+
+    fn onClosed(ctx: ?*anyopaque, _: *transport.endpoint.Conn, _: transport.endpoint.CloseReason) void {
+        const rc: *RawClient = @ptrCast(@alignCast(ctx.?));
+        rc.closed = true;
+    }
+
+    fn waitConnected(rc: *RawClient) !void {
+        const deadline = nowMs() + timeout_ms;
+        while (rc.conn == null) {
+            if (nowMs() > deadline) return error.Timeout;
+            try rc.loop.run(.no_wait);
+            testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+        }
+    }
+
+    fn waitClosed(rc: *RawClient) !void {
+        const deadline = nowMs() + timeout_ms;
+        while (!rc.closed) {
+            if (nowMs() > deadline) return error.Timeout;
+            try rc.loop.run(.no_wait);
+            testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+        }
+    }
+
+    /// Runs the loop for `ms`.
+    fn runFor(rc: *RawClient, ms: i64) !void {
+        const end = nowMs() + ms;
+        while (nowMs() < end) {
+            try rc.loop.run(.no_wait);
+            testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+        }
     }
 
     fn waitError(rc: *RawClient) !u32 {

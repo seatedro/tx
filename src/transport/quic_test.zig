@@ -149,7 +149,7 @@ test "client accepting the server key connects and a stream echoes" {
             if (server.conn) |conn| {
                 try conn.receive(msg.from, msg.data);
             } else {
-                server.conn = try .accept(gpa, io, &server_tls, server.socket.address, msg.from, msg.data, .{
+                server.conn = try .accept(gpa, io, &server_tls, server.socket.address, msg.from, msg.data, null, .{
                     .handler = .{ .ctx = &echo, .streamData = Echo.onData },
                 });
             }
@@ -201,7 +201,7 @@ fn handshake(client_tls: *const quic.Client, server_tls: *const quic.Server) !vo
             if (server.conn) |conn| {
                 conn.receive(msg.from, msg.data) catch {};
             } else {
-                server.conn = try .accept(gpa, io, server_tls, server.socket.address, msg.from, msg.data, .{});
+                server.conn = try .accept(gpa, io, server_tls, server.socket.address, msg.from, msg.data, null, .{});
             }
         }
         while (try client.poll(io, &rbuf, 1)) |msg| try client.conn.?.receive(msg.from, msg.data);

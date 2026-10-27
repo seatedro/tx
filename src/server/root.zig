@@ -65,6 +65,8 @@ pub const Options = struct {
     /// Scrollback and log limits of each session's terminal.
     terminal: session.host.Options.TerminalOptions = .{},
     idle_timeout_ns: u64 = 30 * std.time.ns_per_s,
+    /// Limits on connections that haven't logged in.
+    pending: transport.pending.Limits = .{},
 };
 
 pub const ErrorCode = proto.ErrorCode;
@@ -114,6 +116,8 @@ pub const Server = struct {
     loop: *xev.Loop,
     options: Options,
     tls: transport.quic.Server,
+    /// Shared by the endpoints.
+    pending: transport.pending.Pending,
     /// One per address listened on. They don't move.
     endpoints: std.ArrayList(*Endpoint) = .empty,
     /// Endpoints whose address went away, freed once stopped.
@@ -143,6 +147,7 @@ pub const Server = struct {
             .loop = loop,
             .options = options,
             .tls = try .init(options.identity),
+            .pending = .init(gpa, options.pending),
         };
         errdefer self.deinit();
 
@@ -192,6 +197,7 @@ pub const Server = struct {
             self.gpa.free(r.host_loopback);
             r.timer.deinit();
         }
+        self.pending.deinit();
         self.tls.deinit();
         self.* = undefined;
     }
@@ -204,6 +210,7 @@ pub const Server = struct {
             .local = local,
             .role = .{ .server = &self.tls },
             .idle_timeout_ns = self.options.idle_timeout_ns,
+            .pending = &self.pending,
             .handler = .{
                 .ctx = self,
                 .connected = onConnected,
@@ -212,6 +219,7 @@ pub const Server = struct {
                 .acked = onAcked,
                 .streamClosed = onStreamClosed,
                 .closed = onClosed,
+                .pendingExpired = onPendingExpired,
             },
         });
         errdefer e.deinit();
@@ -369,6 +377,14 @@ pub const Server = struct {
         const client = Client.of(conn) orelse return;
         client.destroy();
         conn.context = null;
+    }
+
+    /// A client that hasn't logged in in time. The endpoint closes the
+    /// connection shortly after.
+    fn onPendingExpired(_: ?*anyopaque, conn: *Conn) void {
+        const client = Client.of(conn) orelse return;
+        log.info("{f} didn't log in in time", .{conn.remote});
+        client.fail(.auth, "login timed out");
     }
 
     /// Whether `key_blob` may log in as `user`.
@@ -569,6 +585,7 @@ const Client = struct {
 
         log.info("{f} logged in as {s} with key {s}", .{ client.conn.remote, m.user, fingerprint.slice() });
         client.logged_in = true;
+        client.conn.admit();
         client.decoder.max_body_len = max_message;
         client.send(.{ .auth_ok = .{} });
     }
@@ -690,6 +707,7 @@ const Client = struct {
 
         log.info("{f} resumed session {d}", .{ client.conn.remote, s.id });
         client.logged_in = true;
+        client.conn.admit();
         client.decoder.max_body_len = max_message;
 
         const seq = m.next_seq orelse return client.attachTo(s, .{ .rebuild = .repaint }, .resumed);
