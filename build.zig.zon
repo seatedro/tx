@@ -10,9 +10,10 @@
         },
         .libxev = .{
             // seatedro/libxev, branch tx: 819ffa18, the commit Ghostty pins,
-            // plus fixes to UDP receive on kqueue.
-            .url = "https://github.com/seatedro/libxev/archive/ebde15aec352166e2599734b9f0046d1a27e5506.tar.gz",
-            .hash = "libxev-0.0.0-86vtc8kzFACcXo7LcHNmKdSe-DirdHBRk0mNCQZirBwK",
+            // plus fixes to UDP receive on kqueue and to disarms in kqueue
+            // ticks that don't wait.
+            .url = "https://github.com/seatedro/libxev/archive/1bf7b0848b8268f019d0232b03c9a114e12f9448.tar.gz",
+            .hash = "libxev-0.0.0-86vtcxk7FAAb7Ad7QAYld65xUS8n3627DtvBFvfFF3Ce",
         },
         .ngtcp2 = .{
             .url = "https://github.com/ngtcp2/ngtcp2/archive/refs/tags/v1.25.0.tar.gz",

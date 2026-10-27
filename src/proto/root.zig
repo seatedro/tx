@@ -30,6 +30,7 @@ pub const Resume = messages.Resume;
 pub const ErrorCode = messages.ErrorCode;
 pub const SessionInfo = messages.SessionInfo;
 pub const Kill = messages.Kill;
+pub const Connect = messages.Connect;
 
 pub const Decoder = frame.Decoder;
 pub const encode = frame.encode;

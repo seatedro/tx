@@ -530,6 +530,37 @@ pub const Killed = struct {
     }
 };
 
+/// Describes the client about to attach. txd sends it to a session before
+/// the client's `Attach` or `Resume`. Message types from 1000 on are txd's
+/// own, and txd refuses them from clients.
+pub const Connect = struct {
+    /// The client's address, for `SessionInfo.attached_from`.
+    remote: []const u8,
+    /// The client's terminal size, from its `Hello`.
+    cols: u16,
+    rows: u16,
+    cell_width_px: ?u32 = null,
+    cell_height_px: ?u32 = null,
+    /// The client connection's TLS exporter value for `auth.resume_`,
+    /// which a `Resume` proof is checked against.
+    resume_exporter: ?[]const u8 = null,
+
+    pub const type_id = 1000;
+    pub const tags = .{ .remote = 1, .cols = 2, .rows = 3, .cell_width_px = 4, .cell_height_px = 5, .resume_exporter = 6 };
+
+    pub fn encodedLen(m: Connect) usize {
+        return bodyLen(Connect, m);
+    }
+
+    pub fn encode(m: Connect, w: *Writer) Writer.Error!void {
+        return encodeBody(Connect, m, w);
+    }
+
+    pub fn decode(bytes: []const u8) DecodeError!Connect {
+        return decodeBody(Connect, bytes);
+    }
+};
+
 pub const Message = union(enum) {
     hello: Hello,
     hello_reply: HelloReply,
@@ -553,6 +584,7 @@ pub const Message = union(enum) {
     list_end: ListEnd,
     kill: Kill,
     killed: Killed,
+    connect: Connect,
     /// A message type this revision does not define.
     unknown: Unknown,
 
@@ -778,7 +810,9 @@ test "every message round trips" {
         .{ .list_end = .{} },
         .{ .kill = .{ .session_id = 2 } },
         .{ .killed = .{ .session_id = 2 } },
-        .{ .unknown = .{ .type_id = 1000, .body = "\x01\x00" } },
+        .{ .connect = .{ .remote = "[::1]:5000", .cols = 80, .rows = 24, .cell_width_px = 9, .cell_height_px = 18, .resume_exporter = "exporter" } },
+        .{ .connect = .{ .remote = "", .cols = 1, .rows = 1 } },
+        .{ .unknown = .{ .type_id = 1999, .body = "\x01\x00" } },
     };
     var buf: [256]u8 = undefined;
     for (samples) |m| try testing.expectEqualDeep(m, try roundTrip(&buf, m));
