@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      # The Zig version is build.zig.zon's minimum_zig_version.
+      - uses: mlugg/setup-zig@v2
+      - run: zig fmt --check src build.zig
+      - run: zig build test --summary all
+
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+      - run: zig build release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: zig-out/release/

@@ -1008,12 +1008,13 @@ test "no fds leak into the program" {
     try testing.expectEqual(100, c.dup2(null_fd, 100));
     defer closeFd(100);
 
-    const fd_dir = if (native_os == .linux) "/proc/self/fd" else "/dev/fd";
-    var pty = try spawnTest(&environ, &.{ "ls", "-1", fd_dir });
+    // The shell's own redirections open no fds, where `ls /dev/fd` can open
+    // more than its directory on some macOS versions. Shells keep their
+    // private fds at 10 and up.
+    var pty = try spawnTest(&environ, &.{ "/bin/sh", "-c", "for fd in 3 4 5 6 7 8 9 100; do if (: <&$fd) 2>/dev/null; then echo $fd; fi; done; echo end" });
     defer pty.deinit();
     var out: Output = .{};
     try out.readToEnd(&pty);
     try testing.expectEqual(Term{ .exited = 0 }, try waitTest(&pty));
-    // stdio, and ls's fd for the directory.
-    try testing.expectEqualStrings("0\r\n1\r\n2\r\n3\r\n", out.bytes());
+    try testing.expectEqualStrings("end\r\n", out.bytes());
 }
