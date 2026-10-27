@@ -10,10 +10,10 @@
 //! A connection that closes leaves its session running, detached. A
 //! session ends when its program exits; the attached client gets `Exit`.
 //!
-//! Attaching to a running session resizes it to the client's terminal,
-//! then sends `Rebuild`: bytes generated from the primary terminal's state
-//! (see `term.rebuild`), so the log's start isn't needed. Output records
-//! follow from the next seq.
+//! Attaching to a running session resizes it to the client's terminal and
+//! sends `Rebuild`, bytes generated from the primary terminal's state (see
+//! `term.rebuild`). Output records follow from the next seq. The log may
+//! have dropped its start by then.
 //!
 //! Listening on a wildcard address binds each address it covers, and
 //! follows addresses as they come and go (see `addresses`).

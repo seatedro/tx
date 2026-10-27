@@ -1,19 +1,18 @@
-//! Rebuild bytes: VT output that brings a terminal in its initial state to
-//! a primary terminal's state. The server sends them on attach instead of
-//! replaying the log, which may have been trimmed.
+//! VT output that brings a terminal in its initial state to a primary
+//! terminal's state. The server sends it to a client attaching to a
+//! running session.
 //!
 //! libghostty-vt's formatter writes each screen's cells, and the cursor,
-//! pen, hyperlink, protection and charsets. This file adds what it leaves
-//! out or writes in an order that doesn't replay: both screens when the
-//! alternate one is active, modes restored after the text so they can't
-//! change how it is laid out, saved modes, the Kitty keyboard stack, the
-//! cursor shape, colors, the title and the mouse shape.
+//! pen, hyperlink, protection and charsets. The rest is written here: the
+//! inactive screen, modes, saved modes, the saved cursor, the Kitty
+//! keyboard stack, the cursor shape, colors, the title and the mouse shape.
+//! Modes are set after the text, since some change how text is laid out.
 //!
 //! Not rebuilt: a pending wrap in the saved cursor, a blank cell under a
-//! pending wrap (it becomes a space), a charset slot set
-//! back to UTF-8 (only a reset does that), the character REP repeats,
-//! semantic prompt marks, Kitty images, Glyph Protocol registrations and
-//! the drag and drop registration.
+//! pending wrap (it becomes a space), a charset slot set back to UTF-8
+//! (only a reset does that), the character REP repeats, semantic prompt
+//! marks, Kitty images, Glyph Protocol registrations and the drag and drop
+//! registration.
 const std = @import("std");
 const Writer = std.Io.Writer;
 const vt = @import("ghostty-vt");
@@ -36,8 +35,8 @@ pub fn write(w: *Writer, t: *const Terminal) Writer.Error!void {
     try r.all();
 }
 
-/// Unwrapped, so soft-wrapped rows wrap again as they are printed, and
-/// untrimmed, so blank rows keep their place.
+/// Soft-wrapped rows are written as one line, which wraps again as it is
+/// printed. Blank rows are kept, since they set where later rows land.
 const format_options: vt.formatter.Options = .{ .emit = .vt, .unwrap = true, .trim = false };
 
 const Rebuild = struct {
@@ -71,9 +70,9 @@ const Rebuild = struct {
 
         try r.text(.primary);
 
-        // While the alternate screen is active: the primary screen's
-        // cursor, pen and keyboard flags. Entering the alternate screen
-        // with mode 1049 saves that cursor, as it did for the program.
+        // The primary screen's cursor, pen and keyboard flags are written
+        // before entering the alternate screen. Mode 1049 saves that
+        // cursor, as it did for the program.
         if (t.screens.active_key == .alternate) {
             if (!t.modes.get(.alt_screen_save_cursor_clear_enter)) try r.savedCursor(.primary);
             try r.cursor(.primary, false);
@@ -89,8 +88,8 @@ const Rebuild = struct {
         try r.colors();
         try r.terminalState();
 
-        // Last: it holds the receiving terminal's display until the program
-        // ends the update.
+        // Written last, because it holds the receiving terminal's display
+        // until the program ends the update.
         if (t.modes.get(.synchronized_output)) try r.setMode(.synchronized_output, true);
     }
 
@@ -128,8 +127,8 @@ const Rebuild = struct {
         for ([_]Mode{ .alt_screen_save_cursor_clear_enter, .alt_screen, .alt_screen_legacy }) |mode| {
             if (modes.get(mode)) return r.setMode(mode, true);
         }
-        // Switched without a mode, by a full reset's side effects or the
-        // like. 1047 switches without saving the cursor.
+        // The alternate screen is active with none of the modes set. 1047
+        // switches without saving the cursor.
         try r.w.writeAll("\x1b[?1047h");
         r.setTracked(.alt_screen, true);
     }
@@ -206,8 +205,8 @@ const Rebuild = struct {
         if (region.left != 0 or region.right != t.cols - 1) try r.w.print("\x1b[{d};{d}s", .{ region.left + 1, region.right + 1 });
     }
 
-    /// What DECSC saved: written before the modes and the scrolling
-    /// region, so that the position counts from the screen's corner.
+    /// The cursor DECSC saved. Written before the modes and the scrolling
+    /// region, so that its position counts from the screen's corner.
     fn savedCursor(r: *Rebuild, key: ScreenKey) Writer.Error!void {
         const saved = r.t.screens.get(key).?.saved_cursor orelse return;
 
@@ -378,10 +377,9 @@ const Rebuild = struct {
     }
 };
 
-/// Modes the rebuild sets with SM and RM. Switching screens is done by
-/// `enterAlternate`, 1048 saves the cursor rather than holding a value,
-/// and DECCOLM would resize the receiving terminal, whose size is the
-/// client's.
+/// Modes the rebuild sets with SM and RM. `enterAlternate` switches
+/// screens. Setting 1048 saves the cursor and holds no value. DECCOLM
+/// would resize the receiving terminal, whose size is the client's.
 fn replayable(comptime mode: Mode) bool {
     return switch (mode) {
         .alt_screen_legacy, .alt_screen, .alt_screen_save_cursor_clear_enter, .save_cursor, .@"132_column" => false,

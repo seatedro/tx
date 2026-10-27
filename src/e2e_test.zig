@@ -449,7 +449,7 @@ test "a session whose log was trimmed reattaches with its scrollback" {
     try typeDetached(&st, session_id, "\r");
     try waitForPrimaryText(&st, session_id, "ready");
 
-    // The first line is long gone from the log, but not from scrollback.
+    // The log dropped the first line. Scrollback still has it.
     var second: TestPty = try .open();
     defer second.close();
     var b: ClientThread = .{ .options = login.clientOptions(&st, &second, &keys) };
