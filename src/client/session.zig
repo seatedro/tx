@@ -22,6 +22,11 @@
 //! the input the server says it didn't get from the old connection. When
 //! that takes longer than `Options.notice_delay_ms`, a notice is drawn
 //! over the session, and the resume asks for a repaint, which clears it.
+//!
+//! The connection is given up once nothing has come from the server for
+//! `Options.silence_timeout_ns`. The server answers the keep-alives sent
+//! every `Options.keep_alive_ns`, so the timeout can be short. Suspended
+//! time counts, so a client waking from sleep reconnects at once.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -71,7 +76,12 @@ pub const Options = struct {
     /// Null disables `~.`.
     escape_char: ?u8 = '~',
     idle_timeout_ns: u64 = 30 * std.time.ns_per_s,
-    keep_alive_ns: u64 = 10 * std.time.ns_per_s,
+    /// The server answers each keep-alive, so an attached client hears
+    /// from it at least this often.
+    keep_alive_ns: u64 = 2 * std.time.ns_per_s,
+    /// An attached client that hasn't heard from the server for this long
+    /// reconnects.
+    silence_timeout_ns: u64 = 6 * std.time.ns_per_s,
     /// How long a reconnect goes before a notice is drawn over the session.
     notice_delay_ms: u64 = 3000,
 };
@@ -162,6 +172,10 @@ const max_held_input = 64 << 10;
 /// The most input sent kept for sending again after a resume.
 const max_sent_input = 64 << 10;
 
+/// How often an attached client checks how long the server has been
+/// silent.
+const silence_check_ms = 500;
+
 /// Runs one session until it exits or detaches. The user's terminal is in
 /// raw mode from the login on.
 pub fn run(gpa: Allocator, io: Io, options: Options) !Outcome {
@@ -243,6 +257,9 @@ const Run = struct {
     notice_timer: xev.Timer,
     notice_c: xev.Completion = .{},
     notice_cancel_c: xev.Completion = .{},
+    silence_timer: xev.Timer,
+    silence_c: xev.Completion = .{},
+    silence_cancel_c: xev.Completion = .{},
     /// The identity in `options.identities` being probed or signed with.
     key_index: usize = 0,
     /// Set while a signature is being made.
@@ -307,10 +324,12 @@ const Run = struct {
             .wake = try .init(),
             .retry_timer = try .init(),
             .notice_timer = try .init(),
+            .silence_timer = try .init(),
         };
         errdefer r.wake.deinit();
         errdefer r.retry_timer.deinit();
         errdefer r.notice_timer.deinit();
+        errdefer r.silence_timer.deinit();
         errdefer r.decoder.deinit();
         r.wake.wait(loop, &r.wake_c, Run, r, onWake);
 
@@ -388,6 +407,7 @@ const Run = struct {
         r.racer.stop();
         cancelTimer(r.loop, &r.retry_c, &r.retry_cancel_c);
         cancelTimer(r.loop, &r.notice_c, &r.notice_cancel_c);
+        cancelTimer(r.loop, &r.silence_c, &r.silence_cancel_c);
         // `onWake` disarms once the outcome is set. Cancelling the wait would
         // end it with an ECANCELED that libxev's poll doesn't map.
         if (r.wake_c.state() == .active) r.wake.notify() catch {};
@@ -397,6 +417,7 @@ const Run = struct {
         destroyRacer(r.gpa, r.racer);
         r.retry_timer.deinit();
         r.notice_timer.deinit();
+        r.silence_timer.deinit();
         r.wake.deinit();
         r.decoder.deinit();
         r.inbox.input.deinit(r.gpa);
@@ -676,6 +697,7 @@ const Run = struct {
                 r.resume_key = m.resume_key[0..auth.resume_.key_len].*;
                 r.session_id = m.session_id;
                 r.attached = true;
+                if (r.silence_c.state() != .active) r.silence_timer.run(r.loop, &r.silence_c, silence_check_ms, Run, r, onSilenceTimer);
                 if (resumed) {
                     r.reconnected();
                     r.resendInput(m.input_offset);
@@ -797,6 +819,24 @@ const Run = struct {
             }
             destroyRacer(r.gpa, r.retired.swapRemove(i));
         }
+        return .disarm;
+    }
+
+    /// Closes a connection the server has been silent on. `onClosed` then
+    /// reconnects. Runs while attached.
+    fn onSilenceTimer(r_: ?*Run, _: *xev.Loop, _: *xev.Completion, result: xev.Timer.RunError!void) xev.CallbackAction {
+        const r = r_.?;
+        result catch return .disarm;
+        if (r.outcome != null or !r.attached) return .disarm;
+
+        const conn = r.conn.?;
+        const silence = conn.silence();
+        if (silence.nanoseconds >= r.options.silence_timeout_ns) {
+            log.info("nothing from the server for {d} ms", .{@divTrunc(silence.nanoseconds, std.time.ns_per_ms)});
+            conn.close(0);
+            return .disarm;
+        }
+        r.silence_timer.run(r.loop, &r.silence_c, silence_check_ms, Run, r, onSilenceTimer);
         return .disarm;
     }
 

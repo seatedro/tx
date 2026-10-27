@@ -175,7 +175,7 @@ pub const Endpoint = struct {
 
         const conn = try self.gpa.create(Conn);
         errdefer self.gpa.destroy(conn);
-        conn.* = .{ .endpoint = self, .remote = remote };
+        conn.* = .{ .endpoint = self, .remote = remote, .received_at = Io.Clock.boot.now(self.io) };
         conn.quic = try quic.Connection.connect(self.gpa, self.io, self.options.role.client, self.local, remote, self.connectionOptions(conn));
         errdefer conn.quic.deinit();
         try self.conns.append(self.gpa, conn);
@@ -274,6 +274,7 @@ pub const Endpoint = struct {
         if (conn.closing != null) return;
 
         conn.quic.receive(from, packet) catch |err| return conn.fail(err);
+        conn.received_at = Io.Clock.boot.now(self.io);
 
         // Replies go to where the peer last sent from. A client that changes
         // address keeps its connection.
@@ -297,7 +298,7 @@ pub const Endpoint = struct {
         if (c.ngtcp2_pkt_decode_version_cid(&vc, packet.ptr, packet.len, cid_len) != 0) return;
 
         const conn = self.gpa.create(Conn) catch return;
-        conn.* = .{ .endpoint = self, .remote = from };
+        conn.* = .{ .endpoint = self, .remote = from, .received_at = Io.Clock.boot.now(self.io) };
         self.conns.append(self.gpa, conn) catch {
             self.gpa.destroy(conn);
             return;
@@ -477,6 +478,10 @@ pub const Conn = struct {
     flush_pending: bool = false,
     /// Set when the connection is done. It is freed when the event ends.
     closing: ?CloseReason = null,
+    /// When the last packet from the peer arrived, or the connection
+    /// started. On `Io.Clock.boot`, which counts time the system spent
+    /// suspended.
+    received_at: Io.Timestamp,
 
     pub const StreamKind = enum { bidi, uni };
 
@@ -486,6 +491,11 @@ pub const Conn = struct {
             .uni => try conn.quic.openUniStream(),
         };
         return conn.addStream(id);
+    }
+
+    /// How long since a packet from the peer arrived.
+    pub fn silence(conn: *const Conn) Io.Duration {
+        return conn.received_at.durationTo(Io.Clock.boot.now(conn.endpoint.io));
     }
 
     /// Sends CONNECTION_CLOSE with an application error code.
