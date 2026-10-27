@@ -2,6 +2,7 @@
 //!
 //! Usage: tx [-p PORT] [-l USER] [--attach ID | --new | --list | --kill ID]
 //!           [--server COMMAND] [--ssh PATH] [USER@]HOST
+//!        tx --version
 //!
 //! With none of `--attach`, `--new`, `--list` and `--kill`, tx attaches to
 //! the host's detached session if it has exactly one, and starts a session
@@ -13,10 +14,10 @@
 //! it. If that fails, tx asks, as ssh does. The key is added to the first
 //! file.
 //!
-//! The same ssh command runs `txd --install`, which sets up a
-//! service that keeps txd running on the host and starts it. tx
-//! runs the install over ssh again when nothing answers on the server's
-//! port.
+//! The same ssh command runs `txd --install`, which sets up a service that
+//! keeps txd running on the host and starts it. tx runs the install over
+//! ssh again when nothing answers on the server's port. On a host with no
+//! txd, tx copies one there first; see `remote.zig`.
 //!
 //! The login uses the SSH agent's Ed25519 and RSA keys, then
 //! `~/.ssh/id_ed25519`.
@@ -30,12 +31,13 @@ const IpAddress = Io.net.IpAddress;
 const client = @import("client");
 const auth = @import("auth");
 const proto = @import("proto");
+const build_options = @import("build_options");
 const paths = @import("paths.zig");
+const remote = @import("remote.zig");
 
-/// txd's default port.
-const default_port = 8739;
+const default_port = remote.default_port;
 
-const usage_text = "usage: tx [-p PORT] [-l USER] [--attach ID | --new | --list | --kill ID] [--server COMMAND] [--ssh PATH] [USER@]HOST";
+const usage_text = "usage: tx [-p PORT] [-l USER] [--attach ID | --new | --list | --kill ID] [--server COMMAND] [--ssh PATH] [USER@]HOST\n       tx --version";
 
 /// How long tx waits for an answer from the server's port before it
 /// starts txd over ssh, and after.
@@ -48,7 +50,7 @@ pub fn main(init: std.process.Init) !u8 {
     // First, so every thread inherits the mask: name lookups can start
     // threads, and a terminating signal must reach the session's signal
     // thread, which restores the terminal.
-    _ = client.tty.blockSignals();
+    const signal_mask = client.tty.blockSignals();
 
     const gpa = init.gpa;
     const io = init.io;
@@ -63,7 +65,7 @@ pub fn main(init: std.process.Init) !u8 {
     var new = false;
     // `--attach`, `--new`, `--list` and `--kill` exclude each other.
     var modes: usize = 0;
-    var server_command: []const u8 = "txd";
+    var server_command: ?[]const u8 = null;
     var ssh_path: []const u8 = "ssh";
     var destination: ?[]const u8 = null;
     var i: usize = 1;
@@ -92,6 +94,9 @@ pub fn main(init: std.process.Init) !u8 {
         } else if (std.mem.eql(u8, arg, "--server") and i + 1 < args.len) {
             i += 1;
             server_command = args[i];
+        } else if (std.mem.eql(u8, arg, "--version")) {
+            Io.File.stdout().writeStreamingAll(io, "tx " ++ build_options.version ++ "\n") catch return 255;
+            return 0;
         } else if (std.mem.eql(u8, arg, "--ssh") and i + 1 < args.len) {
             i += 1;
             ssh_path = args[i];
@@ -130,11 +135,12 @@ pub fn main(init: std.process.Init) !u8 {
     const known_name = auth.known_hosts.hostName(&name_buf, host, port, default_port) catch return fail("host name too long", .{});
     const tx_known_hosts = try paths.config(gpa, environ, "known_hosts");
     defer gpa.free(tx_known_hosts);
-    const ssh: SshSource = .{
+    const ssh: remote.Source = .{
         .ssh = ssh_path,
         .destination = ssh_destination,
         .server_command = server_command,
         .port = port,
+        .signal_mask = signal_mask,
     };
     const trusted = trustedKeys(gpa, io, environ, tx_known_hosts, known_name, addresses, ssh) catch |err| switch (err) {
         error.Declined => return 255,
@@ -375,50 +381,13 @@ fn keyFilePublicKey(gpa: Allocator, io: Io, path: []const u8) !auth.ssh.PublicKe
     return .fromEd25519(file.public_key);
 }
 
-/// How to run txd in the remote account over ssh.
-const SshSource = struct {
-    /// The ssh client.
-    ssh: []const u8,
-    /// `host` or `user@host`, as ssh takes it.
-    destination: []const u8,
-    /// txd on the remote side.
-    server_command: []const u8,
-    /// The port txd listens on.
-    port: u16,
-};
-
 /// Whether tx ran `txd --install` over ssh, and how it went.
 const Install = enum { not_run, failed, done };
 
-/// Runs `txd OPTIONS` in the remote account over ssh, with
-/// `--listen` for a port other than the default. Returns its stdout and
-/// whether it succeeded. Its stderr, such as what `--install` did, goes to
-/// the user.
-fn runOverSsh(gpa: Allocator, io: Io, source: SshSource, options: []const u8) !struct { ok: bool, stdout: []u8 } {
-    // Quoted for the remote shell, where `[` starts a pattern.
-    var listen_buf: [32]u8 = undefined;
-    const listen = if (source.port == default_port) "" else std.fmt.bufPrint(&listen_buf, " --listen '[::]:{d}'", .{source.port}) catch unreachable;
-    const command = try std.fmt.allocPrint(gpa, "{s} {s}{s}", .{ source.server_command, options, listen });
-    defer gpa.free(command);
-
-    // ssh asks for passwords and its own host keys on the terminal, not on
-    // stdin.
-    const result = try std.process.run(gpa, io, .{
-        .argv = &.{ source.ssh, "-T", "-o", "ConnectTimeout=10", "--", source.destination, command },
-        .stdout_limit = .limited(4096),
-        .stderr_limit = .limited(16 << 10),
-    });
-    defer gpa.free(result.stderr);
-
-    const message = std.mem.trim(u8, result.stderr, " \t\r\n");
-    if (message.len > 0) std.debug.print("{s}\n", .{message});
-    return .{ .ok = result.term.success(), .stdout = result.stdout };
-}
-
 /// Starts txd on the host, and sets up its service.
-fn installOverSsh(gpa: Allocator, io: Io, source: SshSource) Install {
-    const result = runOverSsh(gpa, io, source, "--install") catch |err| {
-        std.debug.print("tx: can't run ssh: {t}\n", .{err});
+fn installOverSsh(gpa: Allocator, io: Io, source: remote.Source) Install {
+    const result = remote.runTxd(gpa, io, source, "--install") catch |err| {
+        if (err != error.NoTxd) std.debug.print("tx: can't run txd over ssh: {t}\n", .{err});
         return .failed;
     };
     gpa.free(result.stdout);
@@ -428,8 +397,9 @@ fn installOverSsh(gpa: Allocator, io: Io, source: SshSource) Install {
 /// Reads txd's host key from the remote account over ssh, and
 /// installs txd there. ssh's own host key check vouches for the
 /// connection, so the key needs no prompt.
-fn hostKeyOverSsh(gpa: Allocator, io: Io, source: SshSource, install: *Install) !auth.Key {
-    const result = try runOverSsh(gpa, io, source, "--print-host-key --install");
+fn hostKeyOverSsh(gpa: Allocator, io: Io, source: remote.Source, install: *Install) !auth.Key {
+    install.* = .failed;
+    const result = try remote.runTxd(gpa, io, source, "--print-host-key --install");
     defer gpa.free(result.stdout);
     install.* = if (result.ok) .done else .failed;
 
@@ -458,7 +428,7 @@ fn trustedKeys(
     tx_known_hosts: []const u8,
     name: []const u8,
     addresses: []const IpAddress,
-    ssh: SshSource,
+    ssh: remote.Source,
 ) !Trusted {
     var known: auth.known_hosts.Known = .{};
     defer known.deinit(gpa);
@@ -564,4 +534,5 @@ test {
     // Analyzes `main`, and through it the crypto module, whose exports the
     // linked C code needs.
     _ = &main;
+    _ = remote;
 }

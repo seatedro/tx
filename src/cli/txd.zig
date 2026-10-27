@@ -2,6 +2,7 @@
 //!
 //! Usage: txd [--listen ADDRESS:PORT] [--key PATH] [--print-host-key]
 //!            [--install]
+//!        txd --version
 //!
 //! Personal mode: clients log in as the user running txd, with a key
 //! from `~/.config/tx/authorized_keys` if that file exists, or else from
@@ -20,6 +21,7 @@ const xev = @import("xev");
 const server_pkg = @import("server");
 const transport = @import("transport");
 const auth = @import("auth");
+const build_options = @import("build_options");
 const install = @import("install.zig");
 const keyfile = @import("keyfile.zig");
 const paths = @import("paths.zig");
@@ -56,6 +58,9 @@ pub fn main(init: std.process.Init) !u8 {
             print_host_key = true;
         } else if (std.mem.eql(u8, arg, "--install")) {
             install_service = true;
+        } else if (std.mem.eql(u8, arg, "--version")) {
+            Io.File.stdout().writeStreamingAll(io, "txd " ++ build_options.version ++ "\n") catch return 1;
+            return 0;
         } else return usage("unknown argument");
     }
 
@@ -152,7 +157,7 @@ pub fn main(init: std.process.Init) !u8 {
 }
 
 fn usage(reason: []const u8) u8 {
-    std.debug.print("txd: {s}\nusage: txd [--listen ADDRESS:PORT] [--key PATH] [--print-host-key] [--install]\n", .{reason});
+    std.debug.print("txd: {s}\nusage: txd [--listen ADDRESS:PORT] [--key PATH] [--print-host-key] [--install]\n       txd --version\n", .{reason});
     return 2;
 }
 
