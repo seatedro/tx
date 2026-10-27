@@ -61,8 +61,13 @@ pub const Options = struct {
     passphrase: *const fn (path: []const u8, buf: []u8, cancel_fd: posix.fd_t) ?[]u8 = askPassphrase,
     /// Print the session's ID once attached.
     show_session_id: bool = false,
-    /// Null starts a new session.
+    /// What to do once logged in.
+    command: Command = .attach,
+    /// Null starts a new session, unless `reuse_detached` is set.
     session_id: ?u64 = null,
+    /// With no `session_id`, attaches the detached session if there is
+    /// exactly one.
+    reuse_detached: bool = false,
     /// The user's terminal.
     in_fd: posix.fd_t = posix.STDIN_FILENO,
     out_fd: posix.fd_t = posix.STDOUT_FILENO,
@@ -74,6 +79,15 @@ pub const Options = struct {
     keep_alive_ns: u64 = 10 * std.time.ns_per_s,
     /// How long a reconnect goes before a notice is drawn over the session.
     notice_delay_ms: u64 = 3000,
+};
+
+pub const Command = union(enum) {
+    /// A session, with the user's terminal.
+    attach,
+    /// Lists the sessions. The terminal isn't used.
+    list,
+    /// Ends a session. The terminal isn't used.
+    kill: u64,
 };
 
 pub const Identity = struct {
@@ -104,6 +118,21 @@ pub const Outcome = union(enum) {
     host_key_refused: [32]u8,
     /// The server answered with `proto.Error`.
     refused: Refusal,
+    /// The sessions, for `Command.list`. Allocated with the allocator
+    /// given to `run`, and owned by the caller.
+    listed: []Listed,
+    /// For `Command.kill`.
+    killed: u64,
+
+    pub const Listed = struct {
+        session_id: u64,
+        cols: u16,
+        rows: u16,
+        running_s: u64,
+        /// Null while detached.
+        attached_from: ?Name,
+        title: ?Name,
+    };
 
     pub const Exit = struct {
         status: u8,
@@ -200,9 +229,9 @@ const Run = struct {
     retired: std.ArrayList(*connect.Racer) = .empty,
     /// The winner's connection, once its handshake completes.
     conn: ?*Conn = null,
-    /// The terminal's attributes from before the session. Raw mode is
-    /// applied once `terminal` is set.
-    raw: tty.RawMode,
+    /// The terminal's attributes from before the session, for
+    /// `Command.attach`. Raw mode is applied once `terminal` is set.
+    raw: ?tty.RawMode,
     /// Raw mode is on, and the reader and writer run. Set after the login.
     terminal: bool = false,
     /// The size sent in `Hello`.
@@ -230,6 +259,8 @@ const Run = struct {
     next_seq: u64 = 0,
     /// The server confirmed the attach on the current connection.
     attached: bool = false,
+    /// The sessions received for `Command.list`.
+    listing: std.ArrayList(Outcome.Listed) = .empty,
     /// Input typed before the first attach, or while reconnecting.
     held_input: std.ArrayList(u8) = .empty,
     /// The last input sent, up to `max_sent_input` bytes, and the offset of
@@ -301,7 +332,9 @@ const Run = struct {
             .options = options,
             .size = terminalSize(options),
             .racer = undefined,
-            .raw = try .save(options.in_fd),
+            // `list` and `kill` don't use the terminal, which may not be
+            // one.
+            .raw = if (options.command == .attach) try .save(options.in_fd) else null,
             .decoder = .init(gpa, max_message),
             .escape = .{ .char = options.escape_char },
             .wake = try .init(),
@@ -317,7 +350,7 @@ const Run = struct {
         // From the start, so a terminating signal during the login ends it.
         // Restoring the saved attributes before raw mode turns echo back on
         // after a passphrase prompt.
-        try r.signals.start(.{ .fd = options.in_fd, .raw_mode = &r.raw, .context = r, .callback = onSignal });
+        try r.signals.start(.{ .fd = options.in_fd, .raw_mode = if (r.raw) |*raw| raw else null, .context = r, .callback = onSignal });
         errdefer r.signals.stop();
 
         r.racer = try r.startRacer(null);
@@ -351,8 +384,8 @@ const Run = struct {
 
     /// Enters raw mode and starts reading and writing the terminal.
     fn startTerminal(r: *Run) !void {
-        try r.raw.apply();
-        errdefer r.raw.restore();
+        try r.raw.?.apply();
+        errdefer r.raw.?.restore();
 
         try r.writer.start(r.gpa, r.io, .{
             .fd = r.options.out_fd,
@@ -402,7 +435,8 @@ const Run = struct {
         r.inbox.input.deinit(r.gpa);
         r.held_input.deinit(r.gpa);
         r.sent_input.deinit(r.gpa);
-        if (r.terminal) r.raw.restore();
+        r.listing.deinit(r.gpa);
+        if (r.terminal) r.raw.?.restore();
     }
 
     fn destroyRacer(gpa: Allocator, racer: *connect.Racer) void {
@@ -626,10 +660,15 @@ const Run = struct {
         defer r.gpa.free(sig);
 
         r.send(.{ .auth_signature = .{ .user = r.options.user, .key = identity.key.blob(), .signature = sig } });
-        r.send(.{ .attach = .{ .session_id = r.options.session_id } });
+        r.send(switch (r.options.command) {
+            .attach => .{ .attach = .{ .session_id = r.options.session_id, .reuse = r.options.reuse_detached } },
+            .list => .{ .list = .{} },
+            .kill => |id| .{ .kill = .{ .session_id = id } },
+        });
     }
 
     fn onAuthOk(r: *Run) void {
+        if (r.options.command != .attach) return;
         r.startTerminal() catch |err| {
             r.failure = err;
             r.finish(.{ .disconnected = .failed });
@@ -704,6 +743,23 @@ const Run = struct {
                 r.next_seq = m.seq + 1;
                 r.send(.{ .ack = .{ .seq = m.seq } });
             },
+            .session_info => |m| {
+                if (r.options.command != .list) return r.refuse("the server sent a session list unasked");
+                r.listing.append(r.gpa, .{
+                    .session_id = m.session_id,
+                    .cols = m.cols,
+                    .rows = m.rows,
+                    .running_s = m.running_s,
+                    .attached_from = if (m.attached_from) |from| .init(from) else null,
+                    .title = if (m.title) |title| .init(title) else null,
+                }) catch return r.finish(.{ .disconnected = .failed });
+            },
+            .list_end => {
+                if (r.options.command != .list) return r.refuse("the server sent a session list unasked");
+                const listed = r.listing.toOwnedSlice(r.gpa) catch return r.finish(.{ .disconnected = .failed });
+                r.finish(.{ .listed = listed });
+            },
+            .killed => |m| r.finish(.{ .killed = m.session_id }),
             .exit => |m| r.finish(.{ .exited = .{
                 .status = m.status,
                 .signal = if (m.signal) |s| .init(s) else null,

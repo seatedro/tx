@@ -1,6 +1,11 @@
 //! tx: a session on a tx-session server.
 //!
-//! Usage: tx [-p PORT] [-l USER] [--attach ID] [--server COMMAND] [--ssh PATH] [USER@]HOST
+//! Usage: tx [-p PORT] [-l USER] [--attach ID | --new | --list | --kill ID]
+//!           [--server COMMAND] [--ssh PATH] [USER@]HOST
+//!
+//! With none of `--attach`, `--new`, `--list` and `--kill`, tx attaches to
+//! the host's detached session if it has exactly one, and starts a session
+//! if it has none.
 //!
 //! The server's key is checked against `~/.config/tx/known_hosts` and
 //! `~/.ssh/known_hosts`. For a host in neither, tx reads the key over ssh
@@ -19,12 +24,13 @@ const Io = std.Io;
 const IpAddress = Io.net.IpAddress;
 const client = @import("client");
 const auth = @import("auth");
+const proto = @import("proto");
 const paths = @import("paths.zig");
 
 /// tx-session's default port.
 const default_port = 8739;
 
-const usage_text = "usage: tx [-p PORT] [-l USER] [--attach ID] [--server COMMAND] [--ssh PATH] [USER@]HOST";
+const usage_text = "usage: tx [-p PORT] [-l USER] [--attach ID | --new | --list | --kill ID] [--server COMMAND] [--ssh PATH] [USER@]HOST";
 
 /// Key files tried after the agent's keys, under HOME.
 const default_key_files = [_][]const u8{".ssh/id_ed25519"};
@@ -44,6 +50,10 @@ pub fn main(init: std.process.Init) !u8 {
     var port: u16 = default_port;
     var user: ?[]const u8 = null;
     var session_id: ?u64 = null;
+    var command: client.session.Command = .attach;
+    var new = false;
+    // `--attach`, `--new`, `--list` and `--kill` exclude each other.
+    var modes: usize = 0;
     var server_command: []const u8 = "tx-session";
     var ssh_path: []const u8 = "ssh";
     var destination: ?[]const u8 = null;
@@ -59,6 +69,17 @@ pub fn main(init: std.process.Init) !u8 {
         } else if (std.mem.eql(u8, arg, "--attach") and i + 1 < args.len) {
             i += 1;
             session_id = std.fmt.parseInt(u64, args[i], 10) catch return usage("invalid session id");
+            modes += 1;
+        } else if (std.mem.eql(u8, arg, "--new")) {
+            new = true;
+            modes += 1;
+        } else if (std.mem.eql(u8, arg, "--list")) {
+            command = .list;
+            modes += 1;
+        } else if (std.mem.eql(u8, arg, "--kill") and i + 1 < args.len) {
+            i += 1;
+            command = .{ .kill = std.fmt.parseInt(u64, args[i], 10) catch return usage("invalid session id") };
+            modes += 1;
         } else if (std.mem.eql(u8, arg, "--server") and i + 1 < args.len) {
             i += 1;
             server_command = args[i];
@@ -69,6 +90,8 @@ pub fn main(init: std.process.Init) !u8 {
             destination = arg;
         } else return usage("unknown argument");
     }
+
+    if (modes > 1) return usage("--attach, --new, --list and --kill don't go together");
 
     // `user@host`. A `-l` user wins, as in ssh.
     var host = destination orelse return usage("no host");
@@ -83,7 +106,8 @@ pub fn main(init: std.process.Init) !u8 {
     const addresses = resolve(io, host, port, &address_buf) catch |err| return fail("can't resolve {s}: {t}", .{ host, err });
 
     // The keys, before the network: without one there's no login.
-    const agent_path = environ.get("SSH_AUTH_SOCK");
+    // An empty `SSH_AUTH_SOCK` means no agent, as in ssh.
+    const agent_path = if (environ.get("SSH_AUTH_SOCK")) |path| if (path.len > 0) path else null else null;
     var identities = try findIdentities(gpa, io, environ, agent_path);
     defer identities.deinit(gpa);
     if (identities.list.items.len == 0) return fail("no keys to log in with: the SSH agent has no Ed25519 or RSA keys, and there is no ~/.ssh/id_ed25519", .{});
@@ -113,7 +137,9 @@ pub fn main(init: std.process.Init) !u8 {
         .user = login_user,
         .agent = agent_path,
         .identities = identities.list.items,
+        .command = command,
         .session_id = session_id,
+        .reuse_detached = session_id == null and !new,
         .show_session_id = true,
         .term = environ.get("TERM") orelse "xterm-256color",
         .colorterm = environ.get("COLORTERM"),
@@ -141,8 +167,67 @@ pub fn main(init: std.process.Init) !u8 {
             , .{ known_name, auth.Fingerprint.init(key).slice(), tx_known_hosts });
             return 255;
         },
-        .refused => |refusal| return fail("{s}", .{refusal.message.slice()}),
+        .refused => |refusal| {
+            if (refusal.code == @backingInt(proto.ErrorCode.several_detached)) {
+                return fail("{s}; pick one with --attach ID, or start another with --new", .{refusal.message.slice()});
+            }
+            return fail("{s}", .{refusal.message.slice()});
+        },
+        .listed => |listed| {
+            defer gpa.free(listed);
+            printListing(io, listed) catch |err| return fail("writing the list failed: {t}", .{err});
+            return 0;
+        },
+        .killed => |id| {
+            std.debug.print("tx: killed session {d}\n", .{id});
+            return 0;
+        },
     }
+}
+
+/// One line per session, under a header.
+fn printListing(io: Io, listed: []const client.session.Outcome.Listed) !void {
+    var buf: [4096]u8 = undefined;
+    var stdout = Io.File.stdout().writerStreaming(io, &buf);
+    const w = &stdout.interface;
+    if (listed.len == 0) {
+        try w.writeAll("no sessions\n");
+        return w.flush();
+    }
+
+    try w.print("{s:>4}  {s:<9}  {s:<9}  {s:<22}  {s}\n", .{ "ID", "SIZE", "UP", "CLIENT", "TITLE" });
+    for (listed) |s| {
+        var size_buf: [16]u8 = undefined;
+        const size = std.fmt.bufPrint(&size_buf, "{d}x{d}", .{ s.cols, s.rows }) catch unreachable;
+        var up_buf: [16]u8 = undefined;
+        const client_text = if (s.attached_from) |*from| from.slice() else "detached";
+        const title = if (s.title) |*t| t.slice() else "";
+        try w.print("{d:>4}  {s:<9}  {s:<9}  {s:<22}  {s}\n", .{ s.session_id, size, formatDuration(&up_buf, s.running_s), client_text, title });
+    }
+    try w.flush();
+}
+
+/// `45s`, `12m`, `3h05m` or `2d04h`.
+fn formatDuration(buf: []u8, seconds: u64) []const u8 {
+    const m = seconds / 60;
+    const h = m / 60;
+    const d = h / 24;
+    return (if (d > 0)
+        std.fmt.bufPrint(buf, "{d}d{d:0>2}h", .{ d, h % 24 })
+    else if (h > 0)
+        std.fmt.bufPrint(buf, "{d}h{d:0>2}m", .{ h, m % 60 })
+    else if (m > 0)
+        std.fmt.bufPrint(buf, "{d}m", .{m})
+    else
+        std.fmt.bufPrint(buf, "{d}s", .{seconds})) catch unreachable;
+}
+
+test formatDuration {
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("45s", formatDuration(&buf, 45));
+    try std.testing.expectEqualStrings("12m", formatDuration(&buf, 12 * 60 + 5));
+    try std.testing.expectEqualStrings("3h05m", formatDuration(&buf, 3 * 3600 + 5 * 60));
+    try std.testing.expectEqualStrings("2d04h", formatDuration(&buf, 2 * 86400 + 4 * 3600 + 59));
 }
 
 /// The most addresses of a host tx tries.
@@ -416,4 +501,10 @@ fn fail(comptime format: []const u8, args: anytype) u8 {
 fn usage(reason: []const u8) u8 {
     std.debug.print("tx: {s}\n" ++ usage_text ++ "\n", .{reason});
     return 255;
+}
+
+test {
+    // Analyzes `main`, and through it the crypto module, whose exports the
+    // linked C code needs.
+    _ = &main;
 }

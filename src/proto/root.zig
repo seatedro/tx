@@ -28,6 +28,8 @@ pub const AuthOk = messages.AuthOk;
 pub const Rebuild = messages.Rebuild;
 pub const Resume = messages.Resume;
 pub const ErrorCode = messages.ErrorCode;
+pub const SessionInfo = messages.SessionInfo;
+pub const Kill = messages.Kill;
 
 pub const Decoder = frame.Decoder;
 pub const encode = frame.encode;

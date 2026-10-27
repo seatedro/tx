@@ -788,6 +788,126 @@ test "a client whose session was attached elsewhere doesn't take it back" {
     _ = try c3.join(&third);
 }
 
+/// A server whose sessions set the title `title N`, N being the session's
+/// ID, and wait for a line.
+const TitleSetup = struct {
+    environ: std.process.Environ.Map,
+    login: Login,
+    st: ServerThread,
+    keys: [1]auth.Key,
+
+    fn init(t: *TitleSetup) !void {
+        transport.crypto.init(testing.io);
+        t.environ = .init(gpa);
+        errdefer t.environ.deinit();
+        try t.environ.put("PATH", testing.environ.getPosix("PATH") orelse "/usr/bin:/bin");
+        try t.login.init(null);
+        errdefer t.login.deinit();
+        t.keys = .{t.login.key.public_key.toBytes()};
+        try t.st.init(try t.login.serverOptions(&t.environ, &.{
+            "/bin/sh", "-c",
+            \\printf '\033]2;title %s\033\\ready\r\n' "$TX_SESSION_ID"
+            \\read -r a
+        }));
+    }
+
+    fn deinit(t: *TitleSetup) void {
+        t.st.deinit();
+        t.login.deinit();
+        t.environ.deinit();
+    }
+
+    /// Runs a client until its outcome. A client that attaches is detached
+    /// once it shows `ready`.
+    fn run(t: *TitleSetup, command: client.session.Command, session_id: ?u64, reuse: bool) !client.session.Outcome {
+        var pty: TestPty = try .open();
+        defer pty.close();
+        var ct: ClientThread = .{ .options = t.login.clientOptions(&t.st, &pty, &t.keys) };
+        ct.options.command = command;
+        ct.options.session_id = session_id;
+        ct.options.reuse_detached = reuse;
+        try ct.start();
+
+        // A refused attach ends without `ready`.
+        if (command == .attach) {
+            const deadline = nowMs() + timeout_ms;
+            while (std.mem.indexOf(u8, pty.output.items, "ready") == null and !ct.done.load(.acquire)) {
+                if (nowMs() > deadline) return error.Timeout;
+                try pty.readFor(10);
+            }
+            if (!ct.done.load(.acquire)) try pty.type_("~.");
+        }
+        return ct.join(&pty);
+    }
+};
+
+test "a client lists the sessions, and kills one" {
+    var t: TitleSetup = undefined;
+    try t.init();
+    defer t.deinit();
+
+    try testing.expectEqual(1, (try t.run(.attach, null, false)).detached.?);
+
+    // A second session, attached while the list is taken.
+    var pty: TestPty = try .open();
+    defer pty.close();
+    var attached: ClientThread = .{ .options = t.login.clientOptions(&t.st, &pty, &t.keys) };
+    try attached.start();
+    try pty.readUntil("ready");
+
+    const listed = (try t.run(.list, null, false)).listed;
+    defer gpa.free(listed);
+    try testing.expectEqual(2, listed.len);
+    try testing.expectEqual(1, listed[0].session_id);
+    try testing.expectEqual(null, listed[0].attached_from);
+    try testing.expectEqualStrings("title 1", listed[0].title.?.slice());
+    try testing.expectEqual(80, listed[0].cols);
+    try testing.expectEqual(2, listed[1].session_id);
+    try testing.expect(std.mem.startsWith(u8, listed[1].attached_from.?.slice(), "127.0.0.1:"));
+
+    try testing.expectEqual(1, (try t.run(.{ .kill = 1 }, null, false)).killed);
+    const deadline = nowMs() + timeout_ms;
+    while (try primaryDump(&t.st, 1)) |dump| {
+        gpa.free(dump);
+        if (nowMs() > deadline) return error.Timeout;
+        try testing.io.sleep(.fromMilliseconds(10), .awake);
+    }
+    const after = (try t.run(.list, null, false)).listed;
+    defer gpa.free(after);
+    try testing.expectEqual(1, after.len);
+    try testing.expectEqual(2, after[0].session_id);
+
+    try testing.expectEqualStrings("no such session", (try t.run(.{ .kill = 7 }, null, false)).refused.message.slice());
+
+    try pty.type_("~.");
+    _ = try attached.join(&pty);
+}
+
+test "a client without an ID attaches the one detached session" {
+    var t: TitleSetup = undefined;
+    try t.init();
+    defer t.deinit();
+
+    // With none detached, a session starts. With one, it is attached.
+    try testing.expectEqual(1, (try t.run(.attach, null, true)).detached.?);
+    try testing.expectEqual(1, (try t.run(.attach, null, true)).detached.?);
+
+    // An attached session isn't picked.
+    var pty: TestPty = try .open();
+    defer pty.close();
+    var attached: ClientThread = .{ .options = t.login.clientOptions(&t.st, &pty, &t.keys) };
+    attached.options.reuse_detached = true;
+    try attached.start();
+    try pty.readUntil("title 1");
+    try testing.expectEqual(2, (try t.run(.attach, null, true)).detached.?);
+    try pty.type_("~.");
+    _ = try attached.join(&pty);
+
+    const refusal = (try t.run(.attach, null, true)).refused;
+    try testing.expectEqual(@backingInt(proto.ErrorCode.several_detached), refusal.code);
+    try testing.expectEqualStrings("sessions 1, 2 are detached", refusal.message.slice());
+}
+
 test "a client accepting another server key is refused" {
     transport.crypto.init(testing.io);
     var environ: std.process.Environ.Map = .init(gpa);
