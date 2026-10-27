@@ -16,6 +16,7 @@ const PosixAddress = Io.Threaded.PosixAddress;
 const xev = @import("xev");
 const c = @import("c");
 const quic = @import("quic.zig");
+const pending = @import("pending.zig");
 
 const log = std.log.scoped(.endpoint);
 
@@ -55,6 +56,10 @@ pub const Handler = struct {
     /// `conn` is freed when the callback returns. Its streams were closed
     /// first.
     closed: ?*const fn (ctx: ?*anyopaque, conn: *Conn, reason: CloseReason) void = null,
+    /// Server only. `conn` wasn't admitted within `Options.pending`'s
+    /// timeout. The endpoint closes it `expired_grace_ns` later, which
+    /// leaves time to send a reason.
+    pendingExpired: ?*const fn (ctx: ?*anyopaque, conn: *Conn) void = null,
 };
 
 pub const Options = struct {
@@ -71,7 +76,14 @@ pub const Options = struct {
     connection_window: u64 = 32 << 20,
     /// SO_RCVBUF. Datagrams that arrive while the loop is busy wait here.
     receive_buffer: c_int = 4 << 20,
+    /// Server only. Limits on connections until `Conn.admit`. Null leaves
+    /// them unlimited and admitted from the start.
+    pending: ?*pending.Pending = null,
 };
+
+/// How long a connection that wasn't admitted in time stays open after
+/// `Handler.pendingExpired`.
+pub const expired_grace_ns = std.time.ns_per_s;
 
 /// The length of the connection IDs the endpoint issues. ngtcp2 issues new
 /// ones at the length of the first.
@@ -307,20 +319,44 @@ pub const Endpoint = struct {
 
         var vc: c.ngtcp2_version_cid = undefined;
         if (c.ngtcp2_pkt_decode_version_cid(&vc, packet.ptr, packet.len, cid_len) != 0) return;
+        const hd = quic.initialHeader(packet) orelse return;
 
-        const conn = self.gpa.create(Conn) catch return;
+        // Checks the limits on connections not admitted yet. A token that
+        // doesn't verify is forged or stale, and its packet is dropped.
+        var retry: ?quic.Retry = null;
+        var source: ?pending.Source = null;
+        if (self.options.pending) |p| {
+            switch (quic.checkRetryToken(self.io, &p.retry_secret, &hd, from)) {
+                .none => {},
+                .valid => |r| retry = r,
+                .invalid => return,
+            }
+            source = .of(from);
+            switch (p.check(source.?, retry != null)) {
+                .accept => {},
+                .retry => return self.sendRetry(p, &hd, from),
+                .drop => return,
+            }
+            p.add(source.?) catch return;
+        }
+
+        const conn = self.gpa.create(Conn) catch return self.releasePending(source);
         conn.* = .{ .endpoint = self, .remote = from, .received_at = Io.Clock.boot.now(self.io) };
+        if (source) |src| conn.pending = .{
+            .source = src,
+            .deadline = Io.Clock.awake.now(self.io).addDuration(.fromNanoseconds(self.options.pending.?.limits.timeout_ns)),
+        };
         self.conns.append(self.gpa, conn) catch {
             self.gpa.destroy(conn);
-            return;
+            return self.releasePending(source);
         };
-        conn.quic = quic.Connection.accept(self.gpa, self.io, self.options.role.server, self.local, from, packet, self.connectionOptions(conn)) catch {
+        conn.quic = quic.Connection.accept(self.gpa, self.io, self.options.role.server, self.local, from, packet, retry, self.connectionOptions(conn)) catch {
             // Not an Initial packet, or not a valid one. ngtcp2's callbacks
             // may have added routes before it failed.
             _ = self.conns.pop();
             self.removeRoutes(conn);
             self.gpa.destroy(conn);
-            return;
+            return self.releasePending(source);
         };
         // The client addresses its Initial packets to the ID it chose until
         // it learns ours.
@@ -330,6 +366,19 @@ pub const Endpoint = struct {
         var ids: [quic.Connection.max_connection_ids]c.ngtcp2_cid = undefined;
         for (conn.quic.connectionIds(&ids)) |*cid| self.addRoute(cid.data[0..cid.datalen], conn);
         conn.flush_pending = true;
+    }
+
+    fn releasePending(self: *Endpoint, source: ?pending.Source) void {
+        if (source) |src| self.options.pending.?.remove(src);
+    }
+
+    /// Answers an Initial with a Retry. The client sends its Initial again
+    /// with the Retry's token, which only a client that receives at `to`
+    /// has.
+    fn sendRetry(self: *Endpoint, p: *pending.Pending, hd: *const c.ngtcp2_pkt_hd, to: IpAddress) void {
+        const len = quic.writeRetry(self.io, &self.out, &p.retry_secret, hd, to) catch return;
+        self.sendDatagram(.{ .len = len, .to = to });
+        p.retries += 1;
     }
 
     fn addRoute(self: *Endpoint, cid: []const u8, conn: *Conn) void {
@@ -435,17 +484,23 @@ pub const Endpoint = struct {
             conn.streams.deinit(self.gpa);
 
             if (self.options.handler.closed) |f| f(self.options.handler.ctx, conn, reason);
+            conn.admit();
             conn.quic.deinit();
             self.gpa.destroy(conn);
         }
     }
 
-    /// Sets the timer to the earliest expiry of any connection.
+    /// Sets the timer to the earliest expiry of any connection, or the
+    /// earliest deadline of a connection not admitted.
     fn armTimer(self: *Endpoint) void {
         var next: ?u64 = null;
+        const now = Io.Clock.awake.now(self.io);
         for (self.conns.items) |conn| {
-            const ns = conn.quic.timeout() orelse continue;
-            next = @min(next orelse ns, ns);
+            if (conn.quic.timeout()) |ns| next = @min(next orelse ns, ns);
+            if (conn.pending) |p| {
+                const ns: u64 = @intCast(@max(0, now.durationTo(p.deadline).nanoseconds));
+                next = @min(next orelse ns, ns);
+            }
         }
         const ns = next orelse return;
 
@@ -466,8 +521,18 @@ pub const Endpoint = struct {
 
         // Each connection checks its own expiry and does nothing if it
         // hasn't passed.
+        const now = Io.Clock.awake.now(self.io);
         for (self.conns.items) |conn| {
             if (conn.closing != null) continue;
+            if (conn.pending) |*p| if (now.nanoseconds >= p.deadline.nanoseconds) {
+                if (p.expired) {
+                    conn.close(0);
+                    continue;
+                }
+                p.expired = true;
+                p.deadline = now.addDuration(.fromNanoseconds(expired_grace_ns));
+                if (self.options.handler.pendingExpired) |f| f(self.options.handler.ctx, conn);
+            };
             conn.quic.handleExpiry() catch |err| {
                 conn.fail(err);
                 continue;
@@ -493,6 +558,24 @@ pub const Conn = struct {
     /// started. On `Io.Clock.boot`, which counts time the system spent
     /// suspended.
     received_at: Io.Timestamp,
+    /// Set until `admit` on a server with `Options.pending`.
+    pending: ?Pending = null,
+
+    const Pending = struct {
+        source: pending.Source,
+        /// On `Io.Clock.awake`.
+        deadline: Io.Timestamp,
+        /// The deadline passed once, and the connection closes at the next.
+        expired: bool = false,
+    };
+
+    /// The app trusts the peer, as after a login. The connection stops
+    /// counting toward `Options.pending`'s limits, and has no deadline.
+    pub fn admit(conn: *Conn) void {
+        const p = conn.pending orelse return;
+        conn.pending = null;
+        conn.endpoint.options.pending.?.remove(p.source);
+    }
 
     pub const StreamKind = enum { bidi, uni };
 
