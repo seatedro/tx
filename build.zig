@@ -56,7 +56,13 @@ pub fn build(b: *std.Build) void {
 
     const session_tests = b.addTest(.{
         .name = "session-test",
-        .root_module = sessionModule(b, target, optimize, termModule(b, target, optimize, ghostty_vt), wake),
+        .root_module = sessionModule(b, target, optimize, .{
+            .term = termModule(b, target, optimize, ghostty_vt),
+            .wake = wake,
+            .xev = xev,
+            .proto = protoModule(b, target, optimize),
+            .auth = authModule(b, target, optimize),
+        }),
     });
     addTestRuns(b, session_tests, test_step, test_network_step);
 
@@ -254,7 +260,7 @@ fn appModules(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     const transport = transportModule(b, target, optimize, libs.transport);
     const proto = protoModule(b, target, optimize);
     const auth = authModule(b, target, optimize);
-    const session = sessionModule(b, target, optimize, term, libs.wake);
+    const session = sessionModule(b, target, optimize, .{ .term = term, .wake = libs.wake, .xev = xev, .proto = proto, .auth = auth });
     return .{
         .xev = xev,
         .term = term,
@@ -399,12 +405,19 @@ fn clientModule(
     return mod;
 }
 
+const SessionDeps = struct {
+    term: *std.Build.Module,
+    wake: *std.Build.Module,
+    xev: *std.Build.Module,
+    proto: *std.Build.Module,
+    auth: *std.Build.Module,
+};
+
 fn sessionModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
-    term: *std.Build.Module,
-    wake: *std.Build.Module,
+    deps: SessionDeps,
 ) *std.Build.Module {
     const mod = b.createModule(.{
         .root_source_file = b.path("src/session/root.zig"),
@@ -412,8 +425,11 @@ fn sessionModule(
         .optimize = optimize,
         .link_libc = true,
     });
-    mod.addImport("term", term);
-    mod.addImport("wake", wake);
+    mod.addImport("term", deps.term);
+    mod.addImport("wake", deps.wake);
+    mod.addImport("xev", deps.xev);
+    mod.addImport("proto", deps.proto);
+    mod.addImport("auth", deps.auth);
     return mod;
 }
 
