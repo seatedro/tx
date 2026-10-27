@@ -1,4 +1,4 @@
-//! tx-session's server: QUIC connections attached to sessions.
+//! txd's server: QUIC connections attached to sessions.
 //!
 //! A client opens one bidirectional stream and sends `Hello`, then logs in:
 //! `AuthProbe` for each key it might sign with, and `AuthSignature` with

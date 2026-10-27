@@ -1,4 +1,4 @@
-//! tx-session and tx end to end in one process. The server and each client
+//! txd and tx end to end in one process. The server and each client
 //! run on their own thread and loop. A pseudo-terminal pair stands in for
 //! the user's terminal: the client uses the slave, and the test types into
 //! and reads from the master. Clients log in with a key from a test agent,
@@ -483,7 +483,7 @@ fn expectMatchesPrimary(st: *ServerThread, session_id: u64, bytes: []const u8) !
     try testing.expectEqualStrings(want, got);
 }
 
-test "a session runs, detaches, reattaches and exits through tx-session and tx" {
+test "a session runs, detaches, reattaches and exits through txd and tx" {
     transport.crypto.init(testing.io);
     var environ: std.process.Environ.Map = .init(gpa);
     defer environ.deinit();
