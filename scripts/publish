@@ -1,0 +1,63 @@
+#!/bin/sh
+# Uploads zig-out/release to https://tarball.seated.ro/tx/VERSION/, with a
+# SHA256SUMS file, which goes last. Run `zig build release` first.
+#
+# Needs CLOUDFLARE_ACCOUNT_ID, and CLOUDFLARE_API_TOKEN with permission to
+# edit R2 in that account.
+# It refuses a version that is already published. Each tx of a release
+# carries the SHA-256 of that release's txd builds, which a second upload
+# would replace.
+set -eu
+
+bucket=tarball
+site=https://tarball.seated.ro
+
+cd "$(dirname "$0")/.."
+version=$(sed -n 's/^ *\.version = "\(.*\)",$/\1/p' build.zig.zon)
+if [ -z "$version" ]; then
+    echo "publish: no version in build.zig.zon" >&2
+    exit 1
+fi
+for variable in CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN; do
+    if [ -z "$(printenv "$variable")" ]; then
+        echo "publish: $variable is not set" >&2
+        exit 1
+    fi
+done
+
+files="tx-linux-x86_64 tx-linux-aarch64 tx-macos-x86_64 tx-macos-aarch64
+txd-linux-x86_64 txd-linux-aarch64 txd-macos-x86_64 txd-macos-aarch64"
+for name in $files; do
+    if [ ! -f "zig-out/release/$name" ]; then
+        echo "publish: zig-out/release/$name is missing; run zig build release" >&2
+        exit 1
+    fi
+done
+
+if curl -fsI "$site/tx/$version/SHA256SUMS" >/dev/null 2>&1; then
+    echo "publish: $version is already published" >&2
+    exit 1
+fi
+
+sums=$(mktemp)
+trap 'rm -f "$sums"' EXIT
+(
+    cd zig-out/release
+    for name in $files; do
+        if command -v sha256sum >/dev/null 2>&1; then sha256sum "$name"; else shasum -a 256 "$name"; fi
+    done
+) >"$sums"
+
+upload() {
+    curl -fsS -X PUT \
+        -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+        -H "Content-Type: application/octet-stream" \
+        --data-binary "@$1" \
+        "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/r2/buckets/$bucket/objects/tx/$version/$2" >/dev/null
+    echo "uploaded $site/tx/$version/$2"
+}
+
+for name in $files; do
+    upload "zig-out/release/$name" "$name"
+done
+upload "$sums" SHA256SUMS

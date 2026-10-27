@@ -141,6 +141,7 @@ pub fn main(init: std.process.Init) !u8 {
         .server_command = server_command,
         .port = port,
         .signal_mask = signal_mask,
+        .environ = environ,
     };
     const trusted = trustedKeys(gpa, io, environ, tx_known_hosts, known_name, addresses, ssh) catch |err| switch (err) {
         error.Declined => return 255,

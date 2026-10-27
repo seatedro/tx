@@ -10,6 +10,11 @@ pub fn config(gpa: Allocator, environ: *const Environ.Map, name: []const u8) Err
     return xdg(gpa, environ, "XDG_CONFIG_HOME", ".config", name);
 }
 
+/// `$XDG_CACHE_HOME/tx/name`, or `~/.cache/tx/name`.
+pub fn cache(gpa: Allocator, environ: *const Environ.Map, name: []const u8) Error![]u8 {
+    return xdg(gpa, environ, "XDG_CACHE_HOME", ".cache", name);
+}
+
 /// `$XDG_STATE_HOME/tx/name`, or `~/.local/state/tx/name`.
 pub fn state(gpa: Allocator, environ: *const Environ.Map, name: []const u8) Error![]u8 {
     return xdg(gpa, environ, "XDG_STATE_HOME", ".local/state", name);

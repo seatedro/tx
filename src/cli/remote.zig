@@ -3,15 +3,21 @@
 //!
 //! tx looks for txd on the host in `~/.local/share/tx/DIR`, where DIR is
 //! tx's version, then in PATH. With neither, the host reports its
-//! `uname -s` and `uname -m`, and tx sends a txd for that platform through
-//! ssh's stdin into DIR:
+//! `uname -s` and `uname -m`, and a txd for that platform goes into DIR.
 //!
-//! - A release build sends a `txd-OS-ARCH` from its own directory, after
-//!   checking it against the SHA-256 the release lists for that platform.
-//! - A development build sends the `txd` next to it, if the host's
-//!   platform is its own. Development builds share a version, so DIR adds
-//!   the first 12 hex digits of that txd's SHA-256, and a rebuilt txd is
-//!   sent again.
+//! A release build tries these in order, and each txd must have the
+//! SHA-256 the release lists for its platform:
+//!
+//! 1. The host downloads `BASE/tx/VERSION/txd-OS-ARCH` with curl or wget.
+//!    BASE is `TX_DOWNLOAD_URL`, or `https://tarball.seated.ro`.
+//! 2. tx sends the `txd-OS-ARCH` from its own directory through ssh's
+//!    stdin.
+//! 3. tx downloads it into `~/.cache/tx/VERSION/`, and sends that.
+//!
+//! A development build has no release to download. It sends the `txd`
+//! next to it, if the host's platform is its own. Development builds share
+//! a version, so DIR adds the first 12 hex digits of that txd's SHA-256,
+//! and a rebuilt txd is sent again.
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
@@ -19,6 +25,10 @@ const Io = std.Io;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const build_options = @import("build_options");
 const txd_builds = @import("txd_builds");
+const paths = @import("paths.zig");
+
+/// Where releases are downloaded from, unless `TX_DOWNLOAD_URL` is set.
+const default_download_url = "https://tarball.seated.ro";
 
 /// txd's default port.
 pub const default_port = 8739;
@@ -36,10 +46,14 @@ pub const Source = struct {
     /// The signal mask from before tx blocked the signals its threads
     /// handle. ssh starts with it, since a child inherits the mask.
     signal_mask: std.posix.sigset_t,
+    environ: *const std.process.Environ.Map,
 };
 
 /// The status the remote command exits with when the host has no txd.
 const need_status = 3;
+
+/// The status the host's download exits with when it fails.
+const download_failed_status = 4;
 
 /// Runs `txd OPTIONS` in the remote account, with `--listen` for a port
 /// other than the default, and copies txd there first if the host has
@@ -71,7 +85,33 @@ pub fn runTxd(gpa: Allocator, io: Io, source: Source, options: []const u8) !Resu
         std.debug.print("tx: {s} has no txd, and tx has no build for {s} {s}\n", .{ source.destination, need.system, need.machine });
         return error.NoTxd;
     };
-    const path = try local.forPlatform(gpa, io, platform) orelse {
+    // A release build's txd for the platform, which the host can download.
+    const release: ?Release = if (releaseHash(platform)) |hash| .{
+        .url = try std.fmt.allocPrint(gpa, "{s}/tx/{s}/txd-{s}-{s}", .{
+            source.environ.get("TX_DOWNLOAD_URL") orelse default_download_url,
+            build_options.version,
+            platform.os,
+            platform.arch,
+        }),
+        .sha256_hex = hash,
+    } else null;
+    defer if (release) |r| gpa.free(r.url);
+
+    if (release) |r| {
+        std.debug.print("tx: {s} has no txd; downloading {s} there\n", .{ source.destination, r.url });
+        const download = try std.fmt.allocPrint(gpa,
+            \\sh -c 'd="$HOME/.local/share/tx/{s}"; f="$d/txd.part"; mkdir -p "$d" || exit {d}; if command -v curl >/dev/null 2>&1; then curl -fsSL -o "$f" "{s}"; else wget -qO "$f" "{s}"; fi || {{ rm -f "$f"; exit {d}; }}; s=$(sha256sum "$f" 2>/dev/null || shasum -a 256 "$f"); if [ "${{s%% *}}" != "{s}" ]; then rm -f "$f"; echo "the downloaded txd has the wrong SHA-256" >&2; exit {d}; fi; chmod 755 "$f" && mv "$f" "$d/txd" && exec "$d/txd" {s}{s}'
+        , .{ local.dir, download_failed_status, r.url, r.url, download_failed_status, r.sha256_hex, download_failed_status, options, listen });
+        defer gpa.free(download);
+        const downloaded = try runOverSsh(gpa, io, source, download, null);
+        if (downloaded.status != download_failed_status) return downloaded;
+        gpa.free(downloaded.stdout);
+        std.debug.print("tx: {s} can't download txd\n", .{source.destination});
+    }
+
+    // Next, the txd next to tx, then one tx downloads.
+    const path = try local.forPlatform(gpa, io, platform) orelse found: {
+        if (release) |r| if (try fetch(gpa, io, source.environ, r, platform)) |fetched| break :found fetched;
         std.debug.print("tx: {s} has no txd, and tx has no txd for {s}-{s} to copy there. Install txd on the host, or give its path with --server.\n", .{ source.destination, platform.os, platform.arch });
         return error.NoTxd;
     };
@@ -230,9 +270,7 @@ const Local = struct {
         }
 
         // A release build only sends a file with the release's hash.
-        const want = for (txd_builds.builds) |b| {
-            if (platform.eqlPlatform(.{ .os = b.os, .arch = b.arch })) break b.sha256_hex;
-        } else return null;
+        const want = releaseHash(platform) orelse return null;
         var name_buf: [64]u8 = undefined;
         const name = try std.fmt.bufPrint(&name_buf, "txd-{s}-{s}", .{ platform.os, platform.arch });
         const candidates: []const []const u8 = if (platform.eqlPlatform(.local)) &.{ name, "txd" } else &.{name};
@@ -249,6 +287,67 @@ const Local = struct {
         return null;
     }
 };
+
+/// The SHA-256 of the release's txd for `platform`. Null in a development
+/// build, and for a platform the release has no build for.
+fn releaseHash(platform: Platform) ?*const [64]u8 {
+    for (txd_builds.builds) |b| {
+        if (platform.eqlPlatform(.{ .os = b.os, .arch = b.arch })) return b.sha256_hex;
+    }
+    return null;
+}
+
+const Release = struct {
+    url: []u8,
+    sha256_hex: *const [64]u8,
+};
+
+/// Downloads the release's txd into `~/.cache/tx/VERSION/`, or finds it
+/// there, and returns its path. Null when the download fails or has the
+/// wrong SHA-256.
+fn fetch(gpa: Allocator, io: Io, environ: *const std.process.Environ.Map, release: Release, platform: Platform) !?[]u8 {
+    var name_buf: [64]u8 = undefined;
+    const name = try std.fmt.bufPrint(&name_buf, "{s}/txd-{s}-{s}", .{ build_options.version, platform.os, platform.arch });
+    const path = try paths.cache(gpa, environ, name);
+    errdefer gpa.free(path);
+
+    if (sha256Hex(gpa, io, path)) |got| {
+        if (std.mem.eql(u8, &got, release.sha256_hex)) return path;
+    } else |_| {}
+
+    std.debug.print("tx: downloading {s}\n", .{release.url});
+    var client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer client.deinit();
+    var body: Io.Writer.Allocating = .init(gpa);
+    defer body.deinit();
+    const result = client.fetch(.{ .location = .{ .url = release.url }, .response_writer = &body.writer }) catch |err| {
+        std.debug.print("tx: downloading {s} failed: {t}\n", .{ release.url, err });
+        gpa.free(path);
+        return null;
+    };
+    if (result.status != .ok) {
+        std.debug.print("tx: downloading {s} failed: HTTP {d}\n", .{ release.url, @backingInt(result.status) });
+        gpa.free(path);
+        return null;
+    }
+
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(body.written(), &digest, .{});
+    if (!std.mem.eql(u8, &std.fmt.bytesToHex(digest, .lower), release.sha256_hex)) {
+        std.debug.print("tx: {s} has the wrong SHA-256\n", .{release.url});
+        gpa.free(path);
+        return null;
+    }
+
+    // Written whole, then renamed, so the cache never holds part of one.
+    const dir = Io.Dir.cwd();
+    if (std.fs.path.dirname(path)) |parent| try dir.createDirPath(io, parent);
+    const part = try std.fmt.allocPrint(gpa, "{s}.part", .{path});
+    defer gpa.free(part);
+    try dir.writeFile(io, .{ .sub_path = part, .data = body.written() });
+    try dir.rename(part, dir, path, io);
+    return path;
+}
 
 fn sha256Hex(gpa: Allocator, io: Io, path: []const u8) ![64]u8 {
     const bytes = try Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(256 << 20));
