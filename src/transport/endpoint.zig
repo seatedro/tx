@@ -64,6 +64,8 @@ pub const Options = struct {
     role: Role,
     handler: Handler = .{},
     idle_timeout_ns: u64 = 30 * std.time.ns_per_s,
+    /// Client only. See `quic.Connection.Options`.
+    handshake_timeout_ns: ?u64 = null,
     keep_alive_ns: ?u64 = null,
     stream_window: u64 = 8 << 20,
     connection_window: u64 = 32 << 20,
@@ -197,6 +199,7 @@ pub const Endpoint = struct {
                 .connectionIdRetired = Conn.onConnectionIdRetired,
             },
             .idle_timeout_ns = self.options.idle_timeout_ns,
+            .handshake_timeout_ns = self.options.handshake_timeout_ns,
             .keep_alive_ns = self.options.keep_alive_ns,
             .stream_window = self.options.stream_window,
             .connection_window = self.options.connection_window,

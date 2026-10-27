@@ -93,9 +93,16 @@ pub const Attach = struct {
 
 pub const Attached = struct {
     session_id: u64,
+    /// The key that resumes the session on a new connection (see
+    /// `auth.resume_`). Replaced at each attach.
+    resume_key: []const u8,
+    /// The bytes of input the session got from the client since it
+    /// attached, counted across resumes. The client sends again the input
+    /// that follows them.
+    input_offset: u64 = 0,
 
     pub const type_id = 4;
-    pub const tags = .{ .session_id = 1 };
+    pub const tags = .{ .session_id = 1, .resume_key = 2, .input_offset = 3 };
 
     pub fn encodedLen(m: Attached) usize {
         return bodyLen(Attached, m);
@@ -241,6 +248,19 @@ pub const Exit = struct {
     }
 };
 
+/// The codes of `Error`.
+pub const ErrorCode = enum(u32) {
+    protocol = 1,
+    revision = 2,
+    no_session = 3,
+    log_trimmed = 4,
+    spawn = 5,
+    /// The login failed. The message doesn't say why.
+    auth = 6,
+    /// Another client attached to the session.
+    attached_elsewhere = 7,
+};
+
 pub const Error = struct {
     code: u32,
     message: []const u8 = "",
@@ -348,18 +368,17 @@ pub const AuthOk = struct {
     }
 };
 
-/// Bytes that bring a terminal in its initial state, at the size the
-/// client gave, to the session's state. Sent on attach, before the `Output`
-/// that follows them. A rebuild longer than a message is sent in parts.
+/// Bytes that bring the client's terminal, at the size the client gave,
+/// to the session's state (see `term.rebuild`). Sent on attach, and on a
+/// resume that can't continue from the client's seq. A rebuild longer
+/// than a message is sent in parts.
 pub const Rebuild = struct {
     /// The seq of the first `Output` after the rebuild.
     seq: u64,
     bytes: []const u8,
-    /// Set on the rebuild's first part.
-    first: bool = false,
 
     pub const type_id = 16;
-    pub const tags = .{ .seq = 1, .bytes = 2, .first = 3 };
+    pub const tags = .{ .seq = 1, .bytes = 2 };
 
     pub fn encodedLen(m: Rebuild) usize {
         return bodyLen(Rebuild, m);
@@ -371,6 +390,32 @@ pub const Rebuild = struct {
 
     pub fn decode(bytes: []const u8) DecodeError!Rebuild {
         return decodeBody(Rebuild, bytes);
+    }
+};
+
+/// Logs in and attaches to a session on a new connection, for a client
+/// that was attached to it (see `auth.resume_`). The server answers with
+/// `Attached`, or `Error`.
+pub const Resume = struct {
+    session_id: u64,
+    /// The seq of the first `Output` the client hasn't written. Null, or a
+    /// seq the log no longer holds, gets a repaint.
+    next_seq: ?u64 = null,
+    proof: []const u8,
+
+    pub const type_id = 17;
+    pub const tags = .{ .session_id = 1, .next_seq = 2, .proof = 3 };
+
+    pub fn encodedLen(m: Resume) usize {
+        return bodyLen(Resume, m);
+    }
+
+    pub fn encode(m: Resume, w: *Writer) Writer.Error!void {
+        return encodeBody(Resume, m, w);
+    }
+
+    pub fn decode(bytes: []const u8) DecodeError!Resume {
+        return decodeBody(Resume, bytes);
     }
 };
 
@@ -391,6 +436,7 @@ pub const Message = union(enum) {
     auth_signature: AuthSignature,
     auth_ok: AuthOk,
     rebuild: Rebuild,
+    @"resume": Resume,
     /// A message type this revision does not define.
     unknown: Unknown,
 
@@ -590,7 +636,7 @@ test "every message round trips" {
         .{ .hello_reply = .{ .revision = 7 } },
         .{ .attach = .{ .session_id = std.math.maxInt(u64) } },
         .{ .attach = .{} },
-        .{ .attached = .{ .session_id = 0x0123_4567_89ab_cdef } },
+        .{ .attached = .{ .session_id = 0x0123_4567_89ab_cdef, .resume_key = "key", .input_offset = 9 } },
         .{ .output = .{ .seq = 1 << 40, .bytes = "\x1b[1mhi\x1b[m" } },
         .{ .output = .{ .seq = 0, .bytes = "" } },
         .{ .ack = .{ .seq = 300 } },
@@ -605,8 +651,10 @@ test "every message round trips" {
         .{ .auth_probe_reply = .{ .key = "blob", .accepted = false } },
         .{ .auth_signature = .{ .user = "rohit", .key = "blob", .signature = "sig" } },
         .{ .auth_ok = .{} },
-        .{ .rebuild = .{ .seq = 12, .bytes = "\x1b[Hab", .first = true } },
+        .{ .rebuild = .{ .seq = 12, .bytes = "\x1b[Hab" } },
         .{ .rebuild = .{ .seq = 0, .bytes = "" } },
+        .{ .@"resume" = .{ .session_id = 3, .next_seq = 40, .proof = "proof" } },
+        .{ .@"resume" = .{ .session_id = 3, .proof = "" } },
         .{ .unknown = .{ .type_id = 1000, .body = "\x01\x00" } },
     };
     var buf: [256]u8 = undefined;

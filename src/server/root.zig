@@ -15,6 +15,13 @@
 //! `term.rebuild`). Output records follow from the next seq. The log may
 //! have dropped its start by then.
 //!
+//! A client that lost its connection logs in on a new one with `Resume`,
+//! which proves it holds the session's resume key (see `auth.resume_`).
+//! The output continues from the first record the client hasn't
+//! written, or the client gets a repaint when the log no longer holds it.
+//! A client whose session is attached elsewhere gets `Error`, with
+//! `attached_elsewhere`.
+//!
 //! Listening on a wildcard address binds each address it covers, and
 //! follows addresses as they come and go (see `addresses`).
 const std = @import("std");
@@ -57,16 +64,7 @@ pub const Options = struct {
     idle_timeout_ns: u64 = 30 * std.time.ns_per_s,
 };
 
-/// Error codes sent in `proto.Error`.
-pub const ErrorCode = enum(u32) {
-    protocol = 1,
-    revision = 2,
-    no_session = 3,
-    log_trimmed = 4,
-    spawn = 5,
-    /// The login failed. The message doesn't say why.
-    auth = 6,
-};
+pub const ErrorCode = proto.ErrorCode;
 
 /// Output buffered on a stream above which the server stops reading the
 /// program's output, and below which it resumes.
@@ -467,7 +465,7 @@ const Client = struct {
     fn handle(client: *Client, message: proto.Message) void {
         // Before login, a client can say hello, log in and leave.
         if (!client.logged_in) switch (message) {
-            .hello, .auth_probe, .auth_signature, .detach, .unknown => {},
+            .hello, .auth_probe, .auth_signature, .@"resume", .detach, .unknown => {},
             else => return client.fail(.protocol, "not logged in"),
         };
 
@@ -476,7 +474,11 @@ const Client = struct {
             .auth_probe => |m| client.onAuthProbe(m),
             .auth_signature => |m| client.onAuthSignature(m),
             .attach => |m| client.onAttach(m),
-            .input => |m| if (client.session) |s| s.input(m.bytes),
+            .@"resume" => |m| client.onResume(m),
+            .input => |m| if (client.session) |s| {
+                s.input(m.bytes);
+                s.input_offset += m.bytes.len;
+            },
             .resize => |m| if (client.session) |s| {
                 if (boundedSize(m.cols, m.rows, cellSize(m.cell_width_px, m.cell_height_px))) |size| s.resize(size);
             },
@@ -572,18 +574,69 @@ const Client = struct {
                 return client.fail(.spawn, "can't start the session");
             };
 
-        // One client at a time: the newer attach wins.
-        if (s.client) |other| other.conn.close(0);
+        client.attachTo(s, if (m.session_id != null) .{ .rebuild = .attach } else .new, .attached);
+    }
+
+    /// Logs in with a proof of the session's resume key, and attaches.
+    fn onResume(client: *Client, m: proto.Resume) void {
+        if (!client.startLoginAttempt()) return;
+        const hello = &client.hello.?;
+
+        // A session that doesn't exist and a proof that doesn't match get
+        // the same answer.
+        const s = client.server.sessions.get(m.session_id) orelse return client.fail(.auth, "can't resume the session");
+        var exporter: [auth.resume_.exporter_len]u8 = undefined;
+        client.conn.quic.exportSecret(&exporter, auth.resume_.exporter_label);
+        if (!auth.resume_.verify(&s.resume_key, &exporter, s.id, m.proof)) {
+            log.info("{f} failed to resume session {d}", .{ client.conn.remote, s.id });
+            return client.fail(.auth, "can't resume the session");
+        }
+
+        log.info("{f} resumed session {d}", .{ client.conn.remote, s.id });
+        client.logged_in = true;
+        client.decoder.max_body_len = max_message;
+
+        const seq = m.next_seq orelse return client.attachTo(s, .{ .rebuild = .repaint }, .resumed);
+        client.attachTo(s, if (s.canContinue(seq, hello.size)) .{ .continue_from = seq } else .{ .rebuild = .repaint }, .resumed);
+    }
+
+    const Start = union(enum) {
+        /// A session started for this client. Its output goes from the
+        /// first record.
+        new,
+        /// Output from the session's next record, after a rebuild.
+        rebuild: term.rebuild.Kind,
+        /// Output from `seq`, which the log holds.
+        continue_from: u64,
+    };
+
+    /// `.resumed` keeps counting the client's input from where its last
+    /// connection left off.
+    fn attachTo(client: *Client, s: *Session, start: Start, how: enum { attached, resumed }) void {
+        const hello = &client.hello.?;
+
+        // One client at a time: the newer attach wins. The other client is
+        // told, so that it doesn't resume. When it is this client's own
+        // connection that was lost, nobody reads the error.
+        if (s.client) |other| {
+            s.detach();
+            other.fail(.attached_elsewhere, "the session was attached elsewhere");
+        }
 
         s.attach(client);
-        client.send(.{ .attached = .{ .session_id = s.id } });
+        if (how == .attached) s.input_offset = 0;
+        client.send(.{ .attached = .{ .session_id = s.id, .resume_key = &s.resume_key, .input_offset = s.input_offset } });
+        switch (start) {
+            .new => {},
+            .rebuild => |kind| s.rebuild_pending = kind,
+            .continue_from => |seq| s.next_seq = seq,
+        }
 
-        // A running session is rebuilt at the client's size. The program
-        // redraws at that size too, in output that follows the rebuild.
-        if (m.session_id != null) {
+        // A running session is resized to the client's terminal. The
+        // program redraws at that size, in output that follows.
+        if (start != .new) {
             const t = &s.host.primary.terminal;
             if (t.cols != hello.size.cols or t.rows != hello.size.rows) s.resize(hello.size);
-            s.rebuild_pending = true;
         }
         s.pump();
     }
@@ -622,8 +675,13 @@ const Session = struct {
     client: ?*Client = null,
     /// The next log seq to send to `client`.
     next_seq: u64 = 0,
-    /// `client` gets a rebuild before any output.
-    rebuild_pending: bool = false,
+    /// `client` gets a rebuild of this kind before any output.
+    rebuild_pending: ?term.rebuild.Kind = null,
+    /// Proves a client was the last to attach (see `auth.resume_`).
+    resume_key: [auth.resume_.key_len]u8 = undefined,
+    /// Bytes of input from the client since it attached, counted across
+    /// its resumes.
+    input_offset: u64 = 0,
     /// Output processing stopped because the client's stream holds
     /// `high_water` bytes. The host's thread stops reading the pty once its
     /// queue fills.
@@ -642,6 +700,7 @@ const Session = struct {
         s.client = client;
         client.session = s;
         s.next_seq = 0;
+        s.server.io.random(&s.resume_key);
 
         // The client's terminal answers queries now.
         s.host.answer_queries = false;
@@ -650,7 +709,7 @@ const Session = struct {
     fn detach(s: *Session) void {
         if (s.client) |client| client.session = null;
         s.client = null;
-        s.rebuild_pending = false;
+        s.rebuild_pending = null;
         s.host.answer_queries = true;
 
         // No stream is backed up now. Output keeps flowing while detached.
@@ -671,11 +730,11 @@ const Session = struct {
     fn pump(s: *Session) void {
         const client = s.client orelse return;
         const stream = client.stream orelse return;
-        if (s.rebuild_pending) {
-            s.sendRebuild(client);
+        if (s.rebuild_pending) |kind| {
+            s.sendRebuild(client, kind);
             // The output ends inside a long sequence. The next output may
             // finish it.
-            if (s.rebuild_pending) return;
+            if (s.rebuild_pending != null) return;
         }
 
         // The log dropped records the client hasn't been sent.
@@ -696,29 +755,38 @@ const Session = struct {
         if (stream.buffered() > high_water) s.paused = true;
     }
 
+    /// True if the log holds `seq` and the output since was written at
+    /// `size`.
+    fn canContinue(s: *const Session, seq: u64, size: term.log.Resize) bool {
+        var it = s.host.primary.log.iterator(seq) catch return false;
+        while (it.next()) |record| switch (record.payload) {
+            .output => {},
+            .resize => |r| if (r.cols != size.cols or r.rows != size.rows) return false,
+        };
+        return true;
+    }
+
     /// Sends `Rebuild` for the primary's state, in parts, and continues
     /// from the log's next record.
-    fn sendRebuild(s: *Session, client: *Client) void {
+    fn sendRebuild(s: *Session, client: *Client, kind: term.rebuild.Kind) void {
         const gpa = s.server.gpa;
         var out: Io.Writer.Allocating = .init(gpa);
         defer out.deinit();
-        s.host.primary.rebuild(&out.writer) catch |err| switch (err) {
+        s.host.primary.rebuild(&out.writer, kind) catch |err| switch (err) {
             error.Unfinished => return,
             error.WriteFailed => {
                 log.warn("session {d}: rebuild failed: out of memory", .{s.id});
                 return client.conn.close(0);
             },
         };
-        s.rebuild_pending = false;
+        s.rebuild_pending = null;
         s.next_seq = s.host.primary.log.nextSeq();
 
         var rest = out.written();
-        var first = true;
-        while (first or rest.len > 0) {
+        while (rest.len > 0) {
             const part = rest[0..@min(rest.len, rebuild_part)];
-            client.send(.{ .rebuild = .{ .seq = s.next_seq, .bytes = part, .first = first } });
+            client.send(.{ .rebuild = .{ .seq = s.next_seq, .bytes = part } });
             rest = rest[part.len..];
-            first = false;
         }
     }
 
