@@ -882,7 +882,7 @@ const Client = struct {
 
 /// A `List` sent to every session, and their answers. Sessions that don't
 /// answer within `query_timeout_ms` are left out. The query frees itself
-/// once its timer has ended.
+/// once it has reported and its timer, if any, has ended.
 const Query = struct {
     server: *Server,
     /// Null once the client has gone.
@@ -938,7 +938,9 @@ const Query = struct {
             q.waiting += 1;
         }
 
-        q.timer.run(server.loop, &q.timer_c, query_timeout_ms, Query, q, onTimer);
+        // With no session to wait for, the query reports and ends at once.
+        // A timer canceled as soon as it is added can still fire on kqueue.
+        if (q.waiting > 0) q.timer.run(server.loop, &q.timer_c, query_timeout_ms, Query, q, onTimer);
         return q;
     }
 
@@ -971,6 +973,7 @@ const Query = struct {
     fn reportIfDone(q: *Query) void {
         if (q.waiting > 0 or q.reported) return;
         q.report();
+        if (q.timer_c.state() == .dead) return q.destroy();
         // The timer's callback frees the query.
         q.timer.cancel(q.server.loop, &q.timer_c, &q.cancel_c, Query, q, onCanceled);
     }
