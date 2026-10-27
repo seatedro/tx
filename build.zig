@@ -161,6 +161,7 @@ pub fn build(b: *std.Build) void {
     tx_session.addImport("transport", transport);
     tx_session.addImport("auth", auth);
     b.installArtifact(b.addExecutable(.{ .name = "tx-session", .root_module = tx_session }));
+    addTestRuns(b, b.addTest(.{ .name = "tx-session-test", .root_module = tx_session }), test_step, test_network_step);
 }
 
 const ServerDeps = struct {

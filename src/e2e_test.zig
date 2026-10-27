@@ -1016,10 +1016,15 @@ test "a client whose addresses all fail reports the failure" {
     defer pty.close();
     var ct: ClientThread = .{ .options = login.clientOptions(&st, &pty, &.{login.key.public_key.toBytes()}) };
     ct.options.servers = &servers;
-    ct.options.idle_timeout_ns = std.time.ns_per_s;
+    ct.options.handshake_timeout_ns = std.time.ns_per_s;
+    const start = nowMs();
     try ct.start();
     const outcome = try ct.join(&pty);
-    try testing.expectEqual(transport.endpoint.CloseReason.idle_timeout, outcome.disconnected);
+    try testing.expectEqual(transport.endpoint.CloseReason.idle_timeout, outcome.no_connection);
+
+    // The handshake timeout ends the attempts, long before the 30 s idle
+    // timeout.
+    try testing.expect(nowMs() - start < 5000);
 }
 
 test "the agent's keys are probed in order and only the accepted one signs" {

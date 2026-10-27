@@ -1,6 +1,7 @@
 //! tx-session: serves the user's sessions over QUIC.
 //!
 //! Usage: tx-session [--listen ADDRESS:PORT] [--key PATH] [--print-host-key]
+//!                   [--install]
 //!
 //! Personal mode: clients log in as the user running tx-session, with a key
 //! from `~/.config/tx/authorized_keys` if that file exists, or else from
@@ -9,12 +10,17 @@
 //! `--print-host-key` prints the public host key as `ssh-ed25519 AAAA...`
 //! and exits, creating the key if there is none. `tx` runs it over ssh to
 //! learn a new host's key.
+//!
+//! `--install` sets up a service that keeps tx-session running with the
+//! given `--listen` and `--key`, starts it if it isn't running, and exits;
+//! see `install.zig`. With `--print-host-key`, the key is printed first.
 const std = @import("std");
 const Io = std.Io;
 const xev = @import("xev");
 const server_pkg = @import("server");
 const transport = @import("transport");
 const auth = @import("auth");
+const install = @import("install.zig");
 const keyfile = @import("keyfile.zig");
 const paths = @import("paths.zig");
 
@@ -33,17 +39,23 @@ pub fn main(init: std.process.Init) !u8 {
     var listen: Io.net.IpAddress = try .parseIp6("::", default_port);
     var key_path: ?[]const u8 = null;
     var print_host_key = false;
+    var install_service = false;
+    // `--listen` and `--key` as given, for the service.
+    var listen_arg: ?[]const u8 = null;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "--listen") and i + 1 < args.len) {
             i += 1;
             listen = Io.net.IpAddress.parseLiteral(args[i]) catch return usage("invalid address");
+            listen_arg = args[i];
         } else if (std.mem.eql(u8, arg, "--key") and i + 1 < args.len) {
             i += 1;
             key_path = args[i];
         } else if (std.mem.eql(u8, arg, "--print-host-key")) {
             print_host_key = true;
+        } else if (std.mem.eql(u8, arg, "--install")) {
+            install_service = true;
         } else return usage("unknown argument");
     }
 
@@ -59,13 +71,37 @@ pub fn main(init: std.process.Init) !u8 {
         var w = Io.File.stdout().writerStreaming(io, &buf);
         try w.interface.print("{s} {s}\n", .{ auth.ssh.ed25519, auth.ssh.KeyText.init(identity.public_key.toBytes()).slice() });
         try w.interface.flush();
-        return 0;
+        if (!install_service) return 0;
     }
 
     const user = paths.userName(init.environ_map) orelse {
         std.debug.print("tx-session: can't tell the user name\n", .{});
         return 1;
     };
+
+    if (install_service) {
+        const arena = init.arena.allocator();
+        const exe = try install.exePath(arena, io, init.environ_map, args[0]);
+
+        var service_args: std.ArrayList([]const u8) = .empty;
+        if (listen_arg) |text| try service_args.appendSlice(arena, &.{ "--listen", text });
+        if (key_path) |p| {
+            // The service may start in another directory.
+            const cwd = try std.process.currentPathAlloc(io, arena);
+            try service_args.appendSlice(arena, &.{ "--key", try std.fs.path.resolve(arena, &.{ cwd, p }) });
+        }
+
+        install.install(gpa, io, init.environ_map, .{
+            .exe = exe,
+            .args = service_args.items,
+            .listen = listen,
+            .user = user,
+        }) catch |err| {
+            std.debug.print("tx-session: --install failed: {t}\n", .{err});
+            return 1;
+        };
+        return 0;
+    }
     const tx_authorized_keys = try paths.config(gpa, init.environ_map, "authorized_keys");
     defer gpa.free(tx_authorized_keys);
     const ssh_authorized_keys = try paths.home(gpa, init.environ_map, ".ssh/authorized_keys");
@@ -92,7 +128,7 @@ pub fn main(init: std.process.Init) !u8 {
     defer loop.deinit();
 
     var server: server_pkg.Server = undefined;
-    try server.init(gpa, io, &loop, .{
+    server.init(gpa, io, &loop, .{
         .listen = listen,
         .identity = identity,
         .user = user,
@@ -101,7 +137,13 @@ pub fn main(init: std.process.Init) !u8 {
         .argv = &.{login_name},
         .program = shell,
         .cwd = if (init.environ_map.get("HOME")) |home| .{ .path = home } else .inherit,
-    });
+    }) catch |err| switch (err) {
+        error.AddressInUse => {
+            std.debug.print("tx-session: port {d} is in use, by another tx-session or another program\n", .{listen.getPort()});
+            return 1;
+        },
+        else => |e| return e,
+    };
     defer server.deinit();
 
     std.log.info("serving {s}, host key {s}", .{ user, auth.Fingerprint.init(identity.public_key.toBytes()).slice() });
@@ -110,6 +152,11 @@ pub fn main(init: std.process.Init) !u8 {
 }
 
 fn usage(reason: []const u8) u8 {
-    std.debug.print("tx-session: {s}\nusage: tx-session [--listen ADDRESS:PORT] [--key PATH] [--print-host-key]\n", .{reason});
+    std.debug.print("tx-session: {s}\nusage: tx-session [--listen ADDRESS:PORT] [--key PATH] [--print-host-key] [--install]\n", .{reason});
     return 2;
+}
+
+test {
+    _ = &main;
+    _ = install;
 }
