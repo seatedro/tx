@@ -111,7 +111,7 @@ pub const Primary = struct {
     /// inside a sequence, they end with its start, so the next record
     /// finishes it.
     pub fn rebuild(self: *const Primary, w: *std.Io.Writer) RebuildError!void {
-        // Checked first, since the rest is wasted without it.
+        // Before the rebuild is written, which would be discarded.
         if (self.stream.continuation.?.broken) return error.Unfinished;
         try rebuild_pkg.write(w, &self.terminal);
         self.stream.writeContinuation(w) catch |err| switch (err) {
