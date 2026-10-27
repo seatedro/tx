@@ -1,23 +1,27 @@
-//! Running txd in the remote account over ssh, and copying it there when
-//! the host has none.
+//! Running txd in the remote account over ssh, and putting it there when
+//! the host has none. The commands that run on the host are in
+//! `remote.sh`.
 //!
 //! tx looks for txd on the host in `~/.local/share/tx/DIR`, where DIR is
 //! tx's version, then in PATH. With neither, the host reports its
 //! `uname -s` and `uname -m`, and a txd for that platform goes into DIR.
 //!
-//! A release build tries these in order, and each txd must have the
-//! SHA-256 the release lists for its platform:
+//! A release is a tarball per platform, `tx-VERSION-OS-ARCH.tar.gz`, with
+//! tx and txd in a directory of the same name. A release build of tx tries
+//! these in order, and each txd must have the SHA-256 tx carries for its
+//! platform:
 //!
-//! 1. The host downloads `BASE/tx/VERSION/txd-OS-ARCH` with curl or wget.
-//!    BASE is `TX_DOWNLOAD_URL`, or `https://tarball.seated.ro`.
-//! 2. tx sends the `txd-OS-ARCH` from its own directory through ssh's
-//!    stdin.
-//! 3. tx downloads it into `~/.cache/tx/VERSION/`, and sends that.
+//! 1. The host downloads `BASE/tx/VERSION/tx-VERSION-OS-ARCH.tar.gz` with
+//!    curl or wget. BASE is `TX_DOWNLOAD_URL`, or
+//!    `https://tarball.seated.ro`.
+//! 2. tx sends the `txd` next to it through ssh's stdin, if the host's
+//!    platform is its own.
+//! 3. tx downloads the tarball, keeps its txd in `~/.cache/tx/VERSION/`,
+//!    and sends that.
 //!
-//! A development build has no release to download. It sends the `txd`
-//! next to it, if the host's platform is its own. Development builds share
-//! a version, so DIR adds the first 12 hex digits of that txd's SHA-256,
-//! and a rebuilt txd is sent again.
+//! A development build has no release to download, and only does 2.
+//! Development builds share a version, so DIR adds the first 12 hex digits
+//! of that txd's SHA-256, and a rebuilt txd is sent again.
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
@@ -26,6 +30,25 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const build_options = @import("build_options");
 const txd_builds = @import("txd_builds");
 const paths = @import("paths.zig");
+
+/// `remote.sh` without its comments and blank lines, since ssh sends the
+/// script every time.
+const script = stripComments(@embedFile("remote.sh"));
+
+fn stripComments(comptime text: []const u8) []const u8 {
+    comptime {
+        @setEvalBranchQuota(100_000);
+        var out: []const u8 = "";
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |line| {
+            const code = std.mem.trimStart(u8, line, " ");
+            if (code.len == 0 or code[0] == '#') continue;
+            out = out ++ line ++ "\n";
+        }
+        const final = out[0..out.len].*;
+        return &final;
+    }
+}
 
 /// Where releases are downloaded from, unless `TX_DOWNLOAD_URL` is set.
 const default_download_url = "https://tarball.seated.ro";
@@ -49,35 +72,34 @@ pub const Source = struct {
     environ: *const std.process.Environ.Map,
 };
 
-/// The status the remote command exits with when the host has no txd.
+/// The statuses `remote.sh` exits with.
 const need_status = 3;
-
-/// The status the host's download exits with when it fails.
 const download_failed_status = 4;
 
-/// Runs `txd OPTIONS` in the remote account, with `--listen` for a port
-/// other than the default, and copies txd there first if the host has
-/// none. Its stderr, such as what `--install` did, goes to the user.
-pub fn runTxd(gpa: Allocator, io: Io, source: Source, options: []const u8) !Result {
+/// Runs txd with `args` in the remote account, with `--listen` for a port
+/// other than the default, and puts txd there first if the host has none.
+/// Its stderr, such as what `--install` did, goes to the user.
+pub fn runTxd(gpa: Allocator, io: Io, source: Source, args: []const []const u8) !Result {
     var listen_buf: [32]u8 = undefined;
-    const listen = if (source.port == default_port) "" else std.fmt.bufPrint(&listen_buf, " --listen \"[::]:{d}\"", .{source.port}) catch unreachable;
+    var txd_args: std.ArrayList([]const u8) = .empty;
+    defer txd_args.deinit(gpa);
+    try txd_args.appendSlice(gpa, args);
+    if (source.port != default_port) {
+        try txd_args.appendSlice(gpa, &.{ "--listen", std.fmt.bufPrint(&listen_buf, "[::]:{d}", .{source.port}) catch unreachable });
+    }
 
     if (source.server_command) |command| {
-        const line = try std.fmt.allocPrint(gpa, "{s} {s}{s}", .{ command, options, listen });
-        defer gpa.free(line);
-        return runOverSsh(gpa, io, source, line, null);
+        var line: Io.Writer.Allocating = .init(gpa);
+        defer line.deinit();
+        try line.writer.writeAll(command);
+        for (txd_args.items) |arg| try writeWord(&line.writer, arg);
+        return runOverSsh(gpa, io, source, line.written(), null);
     }
 
     var local: Local = try .find(gpa, io);
     defer local.deinit(gpa);
 
-    // `sh -c` keeps the script the same whatever the login shell is. The
-    // script has no single quotes.
-    const find = try std.fmt.allocPrint(gpa,
-        \\sh -c 'd="$HOME/.local/share/tx/{s}"; if [ -x "$d/txd" ]; then t="$d/txd"; elif command -v txd >/dev/null 2>&1; then t=txd; else echo "need $(uname -s) $(uname -m)"; exit {d}; fi; exec "$t" {s}{s}'
-    , .{ local.dir, need_status, options, listen });
-    defer gpa.free(find);
-    const found = try runOverSsh(gpa, io, source, find, null);
+    const found = try runStep(gpa, io, source, .{ .step = "run", .dir = local.dir }, txd_args.items, null);
     const need = needed(found) orelse return found;
     defer gpa.free(found.stdout);
 
@@ -85,25 +107,21 @@ pub fn runTxd(gpa: Allocator, io: Io, source: Source, options: []const u8) !Resu
         std.debug.print("tx: {s} has no txd, and tx has no build for {s} {s}\n", .{ source.destination, need.system, need.machine });
         return error.NoTxd;
     };
-    // A release build's txd for the platform, which the host can download.
-    const release: ?Release = if (releaseHash(platform)) |hash| .{
-        .url = try std.fmt.allocPrint(gpa, "{s}/tx/{s}/txd-{s}-{s}", .{
-            source.environ.get("TX_DOWNLOAD_URL") orelse default_download_url,
-            build_options.version,
-            platform.os,
-            platform.arch,
-        }),
-        .sha256_hex = hash,
-    } else null;
-    defer if (release) |r| gpa.free(r.url);
+
+    // A release build's tarball for the platform, which the host can
+    // download.
+    var release: ?Release = if (releaseHash(platform)) |hash| try .init(gpa, source.environ, platform, hash) else null;
+    defer if (release) |*r| r.deinit(gpa);
 
     if (release) |r| {
         std.debug.print("tx: {s} has no txd; downloading {s} there\n", .{ source.destination, r.url });
-        const download = try std.fmt.allocPrint(gpa,
-            \\sh -c 'd="$HOME/.local/share/tx/{s}"; f="$d/txd.part"; mkdir -p "$d" || exit {d}; if command -v curl >/dev/null 2>&1; then curl -fsSL -o "$f" "{s}"; else wget -qO "$f" "{s}"; fi || {{ rm -f "$f"; exit {d}; }}; s=$(sha256sum "$f" 2>/dev/null || shasum -a 256 "$f"); if [ "${{s%% *}}" != "{s}" ]; then rm -f "$f"; echo "the downloaded txd has the wrong SHA-256" >&2; exit {d}; fi; chmod 755 "$f" && mv "$f" "$d/txd" && exec "$d/txd" {s}{s}'
-        , .{ local.dir, download_failed_status, r.url, r.url, download_failed_status, r.sha256_hex, download_failed_status, options, listen });
-        defer gpa.free(download);
-        const downloaded = try runOverSsh(gpa, io, source, download, null);
+        const downloaded = try runStep(gpa, io, source, .{
+            .step = "download",
+            .dir = local.dir,
+            .url = r.url,
+            .member = r.member,
+            .sha256_hex = r.sha256_hex,
+        }, txd_args.items, null);
         if (downloaded.status != download_failed_status) return downloaded;
         gpa.free(downloaded.stdout);
         std.debug.print("tx: {s} can't download txd\n", .{source.destination});
@@ -120,19 +138,45 @@ pub fn runTxd(gpa: Allocator, io: Io, source: Source, options: []const u8) !Resu
     std.debug.print("tx: copying {s} to {s}:~/.local/share/tx/{s}/txd\n", .{ path, source.destination, local.dir });
     const file = try Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
-
-    // A partly written txd never takes the place of a complete one.
-    const copy = try std.fmt.allocPrint(gpa,
-        \\sh -c 'd="$HOME/.local/share/tx/{s}"; mkdir -p "$d" && cat > "$d/txd.part" && chmod 755 "$d/txd.part" && mv "$d/txd.part" "$d/txd" && exec "$d/txd" {s}{s}'
-    , .{ local.dir, options, listen });
-    defer gpa.free(copy);
-    const copied = try runOverSsh(gpa, io, source, copy, file);
+    const copied = try runStep(gpa, io, source, .{ .step = "copy", .dir = local.dir }, txd_args.items, file);
 
     // 126 and 127 are the shell's statuses for a program that can't run.
     if (copied.status == 126 or copied.status == 127) {
         std.debug.print("tx: the copied txd doesn't run on {s}. A development build of txd uses this machine's C library; `zig build release` makes static builds.\n", .{source.destination});
     }
     return copied;
+}
+
+/// The arguments of a step of `remote.sh`, before txd's.
+const Step = struct {
+    step: []const u8,
+    dir: []const u8,
+    url: []const u8 = "",
+    member: []const u8 = "",
+    sha256_hex: []const u8 = "",
+};
+
+/// Runs `remote.sh` in the remote account.
+fn runStep(gpa: Allocator, io: Io, source: Source, step: Step, txd_args: []const []const u8, stdin: ?Io.File) !Result {
+    // `sh -c` runs the script the same way whatever the login shell is.
+    var line: Io.Writer.Allocating = .init(gpa);
+    defer line.deinit();
+    try line.writer.writeAll("sh -c");
+    for ([_][]const u8{ script, "tx", step.step, step.dir, step.url, step.member, step.sha256_hex }) |word| try writeWord(&line.writer, word);
+    for (txd_args) |arg| try writeWord(&line.writer, arg);
+    return runOverSsh(gpa, io, source, line.written(), stdin);
+}
+
+/// Writes a space and `word` in single quotes, which sh, bash and zsh take
+/// literally. A single quote in `word` ends the quotes, adds an escaped
+/// quote, and starts them again. fish reads backslashes in single quotes,
+/// so a word with one reaches fish changed.
+fn writeWord(w: *Io.Writer, word: []const u8) !void {
+    try w.writeAll(" '");
+    for (word) |byte| {
+        if (byte == '\'') try w.writeAll("'\\''") else try w.writeByte(byte);
+    }
+    try w.writeByte('\'');
 }
 
 const Need = struct { system: []const u8, machine: []const u8 };
@@ -255,36 +299,29 @@ const Local = struct {
         gpa.free(l.dir);
     }
 
-    /// The path of a txd that runs on `platform`, owned, or null.
+    /// The txd next to tx, owned, if it runs on `platform`. A release build
+    /// only sends it with the release's SHA-256.
     fn forPlatform(l: *const Local, gpa: Allocator, io: Io, platform: Platform) !?[]u8 {
         const exe_dir = l.exe_dir orelse return null;
+        if (!platform.eqlPlatform(.local)) return null;
+        const path = try std.fs.path.join(gpa, &.{ exe_dir, "txd" });
+        errdefer gpa.free(path);
 
-        if (txd_builds.builds.len == 0) {
-            if (!platform.eqlPlatform(.local)) return null;
-            const path = try std.fs.path.join(gpa, &.{ exe_dir, "txd" });
-            Io.Dir.accessAbsolute(io, path, .{}) catch {
+        if (releaseHash(platform)) |want| {
+            const got = sha256Hex(gpa, io, path) catch {
                 gpa.free(path);
                 return null;
             };
-            return path;
-        }
-
-        // A release build only sends a file with the release's hash.
-        const want = releaseHash(platform) orelse return null;
-        var name_buf: [64]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buf, "txd-{s}-{s}", .{ platform.os, platform.arch });
-        const candidates: []const []const u8 = if (platform.eqlPlatform(.local)) &.{ name, "txd" } else &.{name};
-        for (candidates) |candidate| {
-            const path = try std.fs.path.join(gpa, &.{ exe_dir, candidate });
-            const got = sha256Hex(gpa, io, path) catch {
+            if (!std.mem.eql(u8, &got, want)) {
+                std.debug.print("tx: skipping {s}, whose SHA-256 isn't the release's\n", .{path});
                 gpa.free(path);
-                continue;
-            };
-            if (std.mem.eql(u8, &got, want)) return path;
-            std.debug.print("tx: skipping {s}, whose SHA-256 isn't the release's\n", .{path});
+                return null;
+            }
+        } else Io.Dir.accessAbsolute(io, path, .{}) catch {
             gpa.free(path);
-        }
-        return null;
+            return null;
+        };
+        return path;
     }
 };
 
@@ -297,14 +334,37 @@ fn releaseHash(platform: Platform) ?*const [64]u8 {
     return null;
 }
 
+/// A release tarball, and the SHA-256 of the txd in it.
 const Release = struct {
     url: []u8,
+    /// The path of txd in the tarball.
+    member: []u8,
     sha256_hex: *const [64]u8,
+
+    fn init(gpa: Allocator, environ: *const std.process.Environ.Map, platform: Platform, sha256_hex: *const [64]u8) !Release {
+        const name = try std.fmt.allocPrint(gpa, "tx-{s}-{s}-{s}", .{ build_options.version, platform.os, platform.arch });
+        defer gpa.free(name);
+        const url = try std.fmt.allocPrint(gpa, "{s}/tx/{s}/{s}.tar.gz", .{
+            environ.get("TX_DOWNLOAD_URL") orelse default_download_url,
+            build_options.version,
+            name,
+        });
+        errdefer gpa.free(url);
+        return .{ .url = url, .member = try std.fmt.allocPrint(gpa, "{s}/txd", .{name}), .sha256_hex = sha256_hex };
+    }
+
+    fn deinit(r: *Release, gpa: Allocator) void {
+        gpa.free(r.url);
+        gpa.free(r.member);
+    }
 };
 
-/// Downloads the release's txd into `~/.cache/tx/VERSION/`, or finds it
-/// there, and returns its path. Null when the download fails or has the
-/// wrong SHA-256.
+/// The largest txd tx takes out of a tarball.
+const max_txd_size = 256 << 20;
+
+/// Downloads the release tarball and keeps its txd in
+/// `~/.cache/tx/VERSION/`, or finds it there. Returns its path. Null when
+/// the download fails or its txd has the wrong SHA-256.
 fn fetch(gpa: Allocator, io: Io, environ: *const std.process.Environ.Map, release: Release, platform: Platform) !?[]u8 {
     var name_buf: [64]u8 = undefined;
     const name = try std.fmt.bufPrint(&name_buf, "{s}/txd-{s}-{s}", .{ build_options.version, platform.os, platform.arch });
@@ -331,10 +391,16 @@ fn fetch(gpa: Allocator, io: Io, environ: *const std.process.Environ.Map, releas
         return null;
     }
 
+    const txd = extract(gpa, body.written(), release.member) catch |err| {
+        std.debug.print("tx: can't take {s} out of {s}: {t}\n", .{ release.member, release.url, err });
+        gpa.free(path);
+        return null;
+    };
+    defer gpa.free(txd);
     var digest: [Sha256.digest_length]u8 = undefined;
-    Sha256.hash(body.written(), &digest, .{});
+    Sha256.hash(txd, &digest, .{});
     if (!std.mem.eql(u8, &std.fmt.bytesToHex(digest, .lower), release.sha256_hex)) {
-        std.debug.print("tx: {s} has the wrong SHA-256\n", .{release.url});
+        std.debug.print("tx: the txd in {s} has the wrong SHA-256\n", .{release.url});
         gpa.free(path);
         return null;
     }
@@ -344,9 +410,28 @@ fn fetch(gpa: Allocator, io: Io, environ: *const std.process.Environ.Map, releas
     if (std.fs.path.dirname(path)) |parent| try dir.createDirPath(io, parent);
     const part = try std.fmt.allocPrint(gpa, "{s}.part", .{path});
     defer gpa.free(part);
-    try dir.writeFile(io, .{ .sub_path = part, .data = body.written() });
+    try dir.writeFile(io, .{ .sub_path = part, .data = txd });
     try dir.rename(part, dir, path, io);
     return path;
+}
+
+/// The file `member` in the gzip-compressed tarball `bytes`, owned.
+fn extract(gpa: Allocator, bytes: []const u8, member: []const u8) ![]u8 {
+    var input: Io.Reader = .fixed(bytes);
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    var gzip: std.compress.flate.Decompress = .init(&input, .gzip, &window);
+    var name_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var files: std.tar.Iterator = .init(&gzip.reader, .{ .file_name_buffer = &name_buf, .link_name_buffer = &link_buf });
+    while (try files.next()) |file| {
+        if (file.kind != .file or !std.mem.eql(u8, file.name, member)) continue;
+        if (file.size > max_txd_size) return error.TooBig;
+        var out: Io.Writer.Allocating = .init(gpa);
+        errdefer out.deinit();
+        try files.streamRemaining(file, &out.writer);
+        return out.toOwnedSlice();
+    }
+    return error.NotInTarball;
 }
 
 fn sha256Hex(gpa: Allocator, io: Io, path: []const u8) ![64]u8 {
@@ -368,6 +453,20 @@ test "Platform.fromUname" {
     try testing.expectEqualStrings("aarch64", mac.arch);
     try testing.expect(Platform.fromUname("FreeBSD", "amd64") == null);
     try testing.expect(Platform.fromUname("Linux", "riscv64") == null);
+}
+
+test stripComments {
+    try testing.expectEqualStrings("a=1\n    b\n", comptime stripComments("# doc\n\na=1\n    # more\n    b\n"));
+    try testing.expect(std.mem.indexOf(u8, script, "case $step in") != null);
+    try testing.expect(std.mem.indexOf(u8, script, "\n#") == null);
+}
+
+test writeWord {
+    var out: Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try writeWord(&out.writer, "it's [::]:9000");
+    try writeWord(&out.writer, "");
+    try testing.expectEqualStrings(" 'it'\\''s [::]:9000' ''", out.written());
 }
 
 test needed {

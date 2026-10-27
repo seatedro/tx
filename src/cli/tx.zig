@@ -387,7 +387,7 @@ const Install = enum { not_run, failed, done };
 
 /// Starts txd on the host, and sets up its service.
 fn installOverSsh(gpa: Allocator, io: Io, source: remote.Source) Install {
-    const result = remote.runTxd(gpa, io, source, "--install") catch |err| {
+    const result = remote.runTxd(gpa, io, source, &.{"--install"}) catch |err| {
         if (err != error.NoTxd) std.debug.print("tx: can't run txd over ssh: {t}\n", .{err});
         return .failed;
     };
@@ -400,7 +400,7 @@ fn installOverSsh(gpa: Allocator, io: Io, source: remote.Source) Install {
 /// connection, so the key needs no prompt.
 fn hostKeyOverSsh(gpa: Allocator, io: Io, source: remote.Source, install: *Install) !auth.Key {
     install.* = .failed;
-    const result = try remote.runTxd(gpa, io, source, "--print-host-key --install");
+    const result = try remote.runTxd(gpa, io, source, &.{ "--print-host-key", "--install" });
     defer gpa.free(result.stdout);
     install.* = if (result.ok) .done else .failed;
 

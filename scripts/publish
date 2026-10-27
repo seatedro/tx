@@ -1,6 +1,7 @@
 #!/bin/sh
-# Uploads zig-out/release to https://tarball.seated.ro/tx/VERSION/, with a
-# SHA256SUMS file, which goes last. Run `zig build release` first.
+# Uploads the tarballs in zig-out/release to
+# https://tarball.seated.ro/tx/VERSION/, with a SHA256SUMS file, which goes
+# last. Run `zig build release` first.
 #
 # Needs CLOUDFLARE_ACCOUNT_ID, and CLOUDFLARE_API_TOKEN with permission to
 # edit R2 in that account.
@@ -25,8 +26,10 @@ for variable in CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN; do
     fi
 done
 
-files="tx-linux-x86_64 tx-linux-aarch64 tx-macos-x86_64 tx-macos-aarch64
-txd-linux-x86_64 txd-linux-aarch64 txd-macos-x86_64 txd-macos-aarch64"
+files=""
+for platform in linux-x86_64 linux-aarch64 macos-x86_64 macos-aarch64; do
+    files="$files tx-$version-$platform.tar.gz"
+done
 for name in $files; do
     if [ ! -f "zig-out/release/$name" ]; then
         echo "publish: zig-out/release/$name is missing; run zig build release" >&2

@@ -138,36 +138,50 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(b.addExecutable(.{ .name = "txd", .root_module = txd }));
     addTestRuns(b, b.addTest(.{ .name = "txd-test", .root_module = txd }), test_step, test_network_step);
 
-    // `zig build release` builds txd and tx for each release platform into
-    // zig-out/release. Each tx carries the SHA-256 of every txd.
+    // `zig build release` makes `tx-VERSION-OS-ARCH.tar.gz` in
+    // zig-out/release for each release platform, with tx, txd, the license
+    // and the README in a directory of the same name. Each tx carries the
+    // SHA-256 of every txd.
     const release_step = b.step("release", "Build tx and txd for every release platform");
     const release_info = buildInfo(b, version);
     const release_builds = b.addRunArtifact(txd_builds_tool);
     const release_builds_module = b.createModule(.{ .root_source_file = release_builds.addOutputFileArg("txd_builds.zig") });
+    const tarball_tool = b.addExecutable(.{
+        .name = "tarball",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/build/tarball.zig"),
+            .target = b.graph.host,
+        }),
+    });
     var release_apps: [release_targets.len]AppModules = undefined;
-    for (release_targets, &release_apps) |rt, *rt_app| {
+    var txds: [release_targets.len]*std.Build.Step.Compile = undefined;
+    for (release_targets, &release_apps, &txds) |rt, *rt_app, *txd_exe| {
         const rt_target = b.resolveTargetQuery(rt.query);
         rt_app.* = appModules(b, rt_target, .ReleaseSafe, libraries(b, rt_target, .ReleaseSafe));
-        const exe = b.addExecutable(.{ .name = "txd", .root_module = txdModule(b, rt_target, .ReleaseSafe, rt_app.*, release_info) });
-        exe.root_module.strip = true;
-        installRelease(b, release_step, exe, b.fmt("txd-{s}-{s}", .{ rt.os, rt.arch }));
+        txd_exe.* = b.addExecutable(.{ .name = "txd", .root_module = txdModule(b, rt_target, .ReleaseSafe, rt_app.*, release_info) });
+        txd_exe.*.root_module.strip = true;
         release_builds.addArgs(&.{ rt.os, rt.arch });
-        release_builds.addFileArg(exe.getEmittedBin());
+        release_builds.addFileArg(txd_exe.*.getEmittedBin());
     }
-    for (release_targets, release_apps) |rt, rt_app| {
+    for (release_targets, release_apps, txds) |rt, rt_app, txd_exe| {
         const rt_target = b.resolveTargetQuery(rt.query);
-        const exe = b.addExecutable(.{ .name = "tx", .root_module = txModule(b, rt_target, .ReleaseSafe, rt_app, release_info, release_builds_module) });
-        exe.root_module.strip = true;
-        installRelease(b, release_step, exe, b.fmt("tx-{s}-{s}", .{ rt.os, rt.arch }));
-    }
-}
+        const tx_exe = b.addExecutable(.{ .name = "tx", .root_module = txModule(b, rt_target, .ReleaseSafe, rt_app, release_info, release_builds_module) });
+        tx_exe.root_module.strip = true;
 
-fn installRelease(b: *std.Build, step: *std.Build.Step, exe: *std.Build.Step.Compile, name: []const u8) void {
-    const install = b.addInstallArtifact(exe, .{
-        .dest_dir = .{ .override = .{ .custom = "release" } },
-        .dest_sub_path = name,
-    });
-    step.dependOn(&install.step);
+        const name = b.fmt("tx-{s}-{s}-{s}", .{ version, rt.os, rt.arch });
+        const tarball = b.addRunArtifact(tarball_tool);
+        const out = tarball.addOutputFileArg(b.fmt("{s}.tar.gz", .{name}));
+        tarball.addArg(name);
+        tarball.addArgs(&.{ "tx", "755" });
+        tarball.addFileArg(tx_exe.getEmittedBin());
+        tarball.addArgs(&.{ "txd", "755" });
+        tarball.addFileArg(txd_exe.getEmittedBin());
+        tarball.addArgs(&.{ "LICENSE", "644" });
+        tarball.addFileArg(b.path("LICENSE"));
+        tarball.addArgs(&.{ "README.md", "644" });
+        tarball.addFileArg(b.path("README.md"));
+        release_step.dependOn(&b.addInstallFile(out, b.fmt("release/{s}.tar.gz", .{name})).step);
+    }
 }
 
 /// `build_options`, with the version.
