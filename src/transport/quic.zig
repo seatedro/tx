@@ -149,6 +149,9 @@ pub const Connection = struct {
         /// not use it.
         server_name: ?[*:0]const u8 = null,
         idle_timeout_ns: u64 = 30 * std.time.ns_per_s,
+        /// Gives up on a handshake that hasn't completed after this long.
+        /// Null leaves it to the idle timeout.
+        handshake_timeout_ns: ?u64 = null,
         /// Send a PING after this long without other packets, so an idle
         /// connection stays open.
         keep_alive_ns: ?u64 = null,
@@ -190,6 +193,7 @@ pub const Connection = struct {
         const dcid = randomCid(16);
         const scid = randomCid(16);
         var settings = defaultSettings(io);
+        if (options.handshake_timeout_ns) |ns| settings.handshake_timeout = ns;
         var params = defaultParams(options);
         var path: Path = undefined;
         path.init(local, remote);
@@ -488,7 +492,8 @@ pub const Connection = struct {
         return switch (code) {
             c.NGTCP2_ERR_CRYPTO => error.HandshakeFailed,
             c.NGTCP2_ERR_DRAINING, c.NGTCP2_ERR_CLOSING => error.Closed,
-            c.NGTCP2_ERR_IDLE_CLOSE => error.IdleTimeout,
+            // A handshake that timed out is reported as an idle timeout.
+            c.NGTCP2_ERR_IDLE_CLOSE, c.NGTCP2_ERR_HANDSHAKE_TIMEOUT => error.IdleTimeout,
             c.NGTCP2_ERR_NOMEM => error.OutOfMemory,
             c.NGTCP2_ERR_STREAM_ID_BLOCKED => error.StreamLimit,
             c.NGTCP2_ERR_STREAM_SHUT_WR, c.NGTCP2_ERR_STREAM_NOT_FOUND => error.StreamClosed,

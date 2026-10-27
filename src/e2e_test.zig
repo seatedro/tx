@@ -249,6 +249,118 @@ fn waitForPrimaryText(st: *ServerThread, session_id: u64, needle: []const u8) !v
     return error.Timeout;
 }
 
+/// The visible text of a session's primary terminal. Owned by the caller.
+fn primaryText(st: *ServerThread, session_id: u64) ![]const u8 {
+    const Text = struct {
+        req: ServerThread.Request = .{ .run = run },
+        session_id: u64,
+        result: anyerror![]const u8 = error.NoSession,
+
+        fn run(req: *ServerThread.Request, server_thread: *ServerThread) void {
+            const t: *@This() = @fieldParentPtr("req", req);
+            const s = server_thread.server.sessions.get(t.session_id) orelse return;
+            t.result = s.host.primary.terminal.plainString(gpa);
+        }
+    };
+    var t: Text = .{ .session_id = session_id };
+    st.call(&t.req);
+    return t.result;
+}
+
+/// Relays UDP datagrams between clients and a server on 127.0.0.1, one
+/// upstream socket per client address. While `dropping` is set it drops
+/// them all, as a network that went away would.
+const Relay = struct {
+    fd: posix.fd_t,
+    /// For clients to connect to.
+    addresses: [1]Io.net.IpAddress,
+    server: c.sockaddr.in,
+    pairs: [16]Pair = undefined,
+    len: usize = 0,
+    dropping: std.atomic.Value(bool) = .init(false),
+    stopping: std.atomic.Value(bool) = .init(false),
+    thread: std.Thread = undefined,
+
+    const Pair = struct {
+        client: c.sockaddr.in,
+        fd: posix.fd_t,
+    };
+
+    extern "c" fn socket(domain: c_uint, sock_type: c_uint, protocol: c_uint) c_int;
+
+    fn loopback(port: u16) c.sockaddr.in {
+        return .{ .port = std.mem.nativeToBig(u16, port), .addr = std.mem.nativeToBig(u32, 0x7f00_0001) };
+    }
+
+    fn open(port: u16) !posix.fd_t {
+        const fd = socket(c.AF.INET, c.SOCK.DGRAM, 0);
+        if (fd == -1) return error.SocketFailed;
+        errdefer _ = c.close(fd);
+        const addr = loopback(port);
+        if (c.bind(fd, @ptrCast(&addr), @sizeOf(c.sockaddr.in)) != 0) return error.BindFailed;
+        return fd;
+    }
+
+    fn start(r: *Relay, server: Io.net.IpAddress) !void {
+        const fd = try open(0);
+        var addr: c.sockaddr.in = undefined;
+        var len: c.socklen_t = @sizeOf(c.sockaddr.in);
+        if (c.getsockname(fd, @ptrCast(&addr), &len) != 0) return error.SocketFailed;
+        r.* = .{
+            .fd = fd,
+            .addresses = .{try .parseIp4("127.0.0.1", std.mem.bigToNative(u16, addr.port))},
+            .server = loopback(server.getPort()),
+        };
+        r.thread = try std.Thread.spawn(.{}, run, .{r});
+    }
+
+    fn stop(r: *Relay) void {
+        r.stopping.store(true, .release);
+        r.thread.join();
+        for (r.pairs[0..r.len]) |pair| _ = c.close(pair.fd);
+        _ = c.close(r.fd);
+    }
+
+    fn run(r: *Relay) void {
+        var buf: [65536]u8 = undefined;
+        while (!r.stopping.load(.acquire)) {
+            var fds: [17]posix.pollfd = undefined;
+            fds[0] = .{ .fd = r.fd, .events = posix.POLL.IN, .revents = 0 };
+            for (r.pairs[0..r.len], 1..) |pair, i| fds[i] = .{ .fd = pair.fd, .events = posix.POLL.IN, .revents = 0 };
+            if (c.poll(&fds, @intCast(r.len + 1), 20) <= 0) continue;
+            const dropping = r.dropping.load(.acquire);
+
+            // From a client, to the server through the client's socket.
+            if (fds[0].revents != 0) {
+                var from: c.sockaddr.in = undefined;
+                var from_len: c.socklen_t = @sizeOf(c.sockaddr.in);
+                const n = c.recvfrom(r.fd, &buf, buf.len, 0, @ptrCast(&from), &from_len);
+                if (n > 0 and !dropping) if (r.pairFor(from)) |pair| {
+                    _ = c.sendto(pair.fd, &buf, @intCast(n), 0, @ptrCast(&r.server), @sizeOf(c.sockaddr.in));
+                };
+            }
+
+            // From the server, back to the client.
+            for (r.pairs[0..r.len], 1..) |pair, i| {
+                if (fds[i].revents == 0) continue;
+                const n = c.recv(pair.fd, &buf, buf.len, 0);
+                if (n > 0 and !dropping) _ = c.sendto(r.fd, &buf, @intCast(n), 0, @ptrCast(&pair.client), @sizeOf(c.sockaddr.in));
+            }
+        }
+    }
+
+    fn pairFor(r: *Relay, from: c.sockaddr.in) ?Pair {
+        for (r.pairs[0..r.len]) |pair| {
+            if (pair.client.port == from.port and pair.client.addr == from.addr) return pair;
+        }
+        if (r.len == r.pairs.len) return null;
+        const fd = open(0) catch return null;
+        r.pairs[r.len] = .{ .client = from, .fd = fd };
+        r.len += 1;
+        return r.pairs[r.len - 1];
+    }
+};
+
 /// A pseudo-terminal pair at 80x24.
 const TestPty = struct {
     master: posix.fd_t,
@@ -504,6 +616,176 @@ test "reattaching inside an unfinished sequence finishes it" {
 
     try second.type_("~.");
     _ = try b.join(&second);
+}
+
+/// A server running a shell loop that echoes each line it reads, and a
+/// relay in front of it.
+const EchoSetup = struct {
+    environ: std.process.Environ.Map,
+    login: Login,
+    st: ServerThread,
+    relay: Relay,
+
+    fn init(e: *EchoSetup, log_capacity: ?usize) !void {
+        transport.crypto.init(testing.io);
+        e.environ = .init(gpa);
+        errdefer e.environ.deinit();
+        try e.environ.put("PATH", testing.environ.getPosix("PATH") orelse "/usr/bin:/bin");
+        try e.login.init(null);
+        errdefer e.login.deinit();
+
+        var options = try e.login.serverOptions(&e.environ, &.{
+            "/bin/sh", "-c",
+            \\printf 'ready\r\n'
+            \\while read -r a; do
+            \\  if [ "$a" = flood ]; then i=0; while [ $i -lt 2000 ]; do printf 'line %d\r\n' $i; i=$((i + 1)); done; fi
+            \\  printf 'got %s\r\n' "$a"
+            \\done
+        });
+        if (log_capacity) |n| options.terminal.log_capacity = n;
+        try e.st.init(options);
+        errdefer e.st.deinit();
+        try e.relay.start(e.st.addresses[0]);
+    }
+
+    fn deinit(e: *EchoSetup) void {
+        e.relay.stop();
+        e.st.deinit();
+        e.login.deinit();
+        e.environ.deinit();
+    }
+
+    /// A client through the relay that notices a dead connection within a
+    /// second.
+    fn clientOptions(e: *EchoSetup, pty: *const TestPty, keys: []const auth.Key) client.session.Options {
+        var options = e.login.clientOptions(&e.st, pty, keys);
+        options.servers = &e.relay.addresses;
+        options.idle_timeout_ns = std.time.ns_per_s;
+        options.keep_alive_ns = 200 * std.time.ns_per_ms;
+        return options;
+    }
+};
+
+test "a client that loses its connection resumes where it left off" {
+    var e: EchoSetup = undefined;
+    try e.init(null);
+    defer e.deinit();
+    const keys = [_]auth.Key{e.login.key.public_key.toBytes()};
+
+    var pty: TestPty = try .open();
+    defer pty.close();
+    var ct: ClientThread = .{ .options = e.clientOptions(&pty, &keys) };
+    // No notice, so the resume continues from the client's seq.
+    ct.options.notice_delay_ms = 60_000;
+    try ct.start();
+    try pty.readUntil("ready");
+    try pty.type_("one\r");
+    try pty.readUntil("got one");
+
+    // The network goes away. The server still has the old connection, and
+    // sends `got two` on it. The client holds `three` until it is back.
+    // The server's first session is 1.
+    e.relay.dropping.store(true, .release);
+    try testing.io.sleep(.fromMilliseconds(300), .awake);
+    try typeDetached(&e.st, 1, "two\r");
+    try pty.type_("three\r");
+    try testing.io.sleep(.fromMilliseconds(1200), .awake);
+    e.relay.dropping.store(false, .release);
+
+    const before = pty.output.items.len;
+    try pty.readUntil("got three");
+    const after = pty.output.items[before..];
+    try testing.expect(std.mem.indexOf(u8, after, "got two") != null);
+    // The output continued with no rebuild.
+    try testing.expect(std.mem.indexOf(u8, after, "\x1b[!p") == null);
+    try expectMatchesPrimary(&e.st, 1, pty.output.items);
+
+    try pty.type_("~.");
+    try testing.expectEqual(1, (try ct.join(&pty)).detached.?);
+}
+
+test "a resumed client whose output left the log gets a repaint" {
+    var e: EchoSetup = undefined;
+    try e.init(4096);
+    defer e.deinit();
+    const keys = [_]auth.Key{e.login.key.public_key.toBytes()};
+
+    var pty: TestPty = try .open();
+    defer pty.close();
+    var ct: ClientThread = .{ .options = e.clientOptions(&pty, &keys) };
+    ct.options.notice_delay_ms = 100;
+    try ct.start();
+    try pty.readUntil("ready");
+
+    // The output goes to the old connection, and leaves the log.
+    e.relay.dropping.store(true, .release);
+    try typeDetached(&e.st, 1, "flood\r");
+    try waitForPrimaryText(&e.st, 1, "got flood");
+    try pty.readUntil("reconnecting");
+    e.relay.dropping.store(false, .release);
+
+    // The repaint shows the screen as it is, without the notice.
+    try pty.readUntil("got flood");
+    try pty.type_("x\r");
+    try pty.readUntil("got x");
+    const want = try primaryText(&e.st, 1);
+    defer gpa.free(want);
+    const stand_in: *term.Primary = try .create(gpa, testing.io, .{ .cols = 80, .rows = 24 });
+    defer stand_in.destroy();
+    try stand_in.output(pty.output.items);
+    const got = try stand_in.terminal.plainString(gpa);
+    defer gpa.free(got);
+    try testing.expectEqualStrings(want, got);
+
+    try pty.type_("~.");
+    _ = try ct.join(&pty);
+}
+
+test "a client whose session was attached elsewhere doesn't take it back" {
+    var e: EchoSetup = undefined;
+    try e.init(null);
+    defer e.deinit();
+    const keys = [_]auth.Key{e.login.key.public_key.toBytes()};
+
+    var first: TestPty = try .open();
+    defer first.close();
+    var a: ClientThread = .{ .options = e.clientOptions(&first, &keys) };
+    a.options.notice_delay_ms = 60_000;
+    try a.start();
+    try first.readUntil("ready");
+
+    // While the first client is away, another attaches.
+    e.relay.dropping.store(true, .release);
+    var second: TestPty = try .open();
+    defer second.close();
+    var b: ClientThread = .{ .options = e.login.clientOptions(&e.st, &second, &keys) };
+    b.options.session_id = 1;
+    try b.start();
+    try second.readUntil("ready");
+
+    // The first client gives up on its connection before the server's
+    // error could reach it. Its key is stale, so its resume fails.
+    try testing.io.sleep(.fromMilliseconds(1500), .awake);
+    e.relay.dropping.store(false, .release);
+
+    const outcome = try a.join(&first);
+    try testing.expectEqualStrings("can't resume session 1: it ended, or was attached elsewhere", outcome.refused.message.slice());
+
+    try second.type_("y\r");
+    try second.readUntil("got y");
+
+    // A client that is still connected is told at once.
+    var third: TestPty = try .open();
+    defer third.close();
+    var c3: ClientThread = .{ .options = e.login.clientOptions(&e.st, &third, &keys) };
+    c3.options.session_id = 1;
+    try c3.start();
+    try third.readUntil("ready");
+    const taken = try b.join(&second);
+    try testing.expectEqualStrings("the session was attached elsewhere", taken.refused.message.slice());
+
+    try third.type_("~.");
+    _ = try c3.join(&third);
 }
 
 test "a client accepting another server key is refused" {

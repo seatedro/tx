@@ -33,6 +33,8 @@ pub const Options = struct {
     addresses: []const IpAddress,
     accept: quic.Client.Accept,
     idle_timeout_ns: u64 = 30 * std.time.ns_per_s,
+    /// Null leaves a handshake to the idle timeout.
+    handshake_timeout_ns: ?u64 = null,
     keep_alive_ns: ?u64 = null,
     stream_window: u64 = 8 << 20,
     connection_window: u64 = 32 << 20,
@@ -101,6 +103,13 @@ pub const Racer = struct {
         r.attempts.deinit(r.gpa);
         r.timer.deinit();
         r.* = undefined;
+    }
+
+    /// True once every attempt's endpoint has stopped and the timer is
+    /// idle. The racer can then be freed.
+    pub fn isStopped(r: *const Racer) bool {
+        for (r.attempts.items) |a| if (!a.endpoint.isStopped()) return false;
+        return r.timer_c.state() == .dead and r.timer_reset_c.state() == .dead and r.timer_cancel_c.state() == .dead;
     }
 
     /// The key the winner's server presented.
@@ -183,6 +192,7 @@ pub const Racer = struct {
             .local = local,
             .role = .{ .client = &a.tls },
             .idle_timeout_ns = r.options.idle_timeout_ns,
+            .handshake_timeout_ns = r.options.handshake_timeout_ns,
             .keep_alive_ns = r.options.keep_alive_ns,
             .stream_window = r.options.stream_window,
             .connection_window = r.options.connection_window,
