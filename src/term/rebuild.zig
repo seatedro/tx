@@ -1,6 +1,11 @@
-//! VT output that brings a terminal in its initial state to a primary
-//! terminal's state. The server sends it to a client attaching to a
-//! running session.
+//! VT output that brings a terminal to a primary terminal's state. The
+//! server sends it to a client attaching to a running session, and to a
+//! client that reconnects after output it missed was dropped from the log.
+//!
+//! It starts with a reset that brings the receiving terminal close to its
+//! initial state from whatever a session left it in, keeping scrollback.
+//! The reset leaves values saved with XTSAVE, and grapheme clustering
+//! (mode 2027), which some terminals turn on in their configuration.
 //!
 //! libghostty-vt's formatter writes each screen's cells, and the cursor,
 //! pen, hyperlink, protection and charsets. The rest is written here: the
@@ -27,13 +32,41 @@ const ScreenKey = vt.ScreenSet.Key;
 const MouseEvent = @FieldType(@FieldType(Terminal, "flags"), "mouse_event");
 const MouseFormat = @FieldType(@FieldType(Terminal, "flags"), "mouse_format");
 
+pub const Kind = enum {
+    /// For a terminal that has none of the session's output. Its screen is
+    /// scrolled into its scrollback, and the primary screen's scrollback
+    /// follows.
+    attach,
+    /// For a terminal that showed the session until it missed some output.
+    /// Its screen is cleared, and the scrollback isn't written again.
+    repaint,
+};
+
 /// Writes rebuild bytes for `t`. The receiving terminal must be the size
-/// of `t`, and in its initial state. The primary screen's scrollback is
-/// written first, so it scrolls into the receiving terminal's.
-pub fn write(w: *Writer, t: *const Terminal) Writer.Error!void {
-    var r: Rebuild = .{ .w = w, .t = t, .modes = t.modes.default, .charset = .{} };
+/// of `t`.
+pub fn write(w: *Writer, t: *const Terminal, kind: Kind) Writer.Error!void {
+    var r: Rebuild = .{ .w = w, .t = t, .kind = kind, .modes = t.modes.default, .charset = .{} };
     try r.all();
 }
+
+/// Modes a program may have set that DECSTR leaves alone. All are off by
+/// default.
+const reset_modes = [_]Mode{
+    .reverse_colors,
+    .mouse_event_x10,
+    .mouse_event_normal,
+    .mouse_event_button,
+    .mouse_event_any,
+    .focus_event,
+    .mouse_format_utf8,
+    .mouse_format_sgr,
+    .mouse_format_urxvt,
+    .mouse_format_sgr_pixels,
+    .bracketed_paste,
+    .report_color_scheme,
+    .in_band_size_reports,
+    .kitty_paste_events,
+};
 
 /// Soft-wrapped rows are written as one line, which wraps again as it is
 /// printed. Blank rows are kept, since they set where later rows land.
@@ -42,6 +75,7 @@ const format_options: vt.formatter.Options = .{ .emit = .vt, .unwrap = true, .tr
 const Rebuild = struct {
     w: *Writer,
     t: *const Terminal,
+    kind: Kind,
     /// The modes the receiving terminal has, as far as written.
     modes: ModePacked,
     /// The receiving terminal's charsets, as far as written. Switching
@@ -53,6 +87,7 @@ const Rebuild = struct {
 
     fn all(r: *Rebuild) Writer.Error!void {
         const t = r.t;
+        try r.reset();
 
         // Grapheme clustering changes how wide some text is, so it has to
         // be on while the text is printed.
@@ -93,15 +128,59 @@ const Rebuild = struct {
         if (t.modes.get(.synchronized_output)) try r.setMode(.synchronized_output, true);
     }
 
-    /// A screen's cells, from the top of its scrollback.
+    /// Brings the receiving terminal to its initial state, keeping its
+    /// scrollback. Of the modes DECSTR leaves alone, only `reset_modes` are
+    /// reset.
+    fn reset(r: *Rebuild) Writer.Error!void {
+        // A synchronized update left open holds the display.
+        try r.w.writeAll("\x1b[?2026l");
+
+        // Back to the primary screen, with the three modes that switch
+        // screens reset. On a repaint, the alternate screen's Kitty keyboard
+        // stack is emptied and its saved cursor reset, and 1047 clears it
+        // on leaving.
+        try r.w.writeAll("\x1b[?1049l\x1b[?1047l\x1b[?47l");
+        if (r.kind == .repaint) try r.w.writeAll("\x1b[?1047h\x1b[<99u\x1b[!p\x1b[?1047l");
+        try r.w.writeAll("\x1b[<99u");
+
+        // DECSTR resets the pen, charsets, protection, the scrolling region,
+        // the saved cursor, the cursor shape, modifyOtherKeys, the palette
+        // and modes such as insert, origin and autowrap.
+        try r.w.writeAll("\x1b[!p");
+        for (reset_modes) |mode| try r.setMode(mode, false);
+        try r.w.writeAll("\x1b[20l");
+
+        // Dynamic colors, the title, the working directory, the mouse shape
+        // and an open hyperlink.
+        try r.w.writeAll("\x1b]110\x1b\\\x1b]111\x1b\\\x1b]112\x1b\\\x1b]2;\x1b\\\x1b]7;\x1b\\\x1b]22;\x1b\\\x1b]8;;\x1b\\");
+
+        // Tabstops every 8 columns.
+        try r.w.writeAll("\x1b[3g");
+        var x: usize = 8;
+        while (x < r.t.cols - 1) : (x += 8) try r.w.print("\x1b[{d}G\x1bH", .{x + 1});
+
+        // ED 22 scrolls the screen into scrollback in Ghostty and kitty,
+        // and other terminals ignore it.
+        try r.w.writeAll(switch (r.kind) {
+            .attach => "\x1b[22J\x1b[2J\x1b[H",
+            .repaint => "\x1b[2J\x1b[H",
+        });
+    }
+
+    /// A screen's cells. The primary screen's start from the top of its
+    /// scrollback for `attach`.
     fn text(r: *Rebuild, key: ScreenKey) Writer.Error!void {
         // Switching screens carries the cursor over. The cells are written
         // from the corner.
         try r.w.writeAll("\x1b[H");
         try r.plainPen();
 
-        var f: ScreenFormatter = .init(r.t.screens.get(key).?, format_options);
-        f.content = .{ .selection = null };
+        const s = r.t.screens.get(key).?;
+        var f: ScreenFormatter = .init(s, format_options);
+        f.content = .{ .selection = switch (r.kind) {
+            .attach => null,
+            .repaint => .init(s.pages.getTopLeft(.active), s.pages.getBottomRight(.active).?, false),
+        } };
         try f.format(r.w);
     }
 
@@ -439,9 +518,14 @@ const not_rebuilt_changes = [_][]const u8{
     "a drag and drop registration",
 };
 
-/// Feeds `input` to a terminal, rebuilds it in a fresh one, and compares
-/// their dumps. Prints the lines that differ.
-fn rebuilds(input: []const u8) !bool {
+fn isNotRebuilt(name: []const u8) bool {
+    for (not_rebuilt_changes) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
+}
+
+/// Feeds `input` to a terminal, and rebuilds it as `kind` in another one
+/// fed `before`. Compares their dumps, and prints the lines that differ.
+fn rebuilds(before: []const u8, input: []const u8, kind: Kind) !bool {
     var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 20, .rows = 5 });
     defer t.deinit(testing.allocator);
     var stream = t.vtStream();
@@ -450,12 +534,13 @@ fn rebuilds(input: []const u8) !bool {
 
     var out: Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
-    try write(&out.writer, &t);
+    try write(&out.writer, &t, kind);
 
     var copy: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 20, .rows = 5 });
     defer copy.deinit(testing.allocator);
     var copy_stream = copy.vtStream();
     defer copy_stream.deinit();
+    copy_stream.nextSlice(before);
     copy_stream.nextSlice(out.written());
 
     const want = try state.dumpAlloc(testing.allocator, &t);
@@ -485,12 +570,10 @@ test "each state change rebuilds" {
     testing.log_level = .err;
     var failed = false;
     for (state.changes) |change| {
-        if (for (not_rebuilt_changes) |name| {
-            if (std.mem.eql(u8, name, change[0])) break true;
-        } else false) continue;
+        if (isNotRebuilt(change[0])) continue;
         const input = try std.mem.concat(testing.allocator, u8, &.{ state.changes_base, change[1] });
         defer testing.allocator.free(input);
-        if (!try rebuilds(input)) {
+        if (!try rebuilds("", input, .attach)) {
             std.debug.print("rebuilding {s} failed\n", .{change[0]});
             failed = true;
         }
@@ -525,9 +608,46 @@ test "combined state rebuilds" {
     testing.log_level = .err;
     var failed = false;
     for (combinations) |combination| {
-        if (!try rebuilds(combination[1])) {
+        if (!try rebuilds("", combination[1], .attach)) {
             std.debug.print("rebuilding {s} failed\n", .{combination[0]});
             failed = true;
+        }
+    }
+    if (failed) return error.TestUnexpectedResult;
+}
+
+/// States a session may leave that the reset doesn't undo. The counter of
+/// implicit hyperlink IDs isn't visible.
+const not_reset_changes = [_][]const u8{
+    "a saved mode",
+    "grapheme clustering",
+    "the cursor hyperlink",
+};
+
+/// States a repaint is checked against. The reset creates the alternate
+/// screen, so each has one.
+const repaint_targets = [_]struct { []const u8, []const u8 }{
+    .{ "text", "\x1b[?1047h\x1b[?1047lab\r\ncd" },
+    .{ "the alternate screen", "\x1b[?1047h\x1b[?1047lab\x1b[?1049h\x1b[2;2Hxy\x1b[?2004h" },
+    .{ "a scrolling region in origin mode", "\x1b[?1047h\x1b[?1047lab\x1b[2;4r\x1b[?6h\x1b[2;3Hx" },
+};
+
+test "a repaint undoes the state a session left" {
+    testing.log_level = .err;
+    var failed = false;
+    for (repaint_targets) |target| {
+        for (state.changes ++ combinations) |change| {
+            // Scrollback is kept by a repaint.
+            if (isNotRebuilt(change[0]) or std.mem.indexOf(u8, change[0], "scrollback") != null) continue;
+            if (for (not_reset_changes) |name| {
+                if (std.mem.eql(u8, name, change[0])) break true;
+            } else false) continue;
+            const before = try std.mem.concat(testing.allocator, u8, &.{ state.changes_base, change[1] });
+            defer testing.allocator.free(before);
+            if (!try rebuilds(before, target[1], .repaint)) {
+                std.debug.print("repainting {s} over {s} failed\n", .{ target[0], change[0] });
+                failed = true;
+            }
         }
     }
     if (failed) return error.TestUnexpectedResult;

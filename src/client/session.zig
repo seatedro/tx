@@ -14,8 +14,14 @@
 //! writer's queue is below its high-water mark, so a terminal that can't
 //! keep up slows the server down.
 //!
-//! Reattaching starts with the server's rebuild of the session's terminal,
-//! written after the screen is cleared for it.
+//! Reattaching starts with the server's rebuild of the session's terminal.
+//!
+//! A client that loses its connection once attached connects again and
+//! resumes the session with its resume key (see `auth.resume_`), without
+//! logging in. Input typed meanwhile is held and sent once attached, after
+//! the input the server says it didn't get from the old connection. When
+//! that takes longer than `Options.notice_delay_ms`, a notice is drawn
+//! over the session, and the resume asks for a repaint, which clears it.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -66,6 +72,8 @@ pub const Options = struct {
     escape_char: ?u8 = '~',
     idle_timeout_ns: u64 = 30 * std.time.ns_per_s,
     keep_alive_ns: u64 = 10 * std.time.ns_per_s,
+    /// How long a reconnect goes before a notice is drawn over the session.
+    notice_delay_ms: u64 = 3000,
 };
 
 pub const Identity = struct {
@@ -140,6 +148,20 @@ const stream_window = 2 << 20;
 /// The largest message body accepted from the server.
 const max_message = 1 << 20;
 
+/// How long a reconnect waits before each try, by the number of tries so
+/// far. The last delay repeats.
+const retry_delays_ms = [_]u64{ 0, 1000, 2000, 4000, 8000 };
+
+/// A reconnect's handshake with an address that doesn't answer gives up
+/// after this long.
+const reconnect_handshake_timeout_ns = 5 * std.time.ns_per_s;
+
+/// The most input held while not attached. More is dropped.
+const max_held_input = 64 << 10;
+
+/// The most input sent kept for sending again after a resume.
+const max_sent_input = 64 << 10;
+
 /// Runs one session until it exits or detaches. The user's terminal is in
 /// raw mode from the login on.
 pub fn run(gpa: Allocator, io: Io, options: Options) !Outcome {
@@ -172,7 +194,10 @@ const Run = struct {
     loop: *xev.Loop,
     options: Options,
     size: tty.Size,
-    racer: connect.Racer,
+    /// Races the connection. Replaced at each reconnect try.
+    racer: *connect.Racer,
+    /// Racers replaced, freed once stopped.
+    retired: std.ArrayList(*connect.Racer) = .empty,
     /// The winner's connection, once its handshake completes.
     conn: ?*Conn = null,
     /// The terminal's attributes from before the session. Raw mode is
@@ -199,8 +224,25 @@ const Run = struct {
     /// above its high-water mark.
     held: usize = 0,
     session_id: ?u64 = null,
-    /// Input typed before the server confirmed the attach.
-    early_input: std.ArrayList(u8) = .empty,
+    /// From the last `Attached`. Once set, a lost connection reconnects.
+    resume_key: ?[auth.resume_.key_len]u8 = null,
+    /// The seq of the first `Output` not yet queued for the terminal.
+    next_seq: u64 = 0,
+    /// The server confirmed the attach on the current connection.
+    attached: bool = false,
+    /// Input typed before the first attach, or while reconnecting.
+    held_input: std.ArrayList(u8) = .empty,
+    /// The last input sent, up to `max_sent_input` bytes, and the offset of
+    /// its first byte in all the input sent since attaching.
+    sent_input: std.ArrayList(u8) = .empty,
+    sent_input_offset: u64 = 0,
+    reconnect: Reconnect = .{},
+    retry_timer: xev.Timer,
+    retry_c: xev.Completion = .{},
+    retry_cancel_c: xev.Completion = .{},
+    notice_timer: xev.Timer,
+    notice_c: xev.Completion = .{},
+    notice_cancel_c: xev.Completion = .{},
     /// The identity in `options.identities` being probed or signed with.
     key_index: usize = 0,
     /// Set while a signature is being made.
@@ -208,6 +250,15 @@ const Run = struct {
     outcome: ?Outcome = null,
     /// An error `run` returns, for a failure with no outcome of its own.
     failure: ?anyerror = null,
+
+    const Reconnect = struct {
+        /// Set from losing the connection until attached again.
+        active: bool = false,
+        /// Tries started.
+        tries: usize = 0,
+        /// The notice was drawn over the session.
+        notice_shown: bool = false,
+    };
 
     /// A signature in progress.
     const Signer = struct {
@@ -254,8 +305,12 @@ const Run = struct {
             .decoder = .init(gpa, max_message),
             .escape = .{ .char = options.escape_char },
             .wake = try .init(),
+            .retry_timer = try .init(),
+            .notice_timer = try .init(),
         };
         errdefer r.wake.deinit();
+        errdefer r.retry_timer.deinit();
+        errdefer r.notice_timer.deinit();
         errdefer r.decoder.deinit();
         r.wake.wait(loop, &r.wake_c, Run, r, onWake);
 
@@ -265,11 +320,18 @@ const Run = struct {
         try r.signals.start(.{ .fd = options.in_fd, .raw_mode = &r.raw, .context = r, .callback = onSignal });
         errdefer r.signals.stop();
 
-        try r.racer.init(gpa, io, loop, .{
-            .addresses = options.servers,
-            .accept = .{ .keys = options.host_keys },
-            .idle_timeout_ns = options.idle_timeout_ns,
-            .keep_alive_ns = options.keep_alive_ns,
+        r.racer = try r.startRacer(null);
+    }
+
+    /// Starts racing connections to the server's addresses.
+    fn startRacer(r: *Run, handshake_timeout_ns: ?u64) !*connect.Racer {
+        const racer = try r.gpa.create(connect.Racer);
+        racer.init(r.gpa, r.io, r.loop, .{
+            .addresses = r.options.servers,
+            .accept = .{ .keys = r.options.host_keys },
+            .idle_timeout_ns = r.options.idle_timeout_ns,
+            .handshake_timeout_ns = handshake_timeout_ns,
+            .keep_alive_ns = r.options.keep_alive_ns,
             .stream_window = stream_window,
             .connection_window = stream_window,
             .handler = .{
@@ -278,7 +340,13 @@ const Run = struct {
                 .data = onData,
                 .closed = onClosed,
             },
-        });
+        }) catch |err| {
+            // An attempt that failed to start may still have completions.
+            racer.stop();
+            r.retired.append(r.gpa, racer) catch {};
+            return err;
+        };
+        return racer;
     }
 
     /// Enters raw mode and starts reading and writing the terminal.
@@ -315,19 +383,38 @@ const Run = struct {
         }
         if (r.inbox.signature) |result| if (result) |sig| r.gpa.free(sig) else |_| {};
 
-        // Stop the connections, then run the loop until their completions
-        // finish.
+        // Stop the connections and timers, then run the loop until their
+        // completions finish. Retired racers are stopped already.
         r.racer.stop();
+        cancelTimer(r.loop, &r.retry_c, &r.retry_cancel_c);
+        cancelTimer(r.loop, &r.notice_c, &r.notice_cancel_c);
         // `onWake` disarms once the outcome is set. Cancelling the wait would
         // end it with an ECANCELED that libxev's poll doesn't map.
         if (r.wake_c.state() == .active) r.wake.notify() catch {};
         r.loop.run(.until_done) catch {};
-        r.racer.deinit();
+        for (r.retired.items) |racer| destroyRacer(r.gpa, racer);
+        r.retired.deinit(r.gpa);
+        destroyRacer(r.gpa, r.racer);
+        r.retry_timer.deinit();
+        r.notice_timer.deinit();
         r.wake.deinit();
         r.decoder.deinit();
         r.inbox.input.deinit(r.gpa);
-        r.early_input.deinit(r.gpa);
+        r.held_input.deinit(r.gpa);
+        r.sent_input.deinit(r.gpa);
         if (r.terminal) r.raw.restore();
+    }
+
+    fn destroyRacer(gpa: Allocator, racer: *connect.Racer) void {
+        racer.deinit();
+        gpa.destroy(racer);
+    }
+
+    /// Cancels the timer completion `c` if it is pending.
+    fn cancelTimer(loop: *xev.Loop, c: *xev.Completion, cancel_c: *xev.Completion) void {
+        if (c.state() != .active or cancel_c.state() == .active) return;
+        cancel_c.* = .{ .op = .{ .cancel = .{ .c = c } } };
+        loop.add(cancel_c);
     }
 
     fn fromCtx(ctx: ?*anyopaque) *Run {
@@ -370,10 +457,11 @@ const Run = struct {
     fn onConnected(ctx: ?*anyopaque, conn: *Conn) void {
         const r = fromCtx(ctx);
         r.conn = conn;
+        r.decoder.reset();
         r.stream = conn.openStream(.bidi) catch return r.finish(.{ .disconnected = .failed });
 
-        // Hello and the first probe go together. The server answers both,
-        // in order.
+        // Hello and the first probe or the resume go together. The server
+        // answers both, in order.
         r.hello_size = r.size;
         const cell_w, const cell_h = cellSize(r.size);
         r.send(.{ .hello = .{
@@ -385,7 +473,20 @@ const Run = struct {
             .cell_width_px = cell_w,
             .cell_height_px = cell_h,
         } });
-        r.probe();
+        if (r.resume_key) |*key| r.sendResume(conn, key) else r.probe();
+    }
+
+    /// Proves the resume key over this connection. A notice drawn over the
+    /// session asks for a repaint.
+    fn sendResume(r: *Run, conn: *Conn, key: *const [auth.resume_.key_len]u8) void {
+        var exporter: [auth.resume_.exporter_len]u8 = undefined;
+        conn.quic.exportSecret(&exporter, auth.resume_.exporter_label);
+        const proof = auth.resume_.proof(key, &exporter, r.session_id.?);
+        r.send(.{ .@"resume" = .{
+            .session_id = r.session_id.?,
+            .next_seq = if (r.reconnect.notice_shown) null else r.next_seq,
+            .proof = &proof,
+        } });
     }
 
     /// Asks whether the server accepts the current key.
@@ -567,42 +668,56 @@ const Run = struct {
             .hello_reply => |m| if (m.revision != proto.revision) r.refuse("the server speaks another protocol revision"),
             .auth_probe_reply => |m| r.onProbeReply(m),
             .auth_ok => r.onAuthOk(),
-            // Input typed before this was held, since the server had no
-            // session to give it to.
+            // Input typed while not attached was held.
             .attached => |m| {
                 if (!r.terminal) return r.refuse("the server attached before the login");
+                if (m.resume_key.len != auth.resume_.key_len) return r.refuse("the server sent a malformed resume key");
+                const resumed = r.resume_key != null;
+                r.resume_key = m.resume_key[0..auth.resume_.key_len].*;
                 r.session_id = m.session_id;
+                r.attached = true;
+                if (resumed) {
+                    r.reconnected();
+                    r.resendInput(m.input_offset);
+                }
 
                 // The terminal changed size since `Hello`.
                 if (!std.meta.eql(r.size, r.hello_size)) r.sendResize();
 
-                if (r.options.show_session_id) {
+                if (r.options.show_session_id and !resumed) {
                     var buf: [64]u8 = undefined;
                     const line = std.fmt.bufPrint(&buf, "tx: session {d}\r\n", .{m.session_id}) catch unreachable;
                     r.writer.write(line) catch {};
                 }
-                if (r.early_input.items.len > 0) r.send(.{ .input = .{ .bytes = r.early_input.items } });
-                r.early_input.clearAndFree(r.gpa);
+                if (r.held_input.items.len > 0) r.sendInput(r.held_input.items);
+                r.held_input.clearAndFree(r.gpa);
             },
             .rebuild => |m| {
                 if (!r.terminal) return r.refuse("the server sent a rebuild before the login");
-                // The rebuild expects a terminal in its initial state. Ghostty
-                // and kitty scroll the screen into scrollback with ED 22,
-                // which other terminals ignore.
-                if (m.first) r.writeTerminal("\x1b[0m\x1b[22J\x1b[2J\x1b[H") catch return;
                 r.writeTerminal(m.bytes) catch return;
+                r.next_seq = m.seq;
             },
             // Acked once queued for the terminal.
             .output => |m| {
                 if (!r.terminal) return r.refuse("the server sent output before the login");
                 r.writeTerminal(m.bytes) catch return;
+                r.next_seq = m.seq + 1;
                 r.send(.{ .ack = .{ .seq = m.seq } });
             },
             .exit => |m| r.finish(.{ .exited = .{
                 .status = m.status,
                 .signal = if (m.signal) |s| .init(s) else null,
             } }),
-            .@"error" => |m| r.finish(.{ .refused = .{ .code = m.code, .message = .init(m.message) } }),
+            .@"error" => |m| {
+                // The server doesn't tell a client that isn't logged in which
+                // of the two it was.
+                if (r.reconnect.active and m.code == @backingInt(proto.ErrorCode.auth)) {
+                    var buf: [128]u8 = undefined;
+                    const text = std.fmt.bufPrint(&buf, "can't resume session {d}: it ended, or was attached elsewhere", .{r.session_id.?}) catch unreachable;
+                    return r.finish(.{ .refused = .{ .code = m.code, .message = .init(text) } });
+                }
+                r.finish(.{ .refused = .{ .code = m.code, .message = .init(m.message) } });
+            },
             else => {},
         }
     }
@@ -621,18 +736,112 @@ const Run = struct {
 
     fn onClosed(ctx: ?*anyopaque, conn: *Conn, reason: CloseReason) void {
         const r = fromCtx(ctx);
-        if (r.conn == conn) {
+        const current = r.conn == conn;
+        if (current) {
             r.conn = null;
             r.stream = null;
+            r.attached = false;
+            r.held = 0;
         }
         if (r.outcome != null) return;
 
+        // A connection of a racer replaced by a reconnect.
+        if (!current and r.racer.winner != null) return;
+
         // Every attempt failed. One that met a refused key says more than
-        // the last failure.
-        if (r.conn == null and r.session_id == null) if (r.racer.refusedKey()) |key| {
+        // the last failure, and isn't tried again.
+        if (r.racer.winner == null) if (r.racer.refusedKey()) |key| {
             return r.finish(.{ .host_key_refused = key });
         };
+
+        if (r.resume_key != null) return r.retry(reason);
         r.outcome = .{ .disconnected = reason };
+    }
+
+    /// Tries to connect again after the delay for the tries so far.
+    fn retry(r: *Run, reason: CloseReason) void {
+        if (r.retry_c.state() == .active) return;
+        if (!r.reconnect.active) {
+            log.info("connection lost ({t}), reconnecting", .{reason});
+            r.reconnect = .{ .active = true };
+            r.notice_timer.run(r.loop, &r.notice_c, r.options.notice_delay_ms, Run, r, onNoticeTimer);
+        }
+        const delay = retry_delays_ms[@min(r.reconnect.tries, retry_delays_ms.len - 1)];
+        r.reconnect.tries += 1;
+        r.retry_timer.run(r.loop, &r.retry_c, delay, Run, r, onRetryTimer);
+    }
+
+    fn onRetryTimer(r_: ?*Run, _: *xev.Loop, _: *xev.Completion, result: xev.Timer.RunError!void) xev.CallbackAction {
+        const r = r_.?;
+        result catch return .disarm;
+        if (r.outcome != null) return .disarm;
+
+        // With no address to try, such as with no network, the next try
+        // waits its delay.
+        const racer = r.startRacer(reconnect_handshake_timeout_ns) catch |err| {
+            log.info("reconnecting failed: {t}", .{err});
+            r.retry(.failed);
+            return .disarm;
+        };
+
+        // The last racer's connections are closed. It is freed with the
+        // racers of earlier tries, once their completions finish.
+        r.racer.stop();
+        r.retired.append(r.gpa, r.racer) catch {};
+        r.racer = racer;
+        var i: usize = 0;
+        while (i < r.retired.items.len) {
+            if (!r.retired.items[i].isStopped()) {
+                i += 1;
+                continue;
+            }
+            destroyRacer(r.gpa, r.retired.swapRemove(i));
+        }
+        return .disarm;
+    }
+
+    /// Draws the notice on the terminal's last row, over the session.
+    fn onNoticeTimer(r_: ?*Run, _: *xev.Loop, _: *xev.Completion, result: xev.Timer.RunError!void) xev.CallbackAction {
+        const r = r_.?;
+        result catch return .disarm;
+        if (r.outcome != null or !r.reconnect.active or !r.terminal) return .disarm;
+
+        // A synchronized update the session left open would hide it. The
+        // cursor is saved and restored around it.
+        var buf: [128]u8 = undefined;
+        const notice = std.fmt.bufPrint(&buf, "\x1b[?2026l\x1b7\x1b[{d};1H\x1b[0m\x1b[7m tx: connection lost, reconnecting. ~. detaches \x1b[0m\x1b[K\x1b8", .{r.size.rows}) catch unreachable;
+        r.writeTerminal(notice) catch return .disarm;
+        r.reconnect.notice_shown = true;
+        return .disarm;
+    }
+
+    /// Sends input, and keeps the last of it for `resendInput`.
+    fn sendInput(r: *Run, bytes: []const u8) void {
+        r.send(.{ .input = .{ .bytes = bytes } });
+        r.sent_input.appendSlice(r.gpa, bytes) catch return;
+        if (r.sent_input.items.len > max_sent_input) {
+            const drop = r.sent_input.items.len - max_sent_input;
+            r.sent_input.replaceRangeAssumeCapacity(0, drop, &.{});
+            r.sent_input_offset += drop;
+        }
+    }
+
+    /// Sends again the input after the first `offset` bytes the session
+    /// got, which went out on the lost connection.
+    fn resendInput(r: *Run, offset: u64) void {
+        const end = r.sent_input_offset + r.sent_input.items.len;
+        if (offset >= end) return;
+        if (offset < r.sent_input_offset) log.warn("{d} bytes of input were lost", .{r.sent_input_offset - offset});
+        const start: usize = @intCast(@max(offset, r.sent_input_offset) - r.sent_input_offset);
+        r.send(.{ .input = .{ .bytes = r.sent_input.items[start..] } });
+    }
+
+    /// Attached again after a reconnect.
+    fn reconnected(r: *Run) void {
+        log.info("reconnected after {d} tries", .{r.reconnect.tries});
+        cancelTimer(r.loop, &r.retry_c, &r.retry_cancel_c);
+        cancelTimer(r.loop, &r.notice_c, &r.notice_cancel_c);
+        r.reconnect = .{};
     }
 
     // The next three run on the reader, writer and signal threads. Each
@@ -710,11 +919,10 @@ const Run = struct {
 
         r.forwardInput(input.items);
 
-        // Before the attach, the server has no terminal to resize.
-        // `.attached` sends the size then.
+        // While not attached, `.attached` sends the size.
         if (resize) |size| {
             r.size = size;
-            if (r.session_id != null) r.sendResize();
+            if (r.attached) r.sendResize();
         }
 
         // The terminal caught up: return the credit held back in `onData`.
@@ -742,10 +950,12 @@ const Run = struct {
 
             const result = r.escape.feed(chunk, &out);
             if (result.forward.len > 0) {
-                if (r.session_id == null) {
-                    r.early_input.appendSlice(r.gpa, result.forward) catch {};
+                if (!r.attached) {
+                    if (r.held_input.items.len + result.forward.len <= max_held_input) {
+                        r.held_input.appendSlice(r.gpa, result.forward) catch {};
+                    }
                 } else {
-                    r.send(.{ .input = .{ .bytes = result.forward } });
+                    r.sendInput(result.forward);
                 }
             }
             if (result.action) |action| switch (action) {
