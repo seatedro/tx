@@ -72,11 +72,16 @@ pub const HelloReply = struct {
 };
 
 pub const Attach = struct {
-    /// Null starts a new session running the user's shell.
+    /// Null starts a new session running the user's shell, unless `reuse`
+    /// is set.
     session_id: ?u64 = null,
+    /// With no `session_id`, attaches the detached session if there is
+    /// exactly one, and starts one if there is none. With several, the
+    /// server answers `Error` with `several_detached`.
+    reuse: bool = false,
 
     pub const type_id = 3;
-    pub const tags = .{ .session_id = 1 };
+    pub const tags = .{ .session_id = 1, .reuse = 2 };
 
     pub fn encodedLen(m: Attach) usize {
         return bodyLen(Attach, m);
@@ -259,6 +264,8 @@ pub const ErrorCode = enum(u32) {
     auth = 6,
     /// Another client attached to the session.
     attached_elsewhere = 7,
+    /// `Attach` with `reuse` found more than one detached session.
+    several_detached = 8,
 };
 
 pub const Error = struct {
@@ -419,6 +426,110 @@ pub const Resume = struct {
     }
 };
 
+/// Asks for the server's sessions. The server answers with a
+/// `SessionInfo` for each, in order of ID, then `ListEnd`.
+pub const List = struct {
+    pub const type_id = 18;
+    pub const tags = .{};
+
+    pub fn encodedLen(m: List) usize {
+        return bodyLen(List, m);
+    }
+
+    pub fn encode(m: List, w: *Writer) Writer.Error!void {
+        return encodeBody(List, m, w);
+    }
+
+    pub fn decode(bytes: []const u8) DecodeError!List {
+        return decodeBody(List, bytes);
+    }
+};
+
+pub const SessionInfo = struct {
+    session_id: u64,
+    cols: u16,
+    rows: u16,
+    /// Seconds since the session started.
+    running_s: u64,
+    /// The attached client's address. Null while detached.
+    attached_from: ?[]const u8 = null,
+    /// The title the program set, if any.
+    title: ?[]const u8 = null,
+
+    pub const type_id = 19;
+    pub const tags = .{ .session_id = 1, .cols = 2, .rows = 3, .running_s = 4, .attached_from = 5, .title = 6 };
+
+    pub fn encodedLen(m: SessionInfo) usize {
+        return bodyLen(SessionInfo, m);
+    }
+
+    pub fn encode(m: SessionInfo, w: *Writer) Writer.Error!void {
+        return encodeBody(SessionInfo, m, w);
+    }
+
+    pub fn decode(bytes: []const u8) DecodeError!SessionInfo {
+        return decodeBody(SessionInfo, bytes);
+    }
+};
+
+pub const ListEnd = struct {
+    pub const type_id = 20;
+    pub const tags = .{};
+
+    pub fn encodedLen(m: ListEnd) usize {
+        return bodyLen(ListEnd, m);
+    }
+
+    pub fn encode(m: ListEnd, w: *Writer) Writer.Error!void {
+        return encodeBody(ListEnd, m, w);
+    }
+
+    pub fn decode(bytes: []const u8) DecodeError!ListEnd {
+        return decodeBody(ListEnd, bytes);
+    }
+};
+
+/// Ends a session. Its program gets SIGHUP, and SIGKILL if it hasn't
+/// exited a second later. The server answers with `Killed`, or `Error`.
+pub const Kill = struct {
+    session_id: u64,
+
+    pub const type_id = 21;
+    pub const tags = .{ .session_id = 1 };
+
+    pub fn encodedLen(m: Kill) usize {
+        return bodyLen(Kill, m);
+    }
+
+    pub fn encode(m: Kill, w: *Writer) Writer.Error!void {
+        return encodeBody(Kill, m, w);
+    }
+
+    pub fn decode(bytes: []const u8) DecodeError!Kill {
+        return decodeBody(Kill, bytes);
+    }
+};
+
+/// The session's program was sent SIGHUP.
+pub const Killed = struct {
+    session_id: u64,
+
+    pub const type_id = 22;
+    pub const tags = .{ .session_id = 1 };
+
+    pub fn encodedLen(m: Killed) usize {
+        return bodyLen(Killed, m);
+    }
+
+    pub fn encode(m: Killed, w: *Writer) Writer.Error!void {
+        return encodeBody(Killed, m, w);
+    }
+
+    pub fn decode(bytes: []const u8) DecodeError!Killed {
+        return decodeBody(Killed, bytes);
+    }
+};
+
 pub const Message = union(enum) {
     hello: Hello,
     hello_reply: HelloReply,
@@ -437,6 +548,11 @@ pub const Message = union(enum) {
     auth_ok: AuthOk,
     rebuild: Rebuild,
     @"resume": Resume,
+    list: List,
+    session_info: SessionInfo,
+    list_end: ListEnd,
+    kill: Kill,
+    killed: Killed,
     /// A message type this revision does not define.
     unknown: Unknown,
 
@@ -655,6 +771,13 @@ test "every message round trips" {
         .{ .rebuild = .{ .seq = 0, .bytes = "" } },
         .{ .@"resume" = .{ .session_id = 3, .next_seq = 40, .proof = "proof" } },
         .{ .@"resume" = .{ .session_id = 3, .proof = "" } },
+        .{ .attach = .{ .reuse = true } },
+        .{ .list = .{} },
+        .{ .session_info = .{ .session_id = 2, .cols = 80, .rows = 24, .running_s = 3600, .attached_from = "127.0.0.1:5000", .title = "vim" } },
+        .{ .session_info = .{ .session_id = 3, .cols = 80, .rows = 24, .running_s = 0 } },
+        .{ .list_end = .{} },
+        .{ .kill = .{ .session_id = 2 } },
+        .{ .killed = .{ .session_id = 2 } },
         .{ .unknown = .{ .type_id = 1000, .body = "\x01\x00" } },
     };
     var buf: [256]u8 = undefined;
