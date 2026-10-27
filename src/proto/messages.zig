@@ -348,6 +348,32 @@ pub const AuthOk = struct {
     }
 };
 
+/// Bytes that bring a terminal in its initial state, at the size the
+/// client gave, to the session's state. Sent on attach, before the `Output`
+/// that follows them. A rebuild longer than a message is sent in parts.
+pub const Rebuild = struct {
+    /// The seq of the first `Output` after the rebuild.
+    seq: u64,
+    bytes: []const u8,
+    /// Set on the rebuild's first part.
+    first: bool = false,
+
+    pub const type_id = 16;
+    pub const tags = .{ .seq = 1, .bytes = 2, .first = 3 };
+
+    pub fn encodedLen(m: Rebuild) usize {
+        return bodyLen(Rebuild, m);
+    }
+
+    pub fn encode(m: Rebuild, w: *Writer) Writer.Error!void {
+        return encodeBody(Rebuild, m, w);
+    }
+
+    pub fn decode(bytes: []const u8) DecodeError!Rebuild {
+        return decodeBody(Rebuild, bytes);
+    }
+};
+
 pub const Message = union(enum) {
     hello: Hello,
     hello_reply: HelloReply,
@@ -364,6 +390,7 @@ pub const Message = union(enum) {
     auth_probe_reply: AuthProbeReply,
     auth_signature: AuthSignature,
     auth_ok: AuthOk,
+    rebuild: Rebuild,
     /// A message type this revision does not define.
     unknown: Unknown,
 
@@ -578,6 +605,8 @@ test "every message round trips" {
         .{ .auth_probe_reply = .{ .key = "blob", .accepted = false } },
         .{ .auth_signature = .{ .user = "rohit", .key = "blob", .signature = "sig" } },
         .{ .auth_ok = .{} },
+        .{ .rebuild = .{ .seq = 12, .bytes = "\x1b[Hab", .first = true } },
+        .{ .rebuild = .{ .seq = 0, .bytes = "" } },
         .{ .unknown = .{ .type_id = 1000, .body = "\x01\x00" } },
     };
     var buf: [256]u8 = undefined;

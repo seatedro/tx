@@ -4,6 +4,10 @@
 //! before applying, so a terminal fed the log from seq 0 reaches the same
 //! state.
 //!
+//! `rebuild` writes bytes that bring a fresh terminal to the same state,
+//! for a client attaching to a running session. The log may have dropped
+//! its start by then.
+//!
 //! Query replies (DA, DSR, DECRQM and so on) and external effects come from
 //! the stream handler's effect callbacks, which the host installs through
 //! `handler`.
@@ -11,6 +15,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const vt = @import("ghostty-vt");
 const log_pkg = @import("log.zig");
+const rebuild_pkg = @import("rebuild.zig");
 
 const Log = log_pkg.Log;
 
@@ -25,6 +30,8 @@ pub const Options = struct {
     kitty_image_storage_limit: usize = 320 * 1000 * 1000,
     /// In bytes.
     log_capacity: usize = 8 * 1024 * 1024,
+    /// The longest unfinished sequence `rebuild` can end with.
+    max_continuation: usize = 1024 * 1024,
 };
 
 pub const Primary = struct {
@@ -55,6 +62,7 @@ pub const Primary = struct {
         self.stream = .init(.{
             .allocator = gpa,
             .handler = .init(&self.terminal),
+            .continuation_max_bytes = options.max_continuation,
         });
         return self;
     }
@@ -92,6 +100,27 @@ pub const Primary = struct {
         }
     }
 
+    pub const RebuildError = std.Io.Writer.Error || error{
+        /// The output ends in an unfinished sequence longer than
+        /// `Options.max_continuation`. Try again after more output.
+        Unfinished,
+    };
+
+    /// Writes bytes that bring a terminal in its initial state, at this
+    /// terminal's size, to this terminal's state. When the output ends
+    /// inside a sequence, they end with its start, so the next record
+    /// finishes it.
+    pub fn rebuild(self: *const Primary, w: *std.Io.Writer) RebuildError!void {
+        // Before the rebuild is written, which would be discarded.
+        if (self.stream.continuation.?.broken) return error.Unfinished;
+        try rebuild_pkg.write(w, &self.terminal);
+        self.stream.writeContinuation(w) catch |err| switch (err) {
+            error.ContinuationUnavailable => return error.Unfinished,
+            error.ContinuationDisabled => unreachable,
+            error.WriteFailed => return error.WriteFailed,
+        };
+    }
+
     /// Appends a resize to the log and applies it. The host resizes the PTY
     /// at the same point.
     pub fn resize(self: *Primary, size: log_pkg.Resize) (log_pkg.AppendError || vt.Terminal.ResizeError)!void {
@@ -104,6 +133,7 @@ pub const Primary = struct {
 };
 
 const testing = std.testing;
+const state = @import("state.zig");
 
 test "output and resize are logged in order" {
     const primary: *Primary = try .create(testing.allocator, testing.io, .{ .cols = 10, .rows = 3 });
@@ -136,6 +166,51 @@ test "output longer than a record is split" {
     try primary.output(bytes);
     try testing.expectEqual(3, primary.log.nextSeq());
     try testing.expectEqual(1, (try primary.log.get(primary.log.nextSeq() - 1)).payload.output.len);
+}
+
+/// Feeds `bytes` to a fresh terminal and checks it ends in `primary`'s
+/// state.
+fn expectRebuildMatches(primary: *Primary, bytes: []const u8) !void {
+    const copy: *Primary = try .create(testing.allocator, testing.io, .{ .cols = primary.terminal.cols, .rows = primary.terminal.rows });
+    defer copy.destroy();
+    try copy.output(bytes);
+    const want = try state.dumpAlloc(testing.allocator, &primary.terminal);
+    defer testing.allocator.free(want);
+    const got = try state.dumpAlloc(testing.allocator, &copy.terminal);
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings(want, got);
+}
+
+test "a rebuild ends inside the sequence the output ends in" {
+    const primary: *Primary = try .create(testing.allocator, testing.io, .{ .cols = 10, .rows = 3 });
+    defer primary.destroy();
+    try primary.output("ab\x1b]2;ti");
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try primary.rebuild(&out.writer);
+    try testing.expect(std.mem.endsWith(u8, out.written(), "\x1b]2;ti"));
+
+    // The rest of the title arrives after the rebuild.
+    try primary.output("tle\x1b\\");
+    try out.writer.writeAll("tle\x1b\\");
+    try expectRebuildMatches(primary, out.written());
+    try testing.expectEqualStrings("title", primary.terminal.getTitle().?);
+}
+
+test "a rebuild inside a sequence too long to keep waits for its end" {
+    const primary: *Primary = try .create(testing.allocator, testing.io, .{ .cols = 10, .rows = 3, .max_continuation = 8 });
+    defer primary.destroy();
+    try primary.output("\x1b]2;a long title");
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try testing.expectError(error.Unfinished, primary.rebuild(&out.writer));
+
+    try primary.output("\x1b\\");
+    out.clearRetainingCapacity();
+    try primary.rebuild(&out.writer);
+    try expectRebuildMatches(primary, out.written());
 }
 
 test "fromHandler finds the primary from an effect callback" {
