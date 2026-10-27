@@ -157,8 +157,9 @@ pub const Server = struct {
             .host_loopback = try addresses.hostLoopback(gpa, io, options.listen),
             .timer = try .init(),
         };
-        try self.updateAddresses(.initial);
-        if (self.endpoints.items.len == 0) return error.NoAddresses;
+        const in_use = try self.updateAddresses(.initial);
+        // With every address taken, another server likely has the port.
+        if (self.endpoints.items.len == 0) return if (in_use > 0) error.AddressInUse else error.NoAddresses;
         self.rescan.?.timer.run(loop, &self.rescan.?.c, rescan_ms, Server, self, onRescan);
     }
 
@@ -225,7 +226,8 @@ pub const Server = struct {
 
     /// Binds the wildcard's addresses that have no endpoint, and stops the
     /// endpoints of addresses that went away.
-    fn updateAddresses(self: *Server, when: enum { initial, rescan }) !void {
+    /// Returns how many addresses failed to bind with `AddressInUse`.
+    fn updateAddresses(self: *Server, when: enum { initial, rescan }) !usize {
         const r = &self.rescan.?;
         const found = try addresses.interfaces(self.gpa, r.wildcard);
         defer self.gpa.free(found);
@@ -245,6 +247,7 @@ pub const Server = struct {
             _ = self.endpoints.swapRemove(i);
         }
 
+        var in_use: usize = 0;
         for ([_][]const IpAddress{ found, r.host_loopback }) |list| for (list) |found_address| {
             if (self.endpointFor(found_address) != null) continue;
 
@@ -256,6 +259,7 @@ pub const Server = struct {
             // An IPv6 address still being checked for duplicates can't be
             // bound yet. A later rescan tries again.
             const e = self.listen(local) catch |err| {
+                if (err == error.AddressInUse) in_use += 1;
                 if (when == .initial) log.warn("can't listen on {f}: {t}", .{ local, err });
                 continue;
             };
@@ -264,6 +268,7 @@ pub const Server = struct {
             // A port of 0 lets the first bind pick one. The others use it.
             if (r.wildcard.getPort() == 0) r.wildcard.setPort(e.local.getPort());
         };
+        return in_use;
     }
 
     fn endpointFor(self: *const Server, local: IpAddress) ?*Endpoint {
@@ -281,7 +286,10 @@ pub const Server = struct {
         result catch return .disarm;
         if (self.stopping) return .disarm;
 
-        self.updateAddresses(.rescan) catch |err| log.warn("looking for addresses failed: {t}", .{err});
+        _ = self.updateAddresses(.rescan) catch |err| blk: {
+            log.warn("looking for addresses failed: {t}", .{err});
+            break :blk 0;
+        };
 
         // Retired endpoints are freed once the loop has finished with them.
         var i: usize = 0;
