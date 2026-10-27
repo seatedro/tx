@@ -472,6 +472,12 @@ pub const Session = struct {
         s.grace.run(s.loop, &s.grace_c, stop_grace_ms, Session, s, onGraceOver);
     }
 
+    /// After `stop`: the grace period is over and the program still runs.
+    /// The owner destroys the session, which kills it.
+    pub fn stopped(s: *const Session) bool {
+        return s.grace_over and !s.ended and s.wake_c.state() == .dead and s.grace_c.state() == .dead and s.kill_c.state() == .dead;
+    }
+
     /// Sends the program SIGHUP, and SIGKILL if it is still running after
     /// the grace period.
     pub fn kill(s: *Session) void {

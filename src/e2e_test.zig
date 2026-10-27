@@ -1,8 +1,10 @@
-//! txd and tx end to end in one process. The server and each client
-//! run on their own thread and loop. A pseudo-terminal pair stands in for
-//! the user's terminal: the client uses the slave, and the test types into
-//! and reads from the master. Clients log in with a key from a test agent,
-//! listed in an `authorized_keys` file in a temporary directory.
+//! txd and tx end to end. The server and each client run on their own
+//! thread and loop in the test's process, and the sessions in txd
+//! processes, which the test reaches through their sockets. A
+//! pseudo-terminal pair stands in for the user's terminal: the client uses
+//! the slave, and the test types into and reads from the master. Clients
+//! log in with a key from a test agent, listed in an `authorized_keys` file
+//! in a temporary directory.
 const std = @import("std");
 const builtin = @import("builtin");
 const testing = std.testing;
@@ -13,10 +15,12 @@ const Ed25519 = std.crypto.sign.Ed25519;
 const xev = @import("xev");
 const transport = @import("transport");
 const server_pkg = @import("server");
+const session = @import("session");
 const client = @import("client");
 const term = @import("term");
 const proto = @import("proto");
 const auth = @import("auth");
+const build_options = @import("build_options");
 
 const gpa = testing.allocator;
 const timeout_ms = 10_000;
@@ -24,19 +28,27 @@ const timeout_ms = 10_000;
 /// The account the test server accepts logins for.
 const test_user = "tx-test";
 
-/// A user key, an agent holding keys, and an `authorized_keys` file
-/// listing the user key.
+/// A user key, an agent holding keys, an `authorized_keys` file listing
+/// the user key, and the runtime directory of the server's sessions.
 const Login = struct {
     tmp: testing.TmpDir,
     key: Ed25519.KeyPair,
     agent: auth.agent.TestAgent = undefined,
     agent_path: []u8,
     authorized_keys: []u8,
+    runtime_dir: []u8,
+    /// txd, from the build, as an absolute path.
+    session_exe: []u8,
+    /// /dev/null, for the session processes' log. The test runner would
+    /// show it.
+    session_log: posix.fd_t,
     /// Holds the identities `clientOptions` returns.
     identities: [4]client.session.Identity = undefined,
 
     /// The agent holds `agent_keys`, or the user key if null.
     fn init(l: *Login, agent_keys: ?[]const Ed25519.KeyPair) !void {
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        defer arena.deinit();
         var tmp = testing.tmpDir(.{});
         errdefer tmp.cleanup();
         var buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -47,6 +59,9 @@ const Login = struct {
             .key = .generate(testing.io),
             .agent_path = try std.fs.path.join(gpa, &.{ dir, "agent.sock" }),
             .authorized_keys = try std.fs.path.join(gpa, &.{ dir, "authorized_keys" }),
+            .runtime_dir = try std.fs.path.join(gpa, &.{ dir, "run" }),
+            .session_exe = try std.fs.path.resolve(gpa, &.{ try std.process.currentPathAlloc(testing.io, arena.allocator()), build_options.txd_exe }),
+            .session_log = c.open("/dev/null", .{ .ACCMODE = .WRONLY, .CLOEXEC = true }),
         };
 
         const line = try std.fmt.allocPrint(gpa, "ssh-ed25519 {s} test\n", .{auth.ssh.KeyText.init(l.key.public_key.toBytes()).slice()});
@@ -84,6 +99,9 @@ const Login = struct {
         l.agent.stop(l.agent_path);
         gpa.free(l.agent_path);
         gpa.free(l.authorized_keys);
+        gpa.free(l.runtime_dir);
+        gpa.free(l.session_exe);
+        _ = c.close(l.session_log);
         l.tmp.cleanup();
     }
 
@@ -94,6 +112,9 @@ const Login = struct {
             .identity = Ed25519.KeyPair.generate(testing.io),
             .user = test_user,
             .authorized_keys = (&l.authorized_keys)[0..1],
+            .runtime_dir = l.runtime_dir,
+            .session_exe = l.session_exe,
+            .session_log = l.session_log,
             .environ = environ,
             .argv = argv,
         };
@@ -170,7 +191,8 @@ const ServerThread = struct {
         while (!req.done.load(.acquire)) testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
     }
 
-    fn deinit(st: *ServerThread) void {
+    /// Stops the server. Its sessions keep running.
+    fn stopServer(st: *ServerThread) void {
         var req: Request = .{ .run = stop };
         st.call(&req);
         st.thread.join();
@@ -179,71 +201,150 @@ const ServerThread = struct {
         st.loop.deinit();
     }
 
+    /// Stops the server and ends its sessions.
+    fn deinit(st: *ServerThread) void {
+        var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const dir = dir_buf[0..st.server.options.runtime_dir.len];
+        @memcpy(dir, st.server.options.runtime_dir);
+        st.stopServer();
+        killSessions(dir) catch |err| std.debug.panic("ending the sessions: {t}", .{err});
+    }
+
+    /// A new server in place of this one, on the same address, with the
+    /// same key and sessions.
+    fn restart(st: *ServerThread) !void {
+        var options = st.server.options;
+        options.listen = st.addresses[0];
+        st.stopServer();
+        try st.init(options);
+    }
+
     fn stop(_: *Request, st: *ServerThread) void {
         st.stopping = true;
         st.server.stop();
     }
+
+    fn runtimeDir(st: *const ServerThread) []const u8 {
+        return st.server.options.runtime_dir;
+    }
 };
 
-/// The state dump of a session's primary terminal, taken on the server
-/// thread. Null once the session has ended.
-fn primaryDump(st: *ServerThread, session_id: u64) !?[]u8 {
-    const Dump = struct {
-        req: ServerThread.Request = .{ .run = run },
-        session_id: u64,
-        result: anyerror!?[]u8 = null,
+/// A session process's answer, pointing into `bytes`.
+const Answer = struct {
+    bytes: std.ArrayList(u8) = .empty,
+    message: proto.Message = undefined,
 
-        fn run(req: *ServerThread.Request, server_thread: *ServerThread) void {
-            const d: *@This() = @fieldParentPtr("req", req);
-            const s = server_thread.server.sessions.get(d.session_id) orelse return;
-            d.result = if (term.state.dumpAlloc(gpa, &s.host.primary.terminal)) |dump| dump else |err| err;
+    fn deinit(a: *Answer) void {
+        a.bytes.deinit(gpa);
+    }
+};
+
+/// Sends `request` to session `id`'s process, through its socket, and
+/// returns the answer. Null if the session is gone.
+fn askSession(dir: []const u8, id: u64, request: proto.Message) !?Answer {
+    const fd = (try tellSession(dir, id, request)) orelse return null;
+    defer session.unix.close(fd);
+
+    var answer: Answer = .{};
+    errdefer answer.deinit();
+    const deadline = nowMs() + timeout_ms;
+    while (true) {
+        var d: proto.Decoder = .init(gpa, 1 << 20);
+        defer d.deinit();
+        d.feed(answer.bytes.items);
+        if (try d.next()) |m| {
+            answer.message = m;
+            return answer;
         }
+
+        // The socket may be non-blocking.
+        var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+        const left = deadline - nowMs();
+        if (left <= 0) return error.Timeout;
+        _ = c.poll(&fds, fds.len, @intCast(left));
+        var buf: [64 << 10]u8 = undefined;
+        const n = c.read(fd, &buf, buf.len);
+        if (n == 0) return null;
+        if (n < 0) continue;
+        try answer.bytes.appendSlice(gpa, buf[0..@intCast(n)]);
+    }
+}
+
+/// Sends `message` to session `id`'s process, and returns the socket. Null
+/// if the session is gone.
+fn tellSession(dir: []const u8, id: u64, message: proto.Message) !?posix.fd_t {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try server_pkg.runtime_dir.socketPath(&path_buf, dir, id);
+    const fd = session.unix.connect(path) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        // The process ended without removing its socket.
+        error.ConnectionRefused => {
+            server_pkg.runtime_dir.remove(dir, id);
+            return null;
+        },
+        else => return err,
     };
-    var d: Dump = .{ .session_id = session_id };
-    st.call(&d.req);
-    return d.result;
+    errdefer session.unix.close(fd);
+    var buf: [64 << 10]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    try proto.encode(&w, message);
+    var rest = w.buffered();
+    while (rest.len > 0) {
+        const n = c.write(fd, rest.ptr, rest.len);
+        if (n <= 0) return error.WriteFailed;
+        rest = rest[@intCast(n)..];
+    }
+    return fd;
+}
+
+/// Ends every session in `dir`, and waits for their processes to exit.
+fn killSessions(dir: []const u8) !void {
+    const ids = try server_pkg.runtime_dir.ids(gpa, testing.io, dir);
+    defer gpa.free(ids);
+    for (ids) |id| if (try tellSession(dir, id, .{ .kill = .{ .session_id = id } })) |fd| session.unix.close(fd);
+
+    // A session process removes its socket as its session ends.
+    const deadline = nowMs() + timeout_ms;
+    while (true) {
+        const left = try server_pkg.runtime_dir.ids(gpa, testing.io, dir);
+        defer gpa.free(left);
+        if (left.len == 0) return;
+        if (nowMs() > deadline) return error.Timeout;
+        try testing.io.sleep(.fromMilliseconds(10), .awake);
+    }
+}
+
+/// Session `id`'s `DumpReply`. Null once the session has ended.
+fn dumpSession(st: *const ServerThread, id: u64) !?Answer {
+    var answer = (try askSession(st.runtimeDir(), id, .{ .dump = .{} })) orelse return null;
+    if (answer.message != .dump_reply) {
+        answer.deinit();
+        return error.UnexpectedAnswer;
+    }
+    return answer;
+}
+
+/// The state dump of a session's primary terminal. Null once the session
+/// has ended.
+fn primaryDump(st: *ServerThread, session_id: u64) !?[]u8 {
+    var answer = (try dumpSession(st, session_id)) orelse return null;
+    defer answer.deinit();
+    return try gpa.dupe(u8, answer.message.dump_reply.state);
 }
 
 /// Writes `bytes` to a session's program as if a client had typed them.
 fn typeDetached(st: *ServerThread, session_id: u64, bytes: []const u8) !void {
-    const Input = struct {
-        req: ServerThread.Request = .{ .run = run },
-        session_id: u64,
-        bytes: []const u8,
-        result: anyerror!void = error.NoSession,
-
-        fn run(req: *ServerThread.Request, server_thread: *ServerThread) void {
-            const in: *@This() = @fieldParentPtr("req", req);
-            const s = server_thread.server.sessions.get(in.session_id) orelse return;
-            in.result = s.host.sendInput(in.bytes);
-        }
-    };
-    var in: Input = .{ .session_id = session_id, .bytes = bytes };
-    st.call(&in.req);
-    return in.result;
+    const fd = (try tellSession(st.runtimeDir(), session_id, .{ .inject = .{ .bytes = bytes } })) orelse return error.NoSession;
+    session.unix.close(fd);
 }
 
 /// Waits until a session's primary terminal shows `needle`, as plain text.
 fn waitForPrimaryText(st: *ServerThread, session_id: u64, needle: []const u8) !void {
-    const Text = struct {
-        req: ServerThread.Request = .{ .run = run },
-        session_id: u64,
-        needle: []const u8,
-        found: bool = false,
-
-        fn run(req: *ServerThread.Request, server_thread: *ServerThread) void {
-            const t: *@This() = @fieldParentPtr("req", req);
-            const s = server_thread.server.sessions.get(t.session_id) orelse return;
-            const text = s.host.primary.terminal.plainString(gpa) catch return;
-            defer gpa.free(text);
-            t.found = std.mem.indexOf(u8, text, t.needle) != null;
-        }
-    };
     const deadline = nowMs() + timeout_ms;
     while (nowMs() < deadline) {
-        var t: Text = .{ .session_id = session_id, .needle = needle };
-        st.call(&t.req);
-        if (t.found) return;
+        const text = try primaryText(st, session_id);
+        defer gpa.free(text);
+        if (std.mem.indexOf(u8, text, needle) != null) return;
         try testing.io.sleep(.fromMilliseconds(10), .awake);
     }
     return error.Timeout;
@@ -251,20 +352,23 @@ fn waitForPrimaryText(st: *ServerThread, session_id: u64, needle: []const u8) !v
 
 /// The visible text of a session's primary terminal. Owned by the caller.
 fn primaryText(st: *ServerThread, session_id: u64) ![]const u8 {
-    const Text = struct {
-        req: ServerThread.Request = .{ .run = run },
-        session_id: u64,
-        result: anyerror![]const u8 = error.NoSession,
+    var answer = (try dumpSession(st, session_id)) orelse return error.NoSession;
+    defer answer.deinit();
+    return gpa.dupe(u8, answer.message.dump_reply.text);
+}
 
-        fn run(req: *ServerThread.Request, server_thread: *ServerThread) void {
-            const t: *@This() = @fieldParentPtr("req", req);
-            const s = server_thread.server.sessions.get(t.session_id) orelse return;
-            t.result = s.host.primary.terminal.plainString(gpa);
-        }
-    };
-    var t: Text = .{ .session_id = session_id };
-    st.call(&t.req);
-    return t.result;
+/// The size of a session's primary terminal.
+fn primarySize(st: *ServerThread, session_id: u64) !struct { u16, u16 } {
+    var answer = (try dumpSession(st, session_id)) orelse return error.NoSession;
+    defer answer.deinit();
+    return .{ answer.message.dump_reply.cols, answer.message.dump_reply.rows };
+}
+
+/// The pid of session `id`'s process.
+fn sessionPid(st: *const ServerThread, id: u64) !posix.pid_t {
+    var answer = (try askSession(st.runtimeDir(), id, .{ .list = .{} })) orelse return error.NoSession;
+    defer answer.deinit();
+    return @intCast(answer.message.session_info.pid.?);
 }
 
 /// Relays UDP datagrams between clients and a server on 127.0.0.1, one
@@ -1593,24 +1697,6 @@ fn reachesItself(address: Io.net.IpAddress) !bool {
     return true;
 }
 
-/// The size of a session's primary terminal, read on the server thread.
-fn primarySize(st: *ServerThread, session_id: u64) !struct { u16, u16 } {
-    const Size = struct {
-        req: ServerThread.Request = .{ .run = run },
-        session_id: u64,
-        size: ?struct { u16, u16 } = null,
-
-        fn run(req: *ServerThread.Request, server_thread: *ServerThread) void {
-            const d: *@This() = @fieldParentPtr("req", req);
-            const s = server_thread.server.sessions.get(d.session_id) orelse return;
-            d.size = .{ s.host.primary.terminal.cols, s.host.primary.terminal.rows };
-        }
-    };
-    var d: Size = .{ .session_id = session_id };
-    st.call(&d.req);
-    return d.size orelse error.NoSession;
-}
-
 test "a server bounds the terminal size a client sends" {
     transport.crypto.init(testing.io);
     var environ = try testEnviron();
@@ -1672,7 +1758,7 @@ test "input larger than the terminal's input queue reaches the program" {
     try rc.waitOutput("262144");
 }
 
-test "stopping the server kills a program that ignores SIGHUP" {
+test "a session told to stop kills a program that ignores SIGHUP" {
     transport.crypto.init(testing.io);
     var environ = try testEnviron();
     defer environ.deinit();
@@ -1681,18 +1767,96 @@ test "stopping the server kills a program that ignores SIGHUP" {
     defer login.deinit();
     var st: ServerThread = undefined;
     try st.init(try login.serverOptions(&environ, &.{ "/bin/sh", "-c", "trap '' HUP; printf 'ready\\r\\n'; while :; do sleep 1; done" }));
+    defer st.deinit();
 
     var rc: RawClient = undefined;
-    try rc.init(&st, login.key, .{
-        .revision = proto.revision,
-        .term = "xterm-256color",
-        .cols = 80,
-        .rows = 24,
-    });
+    try rc.init(&st, login.key, raw_hello);
     defer rc.deinit();
-    _ = try rc.waitAttached();
+    const id = try rc.waitAttached();
     try rc.waitOutput("ready");
+
+    // As a service manager stopping the user's services does.
     const start = nowMs();
-    st.deinit();
+    try posix.kill(try sessionPid(&st, id), .TERM);
+    try testing.expectEqual(@backingInt(proto.ErrorCode.session_lost), try rc.waitError());
     try testing.expect(nowMs() - start < 5000);
+    try testing.expectEqual(null, try primaryDump(&st, id));
+}
+
+test "a session process that dies tells its client" {
+    transport.crypto.init(testing.io);
+    var environ = try testEnviron();
+    defer environ.deinit();
+    var login: Login = undefined;
+    try login.init(null);
+    defer login.deinit();
+    var st: ServerThread = undefined;
+    try st.init(try login.serverOptions(&environ, &.{ "/bin/sh", "-c", "printf 'ready\\r\\n'; sleep 10" }));
+    defer st.deinit();
+
+    var rc: RawClient = undefined;
+    try rc.init(&st, login.key, raw_hello);
+    defer rc.deinit();
+    const id = try rc.waitAttached();
+    try rc.waitOutput("ready");
+
+    try posix.kill(try sessionPid(&st, id), .KILL);
+    try testing.expectEqual(@backingInt(proto.ErrorCode.session_lost), try rc.waitError());
+    try testing.expectEqualStrings("the session's process ended", rc.error_message[0..rc.error_message_len]);
+}
+
+test "a session outlives txd, and its client resumes it on the next txd" {
+    var e: EchoSetup = undefined;
+    try e.init(null);
+    defer e.deinit();
+    const keys = [_]auth.Key{e.login.key.public_key.toBytes()};
+
+    // `restart` replaces the server thread's fields, which the client
+    // mustn't read meanwhile.
+    const servers = e.st.addresses;
+    const host_keys = e.st.host_keys;
+    var pty: TestPty = try .open();
+    defer pty.close();
+    var ct: ClientThread = .{ .options = e.login.clientOptions(&e.st, &pty, &keys) };
+    ct.options.servers = &servers;
+    ct.options.host_keys = &host_keys;
+    ct.options.notice_delay_ms = 60_000;
+    try ct.start();
+    try pty.readUntil("ready");
+    try pty.type_("one\r");
+    try pty.readUntil("got one");
+
+    // The client's connection closes with the server. Input typed
+    // meanwhile is sent once it is back.
+    try e.st.restart();
+    try pty.type_("two\r");
+    const before = pty.output.items.len;
+    try pty.readUntil("got two");
+    // The output continued with no rebuild.
+    try testing.expect(std.mem.indexOf(u8, pty.output.items[before..], "\x1b[!p") == null);
+    try expectMatchesPrimary(&e.st, 1, pty.output.items);
+
+    try pty.type_("~.");
+    try testing.expectEqual(1, (try ct.join(&pty)).detached.?);
+}
+
+test "a new txd lists and kills the sessions it didn't start, and numbers new ones after them" {
+    var t: TitleSetup = undefined;
+    try t.init();
+    defer t.deinit();
+
+    try testing.expectEqual(1, (try t.run(.attach, null, false)).detached.?);
+    try testing.expectEqual(2, (try t.run(.attach, null, false)).detached.?);
+    try t.st.restart();
+
+    const listed = (try t.run(.list, null, false)).listed;
+    defer gpa.free(listed);
+    try testing.expectEqual(2, listed.len);
+    try testing.expectEqual(1, listed[0].session_id);
+    try testing.expectEqualStrings("title 2", listed[1].title.?.slice());
+
+    try testing.expectEqual(3, (try t.run(.attach, null, false)).detached.?);
+    try testing.expectEqual(1, (try t.run(.{ .kill = 1 }, null, false)).killed);
+    // 2 and 3 are detached.
+    try testing.expectEqual(@backingInt(proto.ErrorCode.several_detached), (try t.run(.attach, null, true)).refused.code);
 }

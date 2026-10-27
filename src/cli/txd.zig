@@ -3,6 +3,7 @@
 //! Usage: txd [--listen ADDRESS:PORT] [--key PATH] [--print-host-key]
 //!            [--install]
 //!        txd --version
+//!        txd --session --fd N
 //!
 //! Personal mode: clients log in as the user running txd, with a key
 //! from `~/.config/tx/authorized_keys` if that file exists, or else from
@@ -15,10 +16,15 @@
 //! `--install` sets up a service that keeps txd running with the
 //! given `--listen` and `--key`, starts it if it isn't running, and exits;
 //! see `install.zig`. With `--print-host-key`, the key is printed first.
+//!
+//! `--session` runs one session, on the socket txd passes as fd N. txd
+//! starts it; see `session.process`.
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const xev = @import("xev");
 const server_pkg = @import("server");
+const session = @import("session");
 const transport = @import("transport");
 const auth = @import("auth");
 const build_options = @import("build_options");
@@ -36,6 +42,12 @@ pub fn main(init: std.process.Init) !u8 {
     const gpa = init.gpa;
     const io = init.io;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
+
+    // A session process, started by txd.
+    if (args.len == 4 and std.mem.eql(u8, args[1], "--session") and std.mem.eql(u8, args[2], "--fd")) {
+        const fd = std.fmt.parseInt(std.posix.fd_t, args[3], 10) catch return usage("invalid fd");
+        return session.process.run(gpa, io, fd);
+    }
 
     // Options. `::` covers every IPv4 and IPv6 address.
     var listen: Io.net.IpAddress = try .parseIp6("::", default_port);
@@ -129,12 +141,24 @@ pub fn main(init: std.process.Init) !u8 {
     const login_name = try std.fmt.allocPrint(gpa, "-{s}", .{std.fs.path.basename(shell)});
     defer gpa.free(login_name);
 
+    const runtime_dir = try paths.runtime(gpa, init.environ_map);
+    defer gpa.free(runtime_dir);
+    // On Linux, the binary this process runs even once it has been
+    // replaced, so that the sessions it starts speak its revision.
+    const session_exe = if (builtin.os.tag == .linux)
+        try gpa.dupe(u8, "/proc/self/exe")
+    else
+        try std.process.executablePathAlloc(io, gpa);
+    defer gpa.free(session_exe);
+
     var loop: xev.Loop = try .init(.{});
     defer loop.deinit();
 
     var server: server_pkg.Server = undefined;
     server.init(gpa, io, &loop, .{
         .listen = listen,
+        .runtime_dir = runtime_dir,
+        .session_exe = session_exe,
         .identity = identity,
         .user = user,
         .authorized_keys = &.{ tx_authorized_keys, ssh_authorized_keys },
@@ -147,6 +171,10 @@ pub fn main(init: std.process.Init) !u8 {
             std.debug.print("txd: port {d} is in use, by another txd or another program\n", .{listen.getPort()});
             return 1;
         },
+        error.InsecureRuntimeDir => {
+            std.debug.print("txd: {s} is another user's, or others can reach it\n", .{runtime_dir});
+            return 1;
+        },
         else => |e| return e,
     };
     defer server.deinit();
@@ -157,7 +185,7 @@ pub fn main(init: std.process.Init) !u8 {
 }
 
 fn usage(reason: []const u8) u8 {
-    std.debug.print("txd: {s}\nusage: txd [--listen ADDRESS:PORT] [--key PATH] [--print-host-key] [--install]\n       txd --version\n", .{reason});
+    std.debug.print("txd: {s}\nusage: txd [--listen ADDRESS:PORT] [--key PATH] [--print-host-key] [--install]\n       txd --version\n       txd --session --fd N\n", .{reason});
     return 2;
 }
 

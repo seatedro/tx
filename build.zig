@@ -106,22 +106,6 @@ pub fn build(b: *std.Build) void {
     });
     addTestRuns(b, client_tests, test_step, test_network_step);
 
-    // The end-to-end tests run a server and clients in one process.
-    const e2e = b.createModule(.{
-        .root_source_file = b.path("src/e2e_test.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    e2e.addImport("xev", xev);
-    e2e.addImport("transport", transport);
-    e2e.addImport("server", server);
-    e2e.addImport("client", client);
-    e2e.addImport("term", term);
-    e2e.addImport("proto", proto);
-    e2e.addImport("auth", auth);
-    addTestRuns(b, b.addTest(.{ .name = "e2e-test", .root_module = e2e }), test_step, test_network_step);
-
     // Writes the list of txd builds that tx carries.
     const txd_builds_tool = b.addExecutable(.{
         .name = "txd_builds",
@@ -141,8 +125,30 @@ pub fn build(b: *std.Build) void {
     addTestRuns(b, b.addTest(.{ .name = "cli-test", .root_module = tx }), test_step, test_network_step);
 
     const txd = txdModule(b, target, optimize, app, dev_info);
-    b.installArtifact(b.addExecutable(.{ .name = "txd", .root_module = txd }));
+    const txd_bin = b.addExecutable(.{ .name = "txd", .root_module = txd });
+    b.installArtifact(txd_bin);
     addTestRuns(b, b.addTest(.{ .name = "txd-test", .root_module = txd }), test_step, test_network_step);
+
+    // The end-to-end tests run a server and clients in one process. The
+    // sessions run in txd processes.
+    const e2e = b.createModule(.{
+        .root_source_file = b.path("src/e2e_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    e2e.addImport("xev", xev);
+    e2e.addImport("transport", transport);
+    e2e.addImport("server", server);
+    e2e.addImport("session", session);
+    e2e.addImport("client", client);
+    e2e.addImport("term", term);
+    e2e.addImport("proto", proto);
+    e2e.addImport("auth", auth);
+    const e2e_options = b.addOptions();
+    e2e_options.addOptionPath("txd_exe", txd_bin.getEmittedBin());
+    e2e.addImport("build_options", e2e_options.createModule());
+    addTestRuns(b, b.addTest(.{ .name = "e2e-test", .root_module = e2e }), test_step, test_network_step);
 
     // `zig build release` makes `tx-VERSION-OS-ARCH.tar.gz` in
     // zig-out/release for each release platform, with tx, txd, the license
@@ -317,6 +323,7 @@ fn txdModule(
     });
     mod.addImport("xev", app.xev);
     mod.addImport("server", app.server);
+    mod.addImport("session", app.session);
     mod.addImport("transport", app.transport);
     mod.addImport("auth", app.auth);
     mod.addImport("build_options", info);

@@ -101,8 +101,26 @@ pub const Decoder = struct {
     /// Returns the next complete message, or null when the fed bytes are
     /// used up.
     pub fn next(d: *Decoder) Error!?Message {
+        const raw = (try d.nextRaw()) orelse return null;
+        return try raw.decode();
+    }
+
+    /// A message as it arrived, for forwarding it unchanged.
+    pub const Raw = struct {
+        type_id: u64,
+        /// The whole message, header included.
+        bytes: []const u8,
+        body: []const u8,
+
+        pub fn decode(raw: Raw) DecodeError!Message {
+            return Message.decode(raw.type_id, raw.body);
+        }
+    };
+
+    /// As `next`, without decoding the body.
+    pub fn nextRaw(d: *Decoder) Error!?Raw {
         const header, const bytes = (try d.nextFrame()) orelse return null;
-        return try Message.decode(header.type_id, bytes[header.len..][0..header.body_len]);
+        return .{ .type_id = header.type_id, .bytes = bytes, .body = bytes[header.len..][0..header.body_len] };
     }
 
     /// Returns the next message's header and its bytes, header included.
