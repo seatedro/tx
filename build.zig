@@ -146,7 +146,9 @@ pub fn build(b: *std.Build) void {
     });
     tx.addImport("client", client);
     tx.addImport("auth", auth);
+    tx.addImport("proto", proto);
     b.installArtifact(b.addExecutable(.{ .name = "tx", .root_module = tx }));
+    addTestRuns(b, b.addTest(.{ .name = "cli-test", .root_module = tx }), test_step, test_network_step);
 
     const tx_session = b.createModule(.{
         .root_source_file = b.path("src/cli/tx_session.zig"),

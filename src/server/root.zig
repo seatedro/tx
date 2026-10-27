@@ -22,6 +22,9 @@
 //! A client whose session is attached elsewhere gets `Error`, with
 //! `attached_elsewhere`.
 //!
+//! A logged-in client may also list the sessions (`List`), or end one
+//! (`Kill`).
+//!
 //! Listening on a wildcard address binds each address it covers, and
 //! follows addresses as they come and go (see `addresses`).
 const std = @import("std");
@@ -381,6 +384,17 @@ pub const Server = struct {
         };
     }
 
+    /// The sessions in order of ID. Owned by the caller.
+    fn sortedSessions(self: *const Server, gpa: Allocator) ![]*Session {
+        const sessions = try gpa.dupe(*Session, self.sessions.values());
+        std.mem.sort(*Session, sessions, {}, struct {
+            fn lessThan(_: void, a: *Session, b: *Session) bool {
+                return a.id < b.id;
+            }
+        }.lessThan);
+        return sessions;
+    }
+
     fn startSession(self: *Server, hello: *const Hello) !*Session {
         // The server's environment, plus what describes the client's
         // terminal and the session's ID.
@@ -397,10 +411,20 @@ pub const Server = struct {
         errdefer wake.deinit();
         var grace: xev.Timer = try .init();
         errdefer grace.deinit();
+        var kill_timer: xev.Timer = try .init();
+        errdefer kill_timer.deinit();
 
         // The host's thread can notify as soon as it starts. `wake` has to
         // exist first.
-        s.* = .{ .server = self, .id = self.next_id, .host = undefined, .wake = wake, .grace = grace };
+        s.* = .{
+            .server = self,
+            .id = self.next_id,
+            .host = undefined,
+            .started = Io.Clock.boot.now(self.io),
+            .wake = wake,
+            .grace = grace,
+            .kill_timer = kill_timer,
+        };
         s.host = try Host.create(self.gpa, self.io, .{
             .argv = self.options.argv,
             .program = self.options.program,
@@ -475,6 +499,8 @@ const Client = struct {
             .auth_signature => |m| client.onAuthSignature(m),
             .attach => |m| client.onAttach(m),
             .@"resume" => |m| client.onResume(m),
+            .list => client.onList(),
+            .kill => |m| client.onKill(m),
             .input => |m| if (client.session) |s| {
                 s.input(m.bytes);
                 s.input_offset += m.bytes.len;
@@ -563,18 +589,80 @@ const Client = struct {
         const hello = &(client.hello orelse return client.fail(.protocol, "attach before hello"));
         if (client.session != null) return client.fail(.protocol, "second attach");
 
-        // An ID reattaches. Without one, a new session starts, and its
-        // output goes to the client from the first record.
+        // An ID reattaches, and so does `reuse` with one detached session.
+        // Otherwise a new session starts, and its output goes to the client
+        // from the first record.
         const server = client.server;
-        const s = if (m.session_id) |id|
+        const existing = if (m.session_id) |id|
             server.sessions.get(id) orelse return client.fail(.no_session, "no such session")
+        else if (m.reuse)
+            client.onlyDetached() catch return
         else
-            server.startSession(hello) catch |err| {
-                log.warn("starting a session failed: {t}", .{err});
-                return client.fail(.spawn, "can't start the session");
-            };
+            null;
+        if (existing) |s| return client.attachTo(s, .{ .rebuild = .attach }, .attached);
 
-        client.attachTo(s, if (m.session_id != null) .{ .rebuild = .attach } else .new, .attached);
+        const s = server.startSession(hello) catch |err| {
+            log.warn("starting a session failed: {t}", .{err});
+            return client.fail(.spawn, "can't start the session");
+        };
+        client.attachTo(s, .new, .attached);
+    }
+
+    /// The detached session, if there is exactly one. With several, sends
+    /// `Error` naming them.
+    fn onlyDetached(client: *Client) error{Refused}!?*Session {
+        const gpa = client.server.gpa;
+        const sessions = client.server.sortedSessions(gpa) catch {
+            client.fail(.protocol, "out of memory");
+            return error.Refused;
+        };
+        defer gpa.free(sessions);
+
+        var found: ?*Session = null;
+        var count: usize = 0;
+        var buf: [256]u8 = undefined;
+        var w: Io.Writer = .fixed(&buf);
+        w.writeAll("sessions") catch {};
+        for (sessions) |s| {
+            if (s.client != null) continue;
+            found = s;
+            count += 1;
+            // A message too long for the buffer is cut short.
+            w.print("{s} {d}", .{ if (count > 1) "," else "", s.id }) catch {};
+        }
+        if (count <= 1) return found;
+
+        w.writeAll(" are detached") catch {};
+        client.fail(.several_detached, w.buffered());
+        return error.Refused;
+    }
+
+    fn onList(client: *Client) void {
+        const server = client.server;
+        const sessions = server.sortedSessions(server.gpa) catch return client.fail(.protocol, "out of memory");
+        defer server.gpa.free(sessions);
+        const now = Io.Clock.boot.now(server.io);
+        for (sessions) |s| {
+            var from_buf: [64]u8 = undefined;
+            const from = if (s.client) |c| std.fmt.bufPrint(&from_buf, "{f}", .{c.conn.remote}) catch null else null;
+            const t = &s.host.primary.terminal;
+            client.send(.{ .session_info = .{
+                .session_id = s.id,
+                .cols = t.cols,
+                .rows = t.rows,
+                .running_s = @intCast(@divTrunc(s.started.durationTo(now).nanoseconds, std.time.ns_per_s)),
+                .attached_from = from,
+                .title = t.getTitle(),
+            } });
+        }
+        client.send(.{ .list_end = .{} });
+    }
+
+    fn onKill(client: *Client, m: proto.Kill) void {
+        const s = client.server.sessions.get(m.session_id) orelse return client.fail(.no_session, "no such session");
+        log.info("{f} killed session {d}", .{ client.conn.remote, s.id });
+        s.kill();
+        client.send(.{ .killed = .{ .session_id = s.id } });
     }
 
     /// Logs in with a proof of the session's resume key, and attaches.
@@ -693,6 +781,11 @@ const Session = struct {
     grace_c: xev.Completion = .{},
     /// `Server.stop` was called and the grace period is over.
     grace_over: bool = false,
+    /// Sends SIGKILL after `kill`.
+    kill_timer: xev.Timer,
+    kill_c: xev.Completion = .{},
+    /// On `Io.Clock.boot`.
+    started: Io.Timestamp,
     /// The program exited and the session left `Server.sessions`.
     ended: bool = false,
 
@@ -872,6 +965,21 @@ const Session = struct {
         s.grace.run(s.server.loop, &s.grace_c, stop_grace_ms, Session, s, onGraceOver);
     }
 
+    /// Sends the program SIGHUP, and SIGKILL if it is still running after
+    /// the grace period.
+    fn kill(s: *Session) void {
+        if (s.ended or s.kill_c.state() == .active) return;
+        s.host.pty.kill(.HUP) catch {};
+        s.kill_timer.run(s.server.loop, &s.kill_c, stop_grace_ms, Session, s, onKillTimer);
+    }
+
+    fn onKillTimer(s_: ?*Session, _: *xev.Loop, _: *xev.Completion, _: xev.Timer.RunError!void) xev.CallbackAction {
+        const s = s_.?;
+        if (!s.ended) s.host.pty.kill(.KILL) catch {};
+        s.freeIfEnded();
+        return .disarm;
+    }
+
     fn onGraceOver(s_: ?*Session, _: *xev.Loop, _: *xev.Completion, _: xev.Timer.RunError!void) xev.CallbackAction {
         const s = s_.?;
         s.grace_over = true;
@@ -884,7 +992,7 @@ const Session = struct {
     /// Frees an ended session once no completion holds a pointer to it.
     /// Sessions still in `Server.sessions` are freed by `Server.deinit`.
     fn freeIfEnded(s: *Session) void {
-        if (s.ended and s.wake_c.state() == .dead and s.grace_c.state() == .dead) s.destroy();
+        if (s.ended and s.wake_c.state() == .dead and s.grace_c.state() == .dead and s.kill_c.state() == .dead) s.destroy();
     }
 
     fn destroy(s: *Session) void {
@@ -892,6 +1000,7 @@ const Session = struct {
         s.host.destroy();
         s.wake.deinit();
         s.grace.deinit();
+        s.kill_timer.deinit();
         s.server.gpa.destroy(s);
     }
 };
