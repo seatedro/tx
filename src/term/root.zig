@@ -3,6 +3,7 @@
 //! consumed; the client stream is built from the log.
 pub const log = @import("log.zig");
 pub const primary = @import("primary.zig");
+pub const rebuild = @import("rebuild.zig");
 pub const state = @import("state.zig");
 
 pub const Log = log.Log;
@@ -12,5 +13,6 @@ pub const Primary = primary.Primary;
 test {
     _ = log;
     _ = primary;
+    _ = rebuild;
     _ = state;
 }

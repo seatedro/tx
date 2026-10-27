@@ -10,11 +10,13 @@
 //! A connection that closes leaves its session running, detached. A
 //! session ends when its program exits; the attached client gets `Exit`.
 //!
+//! Attaching to a running session resizes it to the client's terminal and
+//! sends `Rebuild`, bytes generated from the primary terminal's state (see
+//! `term.rebuild`). Output records follow from the next seq. The log may
+//! have dropped its start by then.
+//!
 //! Listening on a wildcard address binds each address it covers, and
 //! follows addresses as they come and go (see `addresses`).
-//!
-//! Revision 0 replays a session's log from seq 0 on attach, so a session
-//! whose log has been trimmed can't be reattached yet.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -50,6 +52,8 @@ pub const Options = struct {
     argv: []const []const u8,
     program: ?[]const u8 = null,
     cwd: std.process.Child.Cwd = .inherit,
+    /// Scrollback and log limits of each session's terminal.
+    terminal: session.host.Options.TerminalOptions = .{},
     idle_timeout_ns: u64 = 30 * std.time.ns_per_s,
 };
 
@@ -71,6 +75,10 @@ const low_water = 256 << 10;
 
 /// The longest message body accepted from a client.
 const max_message = 1 << 20;
+
+/// The most rebuild bytes sent in one message. Well below the client's
+/// message limit.
+const rebuild_part = 256 << 10;
 
 /// The longest message body accepted before login. Login messages carry
 /// a user name, a key and a signature.
@@ -401,6 +409,7 @@ pub const Server = struct {
             .environ = &environ,
             .cwd = self.options.cwd,
             .size = hello.size,
+            .terminal = self.options.terminal,
             .notify = Session.onHostNotify,
             .context = s,
         });
@@ -552,7 +561,8 @@ const Client = struct {
         const hello = &(client.hello orelse return client.fail(.protocol, "attach before hello"));
         if (client.session != null) return client.fail(.protocol, "second attach");
 
-        // An ID reattaches. Without one, a new session starts.
+        // An ID reattaches. Without one, a new session starts, and its
+        // output goes to the client from the first record.
         const server = client.server;
         const s = if (m.session_id) |id|
             server.sessions.get(id) orelse return client.fail(.no_session, "no such session")
@@ -562,20 +572,20 @@ const Client = struct {
                 return client.fail(.spawn, "can't start the session");
             };
 
-        // The client rebuilds the screen by replaying the log from seq 0.
-        if (s.host.primary.log.firstSeq() != 0) return client.fail(.log_trimmed, "the session's output is no longer in its log");
-
         // One client at a time: the newer attach wins.
         if (s.client) |other| other.conn.close(0);
 
         s.attach(client);
         client.send(.{ .attached = .{ .session_id = s.id } });
-        s.pump();
 
-        // The replay is the output as the program wrote it at the old size.
-        // Resizing afterwards makes the program redraw at the client's.
-        const t = &s.host.primary.terminal;
-        if (t.cols != hello.size.cols or t.rows != hello.size.rows) s.resize(hello.size);
+        // A running session is rebuilt at the client's size. The program
+        // redraws at that size too, in output that follows the rebuild.
+        if (m.session_id != null) {
+            const t = &s.host.primary.terminal;
+            if (t.cols != hello.size.cols or t.rows != hello.size.rows) s.resize(hello.size);
+            s.rebuild_pending = true;
+        }
+        s.pump();
     }
 
     /// Encodes `message` onto the stream, which copies it. A failure closes
@@ -612,6 +622,8 @@ const Session = struct {
     client: ?*Client = null,
     /// The next log seq to send to `client`.
     next_seq: u64 = 0,
+    /// `client` gets a rebuild before any output.
+    rebuild_pending: bool = false,
     /// Output processing stopped because the client's stream holds
     /// `high_water` bytes. The host's thread stops reading the pty once its
     /// queue fills.
@@ -629,8 +641,6 @@ const Session = struct {
     fn attach(s: *Session, client: *Client) void {
         s.client = client;
         client.session = s;
-
-        // Replay from the start of the log.
         s.next_seq = 0;
 
         // The client's terminal answers queries now.
@@ -640,6 +650,7 @@ const Session = struct {
     fn detach(s: *Session) void {
         if (s.client) |client| client.session = null;
         s.client = null;
+        s.rebuild_pending = false;
         s.host.answer_queries = true;
 
         // No stream is backed up now. Output keeps flowing while detached.
@@ -654,11 +665,19 @@ const Session = struct {
         s.host.resize(size) catch |err| log.warn("session {d}: resize failed: {t}", .{ s.id, err });
     }
 
-    /// Sends the client the log records it hasn't seen. Resize records are
-    /// skipped: the client's terminal is already at the size it asked for.
+    /// Sends the client the rebuild it is owed, then the log records it
+    /// hasn't seen. Resize records are skipped: the client's terminal is
+    /// already at the size it asked for.
     fn pump(s: *Session) void {
         const client = s.client orelse return;
         const stream = client.stream orelse return;
+        if (s.rebuild_pending) {
+            s.sendRebuild(client);
+            // The output ends inside a long sequence. The next output may
+            // finish it.
+            if (s.rebuild_pending) return;
+        }
+
         // The log dropped records the client hasn't been sent.
         var it = s.host.primary.log.iterator(s.next_seq) catch {
             return client.fail(.log_trimmed, "the client fell behind the session's log");
@@ -675,6 +694,32 @@ const Session = struct {
         // The stream copies what it's given. A client that doesn't
         // acknowledge would grow it without bound.
         if (stream.buffered() > high_water) s.paused = true;
+    }
+
+    /// Sends `Rebuild` for the primary's state, in parts, and continues
+    /// from the log's next record.
+    fn sendRebuild(s: *Session, client: *Client) void {
+        const gpa = s.server.gpa;
+        var out: Io.Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        s.host.primary.rebuild(&out.writer) catch |err| switch (err) {
+            error.Unfinished => return,
+            error.WriteFailed => {
+                log.warn("session {d}: rebuild failed: out of memory", .{s.id});
+                return client.conn.close(0);
+            },
+        };
+        s.rebuild_pending = false;
+        s.next_seq = s.host.primary.log.nextSeq();
+
+        var rest = out.written();
+        var first = true;
+        while (first or rest.len > 0) {
+            const part = rest[0..@min(rest.len, rebuild_part)];
+            client.send(.{ .rebuild = .{ .seq = s.next_seq, .bytes = part, .first = first } });
+            rest = rest[part.len..];
+            first = false;
+        }
     }
 
     fn resume_(s: *Session) void {
