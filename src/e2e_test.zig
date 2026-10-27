@@ -269,7 +269,9 @@ fn primaryText(st: *ServerThread, session_id: u64) ![]const u8 {
 
 /// Relays UDP datagrams between clients and a server on 127.0.0.1, one
 /// upstream socket per client address. While `dropping` is set it drops
-/// them all, as a network that went away would.
+/// them all, as a network that went away would. `blockExisting` drops
+/// those of the client addresses seen so far from then on, as a network
+/// change does to a connection's old path.
 const Relay = struct {
     fd: posix.fd_t,
     /// For clients to connect to.
@@ -278,6 +280,10 @@ const Relay = struct {
     pairs: [16]Pair = undefined,
     len: usize = 0,
     dropping: std.atomic.Value(bool) = .init(false),
+    /// Set by `blockExisting` until the relay's thread takes it.
+    block_requested: std.atomic.Value(bool) = .init(false),
+    /// Pairs before this index are dropped.
+    blocked: usize = 0,
     stopping: std.atomic.Value(bool) = .init(false),
     thread: std.Thread = undefined,
 
@@ -314,6 +320,11 @@ const Relay = struct {
         r.thread = try std.Thread.spawn(.{}, run, .{r});
     }
 
+    fn blockExisting(r: *Relay) void {
+        r.block_requested.store(true, .release);
+        while (r.block_requested.load(.acquire)) testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+    }
+
     fn stop(r: *Relay) void {
         r.stopping.store(true, .release);
         r.thread.join();
@@ -324,6 +335,10 @@ const Relay = struct {
     fn run(r: *Relay) void {
         var buf: [65536]u8 = undefined;
         while (!r.stopping.load(.acquire)) {
+            if (r.block_requested.load(.acquire)) {
+                r.blocked = r.len;
+                r.block_requested.store(false, .release);
+            }
             var fds: [17]posix.pollfd = undefined;
             fds[0] = .{ .fd = r.fd, .events = posix.POLL.IN, .revents = 0 };
             for (r.pairs[0..r.len], 1..) |pair, i| fds[i] = .{ .fd = pair.fd, .events = posix.POLL.IN, .revents = 0 };
@@ -335,29 +350,30 @@ const Relay = struct {
                 var from: c.sockaddr.in = undefined;
                 var from_len: c.socklen_t = @sizeOf(c.sockaddr.in);
                 const n = c.recvfrom(r.fd, &buf, buf.len, 0, @ptrCast(&from), &from_len);
-                if (n > 0 and !dropping) if (r.pairFor(from)) |pair| {
-                    _ = c.sendto(pair.fd, &buf, @intCast(n), 0, @ptrCast(&r.server), @sizeOf(c.sockaddr.in));
+                if (n > 0 and !dropping) if (r.pairFor(from)) |i| {
+                    if (i >= r.blocked) _ = c.sendto(r.pairs[i].fd, &buf, @intCast(n), 0, @ptrCast(&r.server), @sizeOf(c.sockaddr.in));
                 };
             }
 
             // From the server, back to the client.
-            for (r.pairs[0..r.len], 1..) |pair, i| {
-                if (fds[i].revents == 0) continue;
+            for (r.pairs[0..r.len], 0..) |pair, i| {
+                if (fds[i + 1].revents == 0) continue;
                 const n = c.recv(pair.fd, &buf, buf.len, 0);
-                if (n > 0 and !dropping) _ = c.sendto(r.fd, &buf, @intCast(n), 0, @ptrCast(&pair.client), @sizeOf(c.sockaddr.in));
+                if (n > 0 and !dropping and i >= r.blocked) _ = c.sendto(r.fd, &buf, @intCast(n), 0, @ptrCast(&pair.client), @sizeOf(c.sockaddr.in));
             }
         }
     }
 
-    fn pairFor(r: *Relay, from: c.sockaddr.in) ?Pair {
-        for (r.pairs[0..r.len]) |pair| {
-            if (pair.client.port == from.port and pair.client.addr == from.addr) return pair;
+    /// The index of the pair for `from`, made on its first datagram.
+    fn pairFor(r: *Relay, from: c.sockaddr.in) ?usize {
+        for (r.pairs[0..r.len], 0..) |pair, i| {
+            if (pair.client.port == from.port and pair.client.addr == from.addr) return i;
         }
         if (r.len == r.pairs.len) return null;
         const fd = open(0) catch return null;
         r.pairs[r.len] = .{ .client = from, .fd = fd };
         r.len += 1;
-        return r.pairs[r.len - 1];
+        return r.len - 1;
     }
 };
 
@@ -702,6 +718,31 @@ test "a client that loses its connection resumes where it left off" {
 
     try pty.type_("~.");
     try testing.expectEqual(1, (try ct.join(&pty)).detached.?);
+}
+
+test "a client gives up on a silent connection before its idle timeout" {
+    var e: EchoSetup = undefined;
+    try e.init(null);
+    defer e.deinit();
+    const keys = [_]auth.Key{e.login.key.public_key.toBytes()};
+
+    var pty: TestPty = try .open();
+    defer pty.close();
+    var ct: ClientThread = .{ .options = e.clientOptions(&pty, &keys) };
+    // Only the silence can end the connection within the test's timeout.
+    ct.options.idle_timeout_ns = 30 * std.time.ns_per_s;
+    ct.options.silence_timeout_ns = 600 * std.time.ns_per_ms;
+    ct.options.notice_delay_ms = 60_000;
+    try ct.start();
+    try pty.readUntil("ready");
+
+    // The old path stays dead. Only a new connection gets through.
+    e.relay.blockExisting();
+    try pty.type_("one\r");
+    try pty.readUntil("got one");
+
+    try pty.type_("~.");
+    _ = try ct.join(&pty);
 }
 
 test "a resumed client whose output left the log gets a repaint" {
