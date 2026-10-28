@@ -92,6 +92,8 @@ pub const Options = struct {
     err_fd: posix.fd_t = posix.STDERR_FILENO,
     term: []const u8,
     colorterm: ?[]const u8 = null,
+    /// See `proto.Attach.terminfo`.
+    terminfo: ?[]const u8 = null,
     /// See `proto.Hello.locale`.
     locale: ?[]const u8 = null,
     /// Null disables `~.`.
@@ -775,6 +777,7 @@ const Run = struct {
                 .session_id = r.options.session_id,
                 .reuse = r.options.reuse_detached,
                 .command = r.options.session_command,
+                .terminfo = r.options.terminfo,
             } },
             .list => .{ .list = .{} },
             .kill => |id| .{ .kill = .{ .session_id = id } },

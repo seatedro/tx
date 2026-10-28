@@ -30,7 +30,9 @@ same options, and the real ssh runs instead for what tx can't do, such as
     ln -s "$(command -v tx)" ~/.local/bin/ssh
 
 `~.` detaches. A new session gets the client's `TERM`, `COLORTERM`, `LANG`
-and `LC_*`.
+and `LC_*`, and the terminfo entry for its `TERM`, so `xterm-ghostty` and
+`xterm-kitty` work on hosts whose ncurses lacks them. txd compiles the entry
+with the host's `tic`; without it, the session's `TERM` is `xterm-256color`.
 
 tx logs in with the same keys as ssh: the SSH agent's Ed25519 and RSA keys,
 then `~/.ssh/id_ed25519`. txd accepts the keys in `~/.ssh/authorized_keys`.

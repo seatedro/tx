@@ -96,9 +96,12 @@ pub const Attach = struct {
     /// the shell, as `tx -t HOST COMMAND` does. Only without `session_id`
     /// and `reuse`.
     command: ?[]const u8 = null,
+    /// The terminfo source for the client's `TERM`, as `infocmp -x` prints
+    /// it, for a new session on a host that may lack the entry.
+    terminfo: ?[]const u8 = null,
 
     pub const type_id = 3;
-    pub const tags = .{ .session_id = 1, .reuse = 2, .command = 3 };
+    pub const tags = .{ .session_id = 1, .reuse = 2, .command = 3, .terminfo = 4 };
 
     pub fn encodedLen(m: Attach) usize {
         return bodyLen(Attach, m);

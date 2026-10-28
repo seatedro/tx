@@ -48,7 +48,9 @@
 //! A host with no key there, or one whose key changed, doesn't answer,
 //! and the install over ssh brings the key.
 //!
-//! A new session gets the client's `TERM`, `COLORTERM`, `LANG` and `LC_*`.
+//! A new session gets the client's `TERM`, `COLORTERM`, `LANG` and `LC_*`,
+//! and the terminfo entry for its `TERM`, from `infocmp -x`, which txd
+//! compiles for the session on a host that may lack it.
 //!
 //! The login uses the SSH agent's Ed25519 and RSA keys, then
 //! `~/.ssh/id_ed25519`.
@@ -213,6 +215,7 @@ pub fn main(init: std.process.Init) !u8 {
         break :blk null;
     };
 
+    const term = environ.get("TERM") orelse "xterm-256color";
     var options: client.session.Options = .{
         .servers = addresses,
         .host_keys = trusted.keys,
@@ -225,7 +228,8 @@ pub fn main(init: std.process.Init) !u8 {
         .session_command = session_command,
         .reuse_detached = args.mode == .auto and args.command == null,
         .show_session_id = session_command == null,
-        .term = environ.get("TERM") orelse "xterm-256color",
+        .term = term,
+        .terminfo = if (command == .attach) terminfoSource(arena, io, term) else null,
         .colorterm = environ.get("COLORTERM"),
         .locale = try localeVariables(arena, environ),
         .escape_char = args.escape_char,
@@ -546,6 +550,20 @@ fn printConfig(io: Io, environ: *const std.process.Environ.Map, args: args_pkg.A
     w.interface.flush() catch return 255;
     return 0;
 }
+
+/// The terminfo source for `term`, from `infocmp -x`. Null when there's none
+/// to send, as without ncurses' tools.
+fn terminfoSource(arena: Allocator, io: Io, term: []const u8) ?[]const u8 {
+    const result = std.process.run(arena, io, .{
+        .argv = &.{ "infocmp", "-x", term },
+        .stdout_limit = .limited(server_terminfo_limit),
+        .stderr_limit = .limited(4096),
+    }) catch return null;
+    return if (result.term.success()) result.stdout else null;
+}
+
+/// The longest terminfo source txd takes.
+const server_terminfo_limit = 64 << 10;
 
 /// `-n`: stdin from /dev/null.
 fn openNull() !std.posix.fd_t {

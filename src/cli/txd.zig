@@ -178,6 +178,10 @@ pub fn main(init: std.process.Init) !u8 {
     }
     try environ.put("TX_SESSION", "1");
 
+    // Next to txd's own builds, which `--uninstall` removes.
+    const terminfo_dir = try paths.home(gpa, init.environ_map, ".local/share/tx/terminfo");
+    defer gpa.free(terminfo_dir);
+
     // A login shell: argv[0] is the shell's name with a leading "-".
     const shell = init.environ_map.get("SHELL") orelse "/bin/sh";
     const login_name = try std.fmt.allocPrint(gpa, "-{s}", .{std.fs.path.basename(shell)});
@@ -208,6 +212,7 @@ pub fn main(init: std.process.Init) !u8 {
         .argv = &.{login_name},
         .program = shell,
         .shell = shell,
+        .terminfo_dir = terminfo_dir,
         .cwd = if (init.environ_map.get("HOME")) |home| .{ .path = home } else .inherit,
         .spa_key = if (open) null else spa_key,
     }) catch |err| switch (err) {
