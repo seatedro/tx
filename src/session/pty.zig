@@ -127,6 +127,15 @@ pub const Pty = struct {
     term: ?Term,
     tty_name_buf: [128]u8,
     tty_name_len: u8,
+    /// macOS discards what the master hasn't read when the slave's last fd
+    /// closes, which loses the output of a program that exits at once. So
+    /// there, the parent keeps a slave fd until the child has exited and
+    /// `read` has taken its output. -1 elsewhere, and once closed.
+    held_slave: posix.fd_t = -1,
+    /// With `held_slave`, a kqueue that turns readable when the child
+    /// exits, as the master won't then. Poll it with the master, and `read`
+    /// when either is ready. -1 elsewhere, and once closed.
+    exit_fd: posix.fd_t = -1,
 
     /// Opens a pty and starts a program on it. Returns after the program
     /// has been exec'd. If the child fails before exec, it is reaped and its
@@ -165,8 +174,11 @@ pub const Pty = struct {
             .CLOEXEC = true,
         }));
         // The parent closes the slave so that reads from the master see end
-        // of file when the child's side is closed.
-        defer closeFd(slave);
+        // of file when the child's side is closed. On macOS, `read` closes
+        // it once the child has exited (see `held_slave`).
+        const hold = native_os.isDarwin();
+        defer if (!hold) closeFd(slave);
+        errdefer if (hold) closeFd(slave);
 
         // Canonical mode erases whole UTF-8 characters only with IUTF8,
         // which neither Linux nor macOS sets by default.
@@ -185,6 +197,15 @@ pub const Pty = struct {
             .cwd = options.cwd,
             .diagnostic = options.diagnostic,
         }, .{ .pty = slave });
+        if (hold) {
+            self.held_slave = slave;
+            self.exit_fd = watchExit(self.pid.?) catch |err| {
+                // The child runs, and is reaped by `deinit`.
+                closeFd(slave);
+                self.held_slave = -1;
+                return err;
+            };
+        }
         return self;
     }
 
@@ -197,7 +218,15 @@ pub const Pty = struct {
             switch (posix.errno(rc)) {
                 .SUCCESS => return @intCast(rc),
                 .INTR => continue,
-                .AGAIN => return error.WouldBlock,
+                .AGAIN => {
+                    // The child has exited and its output is read: the
+                    // slave closes losing nothing, and end of file follows.
+                    if (self.held_slave != -1 and childExited(self.exit_fd)) {
+                        self.releaseSlave();
+                        continue;
+                    }
+                    return error.WouldBlock;
+                },
                 // Linux returns EIO once the slave has no open fds; macOS
                 // returns 0.
                 .IO => return 0,
@@ -303,6 +332,15 @@ pub const Pty = struct {
         if (self.master == -1) return;
         closeFd(self.master);
         self.master = -1;
+        self.releaseSlave();
+    }
+
+    fn releaseSlave(self: *Pty) void {
+        if (self.held_slave == -1) return;
+        closeFd(self.held_slave);
+        closeFd(self.exit_fd);
+        self.held_slave = -1;
+        self.exit_fd = -1;
     }
 
     /// Hangs up, then sends SIGKILL to the child and reaps it if it hasn't
@@ -675,6 +713,32 @@ fn readChildError(fd: posix.fd_t) ?ChildError.Failure {
     };
 }
 
+/// A kqueue that turns readable when `pid` exits. A child that exited
+/// before it is watched triggers a user event, which reads the same.
+fn watchExit(pid: posix.pid_t) SpawnError!posix.fd_t {
+    if (comptime !native_os.isDarwin()) unreachable;
+    const kq = c.kqueue();
+    if (kq == -1) return openError(posix.errno(-1));
+    errdefer closeFd(kq);
+    if (c.fcntl(kq, posix.F.SETFD, @as(c_int, posix.FD_CLOEXEC)) == -1) return posix.unexpectedErrno(posix.errno(-1));
+
+    const exit: c.Kevent = .{ .ident = @intCast(pid), .filter = c.EVFILT.PROC, .flags = c.EV.ADD, .fflags = c.NOTE.EXIT, .data = 0, .udata = 0 };
+    if (c.kevent(kq, (&exit)[0..1], 1, (&exit)[0..0], 0, null) == 0) return kq;
+    if (posix.errno(-1) != .SRCH) return posix.unexpectedErrno(posix.errno(-1));
+
+    const exited: c.Kevent = .{ .ident = 0, .filter = c.EVFILT.USER, .flags = c.EV.ADD, .fflags = c.NOTE.TRIGGER, .data = 0, .udata = 0 };
+    if (c.kevent(kq, (&exited)[0..1], 1, (&exited)[0..0], 0, null) == -1) return posix.unexpectedErrno(posix.errno(-1));
+    return kq;
+}
+
+/// Whether the kqueue from `watchExit` says the child exited.
+fn childExited(kq: posix.fd_t) bool {
+    if (comptime !native_os.isDarwin()) return false;
+    var event: c.Kevent = undefined;
+    const zero: c.timespec = .{ .sec = 0, .nsec = 0 };
+    return c.kevent(kq, (&event)[0..0], 0, (&event)[0..1], 1, &zero) > 0;
+}
+
 /// Blocks until `pid` has exited, and leaves it unreaped.
 fn waitExitedPid(pid: posix.pid_t) WaitError!void {
     // Larger than siginfo_t on every supported platform. Only the return
@@ -941,7 +1005,10 @@ const Output = struct {
                 std.debug.print("timed out with output \"{f}\"\n", .{std.zig.fmtString(out.bytes())});
                 return error.Timeout;
             }
-            var fds = [_]posix.pollfd{.{ .fd = pty.master, .events = posix.POLL.IN, .revents = 0 }};
+            var fds = [_]posix.pollfd{
+                .{ .fd = pty.master, .events = posix.POLL.IN, .revents = 0 },
+                .{ .fd = pty.exit_fd, .events = posix.POLL.IN, .revents = 0 },
+            };
             _ = c.poll(&fds, fds.len, @intCast(remaining));
             if (out.len == out.buf.len) return error.NoSpaceLeft;
             const n = pty.read(out.buf[out.len..]) catch |err| switch (err) {

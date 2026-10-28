@@ -260,9 +260,12 @@ pub const Host = struct {
             if (want_write) events |= posix.POLL.OUT;
             // poll ignores a negative fd. A closed slave reports POLLHUP
             // even with no events requested.
+            // On macOS, the child's exit is what ends the output (see
+            // `Pty.exit_fd`). It is -1 elsewhere, and once seen.
             var fds = [_]posix.pollfd{
                 .{ .fd = self.wake.read_fd, .events = posix.POLL.IN, .revents = 0 },
                 .{ .fd = if (events == 0) -1 else fd, .events = events, .revents = 0 },
+                .{ .fd = if (want_read) self.pty.exit_fd else -1, .events = posix.POLL.IN, .revents = 0 },
             };
             if (c.poll(&fds, fds.len, -1) == -1) switch (posix.errno(-1)) {
                 .INTR, .AGAIN => continue,
@@ -279,7 +282,7 @@ pub const Host = struct {
             const revents = fds[1].revents;
             const failed = posix.POLL.ERR | posix.POLL.HUP;
             if (want_write and revents & (posix.POLL.OUT | failed) != 0) self.writeInput();
-            if (want_read and revents & (posix.POLL.IN | failed) != 0) self.readOutput(&buf);
+            if (want_read and (revents & (posix.POLL.IN | failed) != 0 or fds[2].revents != 0)) self.readOutput(&buf);
         }
     }
 
