@@ -15,6 +15,10 @@
 //! A server that has the port keeps running, with its sessions, and the
 //! new file applies from its next start. One that doesn't, such as after a
 //! change of port, restarts with the new file.
+//!
+//! Each session runs in a process of its own (see `session.spawn`), and
+//! the service manager stops only txd: sessions outlive a restart of the
+//! service, and the next txd finds them.
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
@@ -270,6 +274,9 @@ fn writeIfChanged(gpa: Allocator, io: Io, path: []const u8, data: []const u8) !b
     return true;
 }
 
+/// `KillMode=process` stops only txd, and the session processes stay in
+/// the service's cgroup. Shutdown and the end of the user's manager still
+/// end them.
 fn systemdUnit(gpa: Allocator, exe: []const u8, args: []const []const u8) ![]u8 {
     var out: Io.Writer.Allocating = .init(gpa);
     errdefer out.deinit();
@@ -290,6 +297,7 @@ fn systemdUnit(gpa: Allocator, exe: []const u8, args: []const []const u8) ![]u8 
     try w.writeAll(
         \\
         \\Restart=on-failure
+        \\KillMode=process
         \\
         \\[Install]
         \\WantedBy=default.target
@@ -310,6 +318,8 @@ fn writeSystemdArg(w: *Io.Writer, arg: []const u8) !void {
     try w.writeByte('"');
 }
 
+/// `AbandonProcessGroup` keeps launchd from killing txd's process group
+/// when txd exits. Session processes are in sessions of their own already.
 fn launchdPlist(gpa: Allocator, exe: []const u8, args: []const []const u8, log_path: []const u8) ![]u8 {
     var out: Io.Writer.Allocating = .init(gpa);
     errdefer out.deinit();
@@ -341,6 +351,8 @@ fn launchdPlist(gpa: Allocator, exe: []const u8, args: []const []const u8, log_p
         \\    </dict>
         \\    <key>ProcessType</key>
         \\    <string>Interactive</string>
+        \\    <key>AbandonProcessGroup</key>
+        \\    <true/>
         \\    <key>StandardErrorPath</key>
         \\
     );
@@ -409,6 +421,7 @@ test systemdUnit {
         \\[Service]
         \\ExecStart="/home/a b/bin/txd" "--key" "/k/100%%\"$$x"
         \\Restart=on-failure
+        \\KillMode=process
         \\
         \\[Install]
         \\WantedBy=default.target
@@ -442,6 +455,8 @@ test launchdPlist {
         \\    </dict>
         \\    <key>ProcessType</key>
         \\    <string>Interactive</string>
+        \\    <key>AbandonProcessGroup</key>
+        \\    <true/>
         \\    <key>StandardErrorPath</key>
         \\    <string>/Users/a/Library/Logs/txd.log</string>
         \\</dict>
