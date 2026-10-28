@@ -1347,6 +1347,162 @@ test "past retry_from, a client logs in after a Retry" {
     try testing.expect(@atomicLoad(u64, &st.server.pending.retries, .monotonic) >= 1);
 }
 
+test "a server that knocks answers only clients with its key" {
+    transport.crypto.init(testing.io);
+    var environ: std.process.Environ.Map = .init(gpa);
+    defer environ.deinit();
+    var login: Login = undefined;
+    try login.init(null);
+    defer login.deinit();
+    const key = transport.knock.generate();
+    var options = try login.serverOptions(&environ, &.{ "/bin/sh", "-c", "sleep 10" });
+    options.knock = key;
+    var st: ServerThread = undefined;
+    try st.init(options);
+    defer st.deinit();
+
+    // Without the key, or with another, nothing answers.
+    var pty: TestPty = try .open();
+    defer pty.close();
+    for ([_]?transport.knock.Key{ null, transport.knock.generate() }) |knock| {
+        var ct: ClientThread = .{ .options = login.clientOptions(&st, &pty, &.{login.key.public_key.toBytes()}) };
+        ct.options.command = .list;
+        ct.options.knock = knock;
+        ct.options.handshake_timeout_ns = std.time.ns_per_s;
+        try ct.start();
+        const outcome = try ct.join(&pty);
+        try testing.expectEqual(transport.endpoint.CloseReason.idle_timeout, outcome.no_connection);
+    }
+
+    // With it, the client logs in.
+    var ct: ClientThread = .{ .options = login.clientOptions(&st, &pty, &.{login.key.public_key.toBytes()}) };
+    ct.options.command = .list;
+    ct.options.knock = key;
+    try ct.start();
+    const listed = (try ct.join(&pty)).listed;
+    defer gpa.free(listed);
+    try testing.expectEqual(0, listed.len);
+}
+
+test "a client with the knock key logs in after a Retry" {
+    transport.crypto.init(testing.io);
+    var environ: std.process.Environ.Map = .init(gpa);
+    defer environ.deinit();
+    var login: Login = undefined;
+    try login.init(null);
+    defer login.deinit();
+    const key = transport.knock.generate();
+    var options = try login.serverOptions(&environ, &.{ "/bin/sh", "-c", "sleep 10" });
+    options.knock = key;
+    options.pending.retry_from = 0;
+    var st: ServerThread = undefined;
+    try st.init(options);
+    defer st.deinit();
+
+    // The Initial after the Retry has the same source ID, so the same
+    // nonce, from the same address.
+    var pty: TestPty = try .open();
+    defer pty.close();
+    var ct: ClientThread = .{ .options = login.clientOptions(&st, &pty, &.{login.key.public_key.toBytes()}) };
+    ct.options.command = .list;
+    ct.options.knock = key;
+    try ct.start();
+    const listed = (try ct.join(&pty)).listed;
+    defer gpa.free(listed);
+    try testing.expect(@atomicLoad(u64, &st.server.pending.retries, .monotonic) >= 1);
+}
+
+test "a server that knocks sends nothing to a copy of a first packet from another address" {
+    transport.crypto.init(testing.io);
+    var environ: std.process.Environ.Map = .init(gpa);
+    defer environ.deinit();
+    var login: Login = undefined;
+    try login.init(null);
+    defer login.deinit();
+    const key = transport.knock.generate();
+    var options = try login.serverOptions(&environ, &.{ "/bin/sh", "-c", "sleep 10" });
+    options.knock = key;
+    // The connection the first packet starts is gone a few seconds later:
+    // ngtcp2 waits at least three probe timeouts.
+    options.idle_timeout_ns = 500 * std.time.ns_per_ms;
+    var st: ServerThread = undefined;
+    try st.init(options);
+    defer st.deinit();
+    const server = Relay.loopback(st.addresses[0].getPort());
+
+    var marked_buf: [2048]u8 = undefined;
+    const marked = try firstDatagram(&key, &marked_buf);
+    var unmarked_buf: [2048]u8 = undefined;
+    const unmarked = try firstDatagram(null, &unmarked_buf);
+
+    const first = try Relay.open(0);
+    defer _ = c.close(first);
+    const other = try Relay.open(0);
+    defer _ = c.close(other);
+
+    // An unmarked packet gets nothing, and the marked one an answer.
+    try testing.expect(!answered(first, unmarked, server, 500));
+    try testing.expect(answered(first, marked, server, timeout_ms));
+
+    // Once the server has dropped that connection, the copy from another
+    // address gets nothing. From the first address, it is a retransmit,
+    // and gets an answer.
+    const deadline = nowMs() + timeout_ms;
+    while (@atomicLoad(u32, &st.server.pending.total, .monotonic) > 0) {
+        if (nowMs() > deadline) return error.Timeout;
+        try testing.io.sleep(.fromMilliseconds(20), .awake);
+    }
+    while (receive(first, 0) != null) {}
+    try testing.expect(!answered(other, marked, server, 500));
+    try testing.expect(answered(first, marked, server, timeout_ms));
+}
+
+/// The first datagram of a client, marked with `knock` if it is set,
+/// caught on a socket of the test's before it reaches any server.
+fn firstDatagram(knock: ?*const transport.knock.Key, buf: []u8) ![]u8 {
+    const catcher = try Relay.open(0);
+    defer _ = c.close(catcher);
+    var addr: c.sockaddr.in = undefined;
+    var len: c.socklen_t = @sizeOf(c.sockaddr.in);
+    if (c.getsockname(catcher, @ptrCast(&addr), &len) != 0) return error.SocketFailed;
+
+    var loop: xev.Loop = try .init(.{});
+    defer loop.deinit();
+    var tls: transport.quic.Client = try .init(.any);
+    defer tls.deinit();
+    var endpoint: transport.endpoint.Endpoint = undefined;
+    try endpoint.init(gpa, testing.io, &loop, .{
+        .local = try .parseIp4("127.0.0.1", 0),
+        .role = .{ .client = &tls },
+        .knock = knock,
+    });
+    defer endpoint.deinit();
+
+    // `connect` sends the first Initial before it returns.
+    _ = try endpoint.connect(try .parseIp4("127.0.0.1", std.mem.bigToNative(u16, addr.port)));
+    const n = c.recv(catcher, buf.ptr, buf.len, 0);
+    endpoint.stop();
+    try loop.run(.until_done);
+    if (n <= 0) return error.ReceiveFailed;
+    return buf[0..@intCast(n)];
+}
+
+/// Sends `packet` from `fd` to `to`, and waits up to `ms` for anything
+/// back.
+fn answered(fd: posix.fd_t, packet: []const u8, to: c.sockaddr.in, ms: i32) bool {
+    if (c.sendto(fd, packet.ptr, packet.len, 0, @ptrCast(&to), @sizeOf(c.sockaddr.in)) != packet.len) return false;
+    return receive(fd, ms) != null;
+}
+
+/// The length of a datagram that arrives on `fd` within `ms`.
+fn receive(fd: posix.fd_t, ms: i32) ?usize {
+    var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+    if (c.poll(&fds, 1, ms) != 1) return null;
+    var buf: [2048]u8 = undefined;
+    const n = c.recv(fd, &buf, buf.len, 0);
+    return if (n > 0) @intCast(n) else null;
+}
+
 // From `ssh-keygen -t ed25519`, with no passphrase and with "correct horse".
 // They are the test keys of auth/private_key.zig.
 const plain_key_file =

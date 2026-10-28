@@ -19,6 +19,11 @@
 //! ssh again when nothing answers on the server's port. On a host with no
 //! txd, tx copies one there first; see `remote.zig`.
 //!
+//! txd answers only clients that hold its knock key. Each ssh command
+//! reads it, and tx keeps it in `~/.config/tx/knocks` (see `knocks.zig`).
+//! A host with no key there, or one whose key changed, doesn't answer,
+//! and the install over ssh brings the key.
+//!
 //! The login uses the SSH agent's Ed25519 and RSA keys, then
 //! `~/.ssh/id_ed25519`.
 //!
@@ -32,8 +37,10 @@ const client = @import("client");
 const auth = @import("auth");
 const proto = @import("proto");
 const build_options = @import("build_options");
+const transport = @import("transport");
 const paths = @import("paths.zig");
 const remote = @import("remote.zig");
+const knocks = @import("knocks.zig");
 
 const default_port = remote.default_port;
 
@@ -135,6 +142,9 @@ pub fn main(init: std.process.Init) !u8 {
     const known_name = auth.known_hosts.hostName(&name_buf, host, port, default_port) catch return fail("host name too long", .{});
     const tx_known_hosts = try paths.config(gpa, environ, "known_hosts");
     defer gpa.free(tx_known_hosts);
+    const tx_knocks = try paths.config(gpa, environ, "knocks");
+    defer gpa.free(tx_knocks);
+    const ssh_knock: SshKnock = .{ .path = tx_knocks, .name = known_name, .host = host };
     const ssh: remote.Source = .{
         .ssh = ssh_path,
         .destination = ssh_destination,
@@ -143,15 +153,22 @@ pub fn main(init: std.process.Init) !u8 {
         .signal_mask = signal_mask,
         .environ = environ,
     };
-    const trusted = trustedKeys(gpa, io, environ, tx_known_hosts, known_name, addresses, ssh) catch |err| switch (err) {
+    const trusted = trustedKeys(gpa, io, environ, tx_known_hosts, known_name, addresses, ssh, ssh_knock) catch |err| switch (err) {
         error.Declined => return 255,
         else => return fail("checking the host key failed: {t}", .{err}),
     };
     defer gpa.free(trusted.keys);
 
-    const options: client.session.Options = .{
+    // The knock key read over ssh just now, or the one recorded.
+    const knock_key = trusted.knock orelse knocks.find(gpa, io, tx_knocks, known_name) catch |err| blk: {
+        std.debug.print("tx: can't read {s}: {t}\n", .{ tx_knocks, err });
+        break :blk null;
+    };
+
+    var options: client.session.Options = .{
         .servers = addresses,
         .host_keys = trusted.keys,
+        .knock = knock_key,
         .user = login_user,
         .agent = agent_path,
         .identities = identities.list.items,
@@ -166,11 +183,11 @@ pub fn main(init: std.process.Init) !u8 {
     var install = trusted.install;
     var outcome = client.session.run(gpa, io, options) catch |err| return fail("{t}", .{err});
 
-    // txd may have stopped, or never been set up on a host already
-    // in known_hosts.
+    // txd may have stopped, never been set up on a host already in
+    // known_hosts, or have a knock key tx doesn't have.
     if (outcome == .no_connection and install == .not_run) {
         std.debug.print("tx: nothing answers on {s} port {d}; starting txd over ssh\n", .{ host, port });
-        install = installOverSsh(gpa, io, ssh);
+        install = installOverSsh(gpa, io, ssh, ssh_knock, &options.knock);
         if (install == .done) outcome = client.session.run(gpa, io, options) catch |err| return fail("{t}", .{err});
     }
 
@@ -385,31 +402,65 @@ fn keyFilePublicKey(gpa: Allocator, io: Io, path: []const u8) !auth.ssh.PublicKe
 /// Whether tx ran `txd --install` over ssh, and how it went.
 const Install = enum { not_run, failed, done };
 
-/// Starts txd on the host, and sets up its service.
-fn installOverSsh(gpa: Allocator, io: Io, source: remote.Source) Install {
-    const result = remote.runTxd(gpa, io, source, &.{"--install"}) catch |err| {
+/// Where a knock key read over ssh is recorded.
+const SshKnock = struct {
+    /// The knocks file.
+    path: []const u8,
+    /// The host's name in it.
+    name: []const u8,
+    /// The host, as the user wrote it.
+    host: []const u8,
+
+    /// Records the key txd printed, if it printed one, and returns it.
+    /// Warns of a clock off by most of `transport.knock.window_minutes`.
+    fn take(k: SshKnock, gpa: Allocator, io: Io, output: []const u8) ?transport.knock.Key {
+        const printed = knocks.parsePrinted(output) orelse return null;
+        knocks.store(gpa, io, k.path, k.name, printed.key) catch |err| {
+            std.debug.print("tx: can't record {s}'s knock key in {s}: {t}\n", .{ k.host, k.path, err });
+        };
+
+        const off_s = Io.Clock.real.now(io).toSeconds() - printed.time;
+        if (@abs(off_s) > (transport.knock.window_minutes - 1) * 60) {
+            std.debug.print("tx: the clocks here and on {s} are {d} minutes apart. txd drops connections from a clock more than {d} minutes off.\n", .{ k.host, @divTrunc(@abs(off_s), 60), transport.knock.window_minutes });
+        }
+        return printed.key;
+    }
+};
+
+/// Starts txd on the host, and sets up its service. Sets `knock` to the
+/// knock key txd printed.
+fn installOverSsh(gpa: Allocator, io: Io, source: remote.Source, ssh_knock: SshKnock, knock: *?transport.knock.Key) Install {
+    const result = remote.runTxd(gpa, io, source, &.{ "--print-knock", "--install" }) catch |err| {
         if (err != error.NoTxd) std.debug.print("tx: can't run txd over ssh: {t}\n", .{err});
         return .failed;
     };
-    gpa.free(result.stdout);
+    defer gpa.free(result.stdout);
+    if (ssh_knock.take(gpa, io, result.stdout)) |key| knock.* = key;
     return if (result.ok) .done else .failed;
 }
 
-/// Reads txd's host key from the remote account over ssh, and
-/// installs txd there. ssh's own host key check vouches for the
+/// What txd printed over ssh on first contact.
+const SshKeys = struct {
+    host_key: auth.Key,
+    knock: ?transport.knock.Key,
+};
+
+/// Reads txd's host key and knock key from the remote account over ssh,
+/// and installs txd there. ssh's own host key check vouches for the
 /// connection, so the key needs no prompt.
-fn hostKeyOverSsh(gpa: Allocator, io: Io, source: remote.Source, install: *Install) !auth.Key {
+fn hostKeyOverSsh(gpa: Allocator, io: Io, source: remote.Source, ssh_knock: SshKnock, install: *Install) !SshKeys {
     install.* = .failed;
-    const result = try remote.runTxd(gpa, io, source, &.{ "--print-host-key", "--install" });
+    const result = try remote.runTxd(gpa, io, source, &.{ "--print-host-key", "--print-knock", "--install" });
     defer gpa.free(result.stdout);
     install.* = if (result.ok) .done else .failed;
+    const knock = ssh_knock.take(gpa, io, result.stdout);
 
     // `ssh-ed25519 AAAA...`. txd prints it before it installs, so
     // it arrives even when the install fails.
     var fields = std.mem.tokenizeAny(u8, result.stdout, " \t\r\n");
     const key_type = fields.next() orelse return error.NoKeyPrinted;
     const text = fields.next() orelse return error.NoKeyPrinted;
-    return auth.ssh.parseKeyText(key_type, text);
+    return .{ .host_key = try auth.ssh.parseKeyText(key_type, text), .knock = knock };
 }
 
 const Trusted = struct {
@@ -417,6 +468,8 @@ const Trusted = struct {
     keys: []auth.Key,
     /// Reading the key over ssh runs the install too.
     install: Install = .not_run,
+    /// The knock key, when the host key was read over ssh.
+    knock: ?transport.knock.Key = null,
 };
 
 /// When no file lists a key for the host, reads the host's key over ssh,
@@ -430,6 +483,7 @@ fn trustedKeys(
     name: []const u8,
     addresses: []const IpAddress,
     ssh: remote.Source,
+    ssh_knock: SshKnock,
 ) !Trusted {
     var known: auth.known_hosts.Known = .{};
     defer known.deinit(gpa);
@@ -445,7 +499,8 @@ fn trustedKeys(
 
     // First contact, over ssh if it can log in.
     var install: Install = .not_run;
-    if (hostKeyOverSsh(gpa, io, ssh, &install)) |key| {
+    if (hostKeyOverSsh(gpa, io, ssh, ssh_knock, &install)) |read| {
+        const key = read.host_key;
         if (known.isRevoked(key)) {
             std.debug.print("tx: {s} has a revoked key, {s}\n", .{ name, auth.Fingerprint.init(key).slice() });
             return error.Declined;
@@ -455,7 +510,7 @@ fn trustedKeys(
 
         const keys = try gpa.alloc(auth.Key, 1);
         keys[0] = key;
-        return .{ .keys = keys, .install = install };
+        return .{ .keys = keys, .install = install, .knock = read.knock };
     } else |err| {
         std.debug.print("tx: can't read the host key over ssh: {t}\n", .{err});
     }
@@ -536,4 +591,5 @@ test {
     // linked C code needs.
     _ = &main;
     _ = remote;
+    _ = knocks;
 }

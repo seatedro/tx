@@ -54,6 +54,9 @@ pub const Options = struct {
     servers: []const IpAddress,
     /// The server keys the client accepts.
     host_keys: []const [32]u8,
+    /// The server's knock key, if it has one. Each connection, the first
+    /// and each reconnect, is marked with it. See `transport.knock`.
+    knock: ?transport.knock.Key = null,
     /// The account to log in as.
     user: []const u8,
     /// The keys to log in with, probed in order. At least one.
@@ -391,6 +394,7 @@ const Run = struct {
             .keep_alive_ns = r.options.keep_alive_ns,
             .stream_window = stream_window,
             .connection_window = stream_window,
+            .knock = if (r.options.knock) |*key| key else null,
             .handler = .{
                 .ctx = r,
                 .connected = onConnected,
