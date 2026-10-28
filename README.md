@@ -20,6 +20,15 @@ tx is early and changes often. Don't rely on it yet.
 tx logs in with the same keys as ssh: the SSH agent's Ed25519 and RSA keys,
 then `~/.ssh/id_ed25519`. txd accepts the keys in `~/.ssh/authorized_keys`.
 
+## Server
+
+tx copies txd to a host that has none, and sets it up as a user service:
+systemd on Linux, launchd on macOS, or a background process elsewhere.
+Each session runs in a process of its own, so a restart or upgrade of txd
+leaves sessions running, and attached clients reconnect to the new txd.
+A txd older than 88d63d9 runs sessions inside itself, and its sessions
+end when it is replaced.
+
 ## Build
 
 Needs Zig 0.17.0, or `nix develop`.
