@@ -6,6 +6,9 @@ pub const primary = @import("primary.zig");
 pub const rebuild = @import("rebuild.zig");
 pub const state = @import("state.zig");
 
+/// libghostty-vt, for the types of the terminal's state.
+pub const vt = @import("ghostty-vt");
+
 pub const Log = log.Log;
 pub const Record = log.Record;
 pub const Primary = primary.Primary;

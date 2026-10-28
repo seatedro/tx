@@ -220,6 +220,10 @@ pub const Session = struct {
             term.log.Resize{ .cols = 80, .rows = 24 };
         const remote = c.remote[0..@min(c.remote.len, s.remote_buf.len)];
 
+        // The colors this client's terminal answers with, for the primary
+        // to answer with while it's gone.
+        if (first == .attach) s.host.setColors(first.attach);
+
         const start: Start, const how: How = switch (first) {
             .attach => if (s.fresh) .{ .new, .attached } else .{ .{ .rebuild = .attach }, .attached },
             .@"resume" => |m| start: {
