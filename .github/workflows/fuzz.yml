@@ -1,0 +1,56 @@
+name: Fuzz
+
+# `zig build fuzz --fuzz` for half an hour each night. The fuzzer's corpus
+# and coverage carry over from one run to the next in the cache.
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The Zig version is build.zig.zon's minimum_zig_version. Its cache
+      # would hold the fuzzer's files too, which the steps below keep.
+      - uses: mlugg/setup-zig@v2
+        with:
+          use-cache: false
+
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            .zig-cache/f
+            .zig-cache/v
+          key: fuzz-${{ github.run_id }}
+          restore-keys: fuzz-
+
+      # The fuzzer runs until stopped, and exits 0 even when a test fails.
+      # It saves the failing input as .zig-cache/f/crash, and the log names
+      # the test.
+      - name: Fuzz
+        run: |
+          rm -f .zig-cache/f/crash
+          timeout 30m zig build fuzz --fuzz > fuzz.log 2>&1 || test $? -eq 124
+          tail -n 40 fuzz.log
+          if [ -e .zig-cache/f/crash ]; then
+            echo "::error::a fuzz test failed; see fuzz.log in the fuzz-crash artifact"
+            exit 1
+          fi
+
+      - if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .zig-cache/f
+            .zig-cache/v
+          key: fuzz-${{ github.run_id }}
+
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash
+          path: |
+            fuzz.log
+            .zig-cache/f/crash
