@@ -22,6 +22,13 @@ tx takes ssh's options, read as ssh reads them, so tools that run ssh can
 run tx: `GIT_SSH_COMMAND=tx git clone ssh://host/repo`, `rsync -e tx`. `-p`
 is txd's port. Options for features tx lacks, such as `-L`, are refused.
 
+Linked as `ssh` in a directory ahead of ssh in `PATH`, tx takes ssh's
+place: `-p` is then sshd's port, the ssh that tx runs for installs gets the
+same options, and the real ssh runs instead for what tx can't do, such as
+`-L`, or a host without txd.
+
+    ln -s "$(command -v tx)" ~/.local/bin/ssh
+
 `~.` detaches. A new session gets the client's `TERM`, `COLORTERM`, `LANG`
 and `LC_*`.
 
