@@ -18,6 +18,10 @@ tx is early and changes often. Don't rely on it yet.
     tx HOST COMMAND...      # run COMMAND, as ssh does
     tx -t HOST COMMAND...   # run COMMAND on a terminal, as a session
 
+tx takes ssh's options, read as ssh reads them, so tools that run ssh can
+run tx: `GIT_SSH_COMMAND=tx git clone ssh://host/repo`, `rsync -e tx`. `-p`
+is txd's port. Options for features tx lacks, such as `-L`, are refused.
+
 `~.` detaches. A new session gets the client's `TERM`, `COLORTERM`, `LANG`
 and `LC_*`.
 

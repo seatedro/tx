@@ -1,10 +1,12 @@
 //! tx: a session on a txd server.
 //!
-//! Usage: tx [-p PORT] [-l USER] [--attach ID | --new | --list | --kill ID]
-//!           [-t | -T] [--yes] [--server COMMAND] [--ssh PATH] [USER@]HOST
-//!           [COMMAND...]
-//!        tx [-p PORT] [-l USER] [--yes] [--ssh PATH] --uninstall [USER@]HOST
+//! Usage: tx [SSH OPTIONS] [--attach ID | --new | --list | --kill ID]
+//!           [--yes] [--server COMMAND] [--ssh PATH] DESTINATION [COMMAND...]
+//!        tx [SSH OPTIONS] [--yes] [--ssh PATH] --uninstall DESTINATION
 //!        tx --version
+//!
+//! tx takes ssh's options, as ssh reads them, so that tools that run ssh
+//! can run tx (see `args.zig`). `-p` is txd's port.
 //!
 //! With none of `--attach`, `--new`, `--list` and `--kill`, tx attaches to
 //! the host's detached session if it has exactly one, and starts a session
@@ -61,21 +63,27 @@ const transport = @import("transport");
 const paths = @import("paths.zig");
 const remote = @import("remote.zig");
 const spa_keys = @import("spa_keys.zig");
+const args_pkg = @import("args.zig");
 
 const default_port = remote.default_port;
 
 const usage_text =
-    \\usage: tx [-p PORT] [-l USER] [--attach ID | --new | --list | --kill ID] [-t | -T] [--yes] [--server COMMAND] [--ssh PATH] [USER@]HOST [COMMAND...]
-    \\       tx [-p PORT] [-l USER] [--yes] [--ssh PATH] --uninstall [USER@]HOST
+    \\usage: tx [SSH OPTIONS] [--attach ID | --new | --list | --kill ID] [--yes]
+    \\          [--server COMMAND] [--ssh PATH] DESTINATION [COMMAND...]
+    \\       tx [SSH OPTIONS] [--yes] [--ssh PATH] --uninstall DESTINATION
     \\       tx --version
+    \\
+    \\The ssh options that take effect: -p PORT (txd's), -l USER, -t, -T, -4, -6,
+    \\-i KEY_FILE, -e CHAR, -n, -G, -V and -o with Port, User, IdentityFile and
+    \\RequestTTY. DESTINATION is [USER@]HOST or ssh://[USER@]HOST[:PORT].
 ;
 
 /// How long tx waits for an answer from the server's port before it
 /// starts txd over ssh, and after.
 const no_answer_timeout_ns = 5 * std.time.ns_per_s;
 
-/// Key files tried after the agent's keys, under HOME.
-const default_key_files = [_][]const u8{".ssh/id_ed25519"};
+/// Key files tried after the agent's keys, without `-i`.
+const default_key_files = [_][]const u8{"~/.ssh/id_ed25519"};
 
 pub fn main(init: std.process.Init) !u8 {
     // First, so every thread inherits the mask: name lookups can start
@@ -86,100 +94,48 @@ pub fn main(init: std.process.Init) !u8 {
     const gpa = init.gpa;
     const io = init.io;
     const environ = init.environ_map;
-    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    const arena = init.arena.allocator();
+    const argv = try init.minimal.args.toSlice(arena);
 
-    // Options, then one destination.
-    var port: u16 = default_port;
-    var user: ?[]const u8 = null;
-    var session_id: ?u64 = null;
+    const args = switch (try args_pkg.parse(arena, argv[1..])) {
+        .ok => |a| a,
+        .usage => |problem| return usage(problem),
+        .unsupported => |option| return fail("{s} isn't supported", .{option}),
+    };
+    if (args.version) {
+        Io.File.stdout().writeStreamingAll(io, "tx " ++ build_options.version ++ "\n") catch return 255;
+        return 0;
+    }
+    for (args.ignored) |letter| std.debug.print("tx: ignoring -{c}, which tx doesn't support yet\n", .{letter});
+
+    const host = args.host;
+    const user = args.user;
+    const port = args.port orelse default_port;
+    if (args.print_config) return printConfig(io, environ, args);
+
+    // What to do once logged in. A command runs in a session of its own
+    // with a terminal.
     var command: client.session.Command = .attach;
-    var new = false;
-    var uninstall = false;
-    // `--attach`, `--new`, `--list`, `--kill` and `--uninstall` exclude
-    // each other.
-    var modes: usize = 0;
-    // `--yes`: no questions before installing or uninstalling.
-    var yes = false;
-    // `-t`: a command on a terminal.
-    var tty = false;
-    var server_command: ?[]const u8 = null;
-    var ssh_path: []const u8 = "ssh";
-    var destination: ?[]const u8 = null;
-    // The words after the destination.
-    var command_words: []const []const u8 = &.{};
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
-        if (destination != null) {
-            command_words = args[i..];
-            break;
-        }
-        if (std.mem.eql(u8, arg, "-p") and i + 1 < args.len) {
-            i += 1;
-            port = std.fmt.parseInt(u16, args[i], 10) catch return usage("invalid port");
-        } else if (std.mem.eql(u8, arg, "-l") and i + 1 < args.len) {
-            i += 1;
-            user = args[i];
-        } else if (std.mem.eql(u8, arg, "--attach") and i + 1 < args.len) {
-            i += 1;
-            session_id = std.fmt.parseInt(u64, args[i], 10) catch return usage("invalid session id");
-            modes += 1;
-        } else if (std.mem.eql(u8, arg, "--new")) {
-            new = true;
-            modes += 1;
-        } else if (std.mem.eql(u8, arg, "--list")) {
-            command = .list;
-            modes += 1;
-        } else if (std.mem.eql(u8, arg, "--kill") and i + 1 < args.len) {
-            i += 1;
-            command = .{ .kill = std.fmt.parseInt(u64, args[i], 10) catch return usage("invalid session id") };
-            modes += 1;
-        } else if (std.mem.eql(u8, arg, "--uninstall")) {
-            uninstall = true;
-            modes += 1;
-        } else if (std.mem.eql(u8, arg, "--yes")) {
-            yes = true;
-        } else if (std.mem.eql(u8, arg, "-t")) {
-            tty = true;
-        } else if (std.mem.eql(u8, arg, "-T")) {
-            tty = false;
-        } else if (std.mem.eql(u8, arg, "--server") and i + 1 < args.len) {
-            i += 1;
-            server_command = args[i];
-        } else if (std.mem.eql(u8, arg, "--version")) {
-            Io.File.stdout().writeStreamingAll(io, "tx " ++ build_options.version ++ "\n") catch return 255;
-            return 0;
-        } else if (std.mem.eql(u8, arg, "--ssh") and i + 1 < args.len) {
-            i += 1;
-            ssh_path = args[i];
-        } else if (destination == null and !std.mem.startsWith(u8, arg, "-")) {
-            destination = arg;
-        } else return usage("unknown argument");
-    }
-
-    // A command, in a session of its own with `-t`.
+    var session_id: ?u64 = null;
     var session_command: ?[]const u8 = null;
-    if (command_words.len > 0) {
-        const joined = try std.mem.join(init.arena.allocator(), " ", command_words);
-        if (tty) session_command = joined else command = .{ .exec = joined };
-        modes += 1;
+    switch (args.mode) {
+        .auto => if (args.command) |words| {
+            if (args.tty == true) session_command = words else command = .{ .exec = words };
+        },
+        .attach => |id| session_id = id,
+        .new, .uninstall => {},
+        .list => command = .list,
+        .kill => |id| command = .{ .kill = id },
     }
-    if (modes > 1) return usage("a command, --attach, --new, --list, --kill and --uninstall don't go together");
-
-    // `user@host`. A `-l` user wins, as in ssh.
-    var host = destination orelse return usage("no host");
-    if (std.mem.lastIndexOfScalar(u8, host, '@')) |at| {
-        if (user == null) user = host[0..at];
-        host = host[at + 1 ..];
-    }
+    const yes = args.yes;
 
     // ssh logs in to the same account, unless its config says otherwise.
     var ssh_buf: [512]u8 = undefined;
     const ssh_destination = if (user) |u| std.fmt.bufPrint(&ssh_buf, "{s}@{s}", .{ u, host }) catch host else host;
     const ssh: remote.Source = .{
-        .ssh = ssh_path,
+        .ssh = args.ssh_path,
         .destination = ssh_destination,
-        .server_command = server_command,
+        .server_command = args.server_command,
         .port = port,
         .signal_mask = signal_mask,
         .environ = environ,
@@ -194,7 +150,7 @@ pub fn main(init: std.process.Init) !u8 {
     const tx_spa_keys = try paths.config(gpa, environ, "spa_keys");
     defer gpa.free(tx_spa_keys);
 
-    if (uninstall) {
+    if (args.mode == .uninstall) {
         // Ending the sessions loses what runs in them.
         if (!yes) {
             var buf: [1024]u8 = undefined;
@@ -212,12 +168,13 @@ pub fn main(init: std.process.Init) !u8 {
     if (login_user.len == 0 or login_user.len > auth.login.max_user_len) return fail("invalid user name", .{});
 
     var address_buf: [max_addresses]IpAddress = undefined;
-    const addresses = resolve(io, host, port, &address_buf) catch |err| return fail("can't resolve {s}: {t}", .{ host, err });
+    const addresses = resolve(io, host, port, args.family, &address_buf) catch |err| return fail("can't resolve {s}: {t}", .{ host, err });
 
     // The keys, before the network: without one there's no login.
     // An empty `SSH_AUTH_SOCK` means no agent, as in ssh.
     const agent_path = if (environ.get("SSH_AUTH_SOCK")) |path| if (path.len > 0) path else null else null;
-    var identities = try findIdentities(gpa, io, environ, agent_path);
+    const key_files = if (args.key_files.len > 0) args.key_files else &default_key_files;
+    var identities = try findIdentities(gpa, io, environ, agent_path, key_files);
     defer identities.deinit(gpa);
     if (identities.list.items.len == 0) return fail("no keys to log in with: the SSH agent has no Ed25519 or RSA keys, and there is no ~/.ssh/id_ed25519", .{});
 
@@ -245,11 +202,13 @@ pub fn main(init: std.process.Init) !u8 {
         .command = command,
         .session_id = session_id,
         .session_command = session_command,
-        .reuse_detached = session_id == null and !new and session_command == null,
+        .reuse_detached = args.mode == .auto and args.command == null,
         .show_session_id = session_command == null,
         .term = environ.get("TERM") orelse "xterm-256color",
         .colorterm = environ.get("COLORTERM"),
-        .locale = try localeVariables(init.arena.allocator(), environ),
+        .locale = try localeVariables(arena, environ),
+        .escape_char = args.escape_char,
+        .in_fd = if (args.no_stdin) try openNull() else std.posix.STDIN_FILENO,
         .handshake_timeout_ns = no_answer_timeout_ns,
     };
     var install = trusted.install;
@@ -273,7 +232,7 @@ pub fn main(init: std.process.Init) !u8 {
             const port_arg = if (port == default_port) "" else std.fmt.bufPrint(&port_buf, "-p {d} ", .{port}) catch unreachable;
             // Before the attach, there's no session to come back to.
             const n = id orelse return fail("interrupted before the session started", .{});
-            std.debug.print("tx: detached from session {d}; reattach with tx {s}--attach {d} {s}\n", .{ n, port_arg, n, destination.? });
+            std.debug.print("tx: detached from session {d}; reattach with tx {s}--attach {d} {s}\n", .{ n, port_arg, n, ssh_destination });
             return 0;
         },
         .no_connection => |reason| {
@@ -388,8 +347,10 @@ const max_addresses = 8;
 
 /// The addresses `host` resolves to, in the order to try them: the
 /// resolver's order, with the two families alternating.
-fn resolve(io: Io, host: []const u8, port: u16, out: *[max_addresses]IpAddress) ![]IpAddress {
+/// With `family`, the addresses of the other are left out.
+fn resolve(io: Io, host: []const u8, port: u16, family: ?args_pkg.Family, out: *[max_addresses]IpAddress) ![]IpAddress {
     if (IpAddress.parse(host, port)) |address| {
+        if (!inFamily(address, family)) return error.UnknownHostName;
         out[0] = address;
         return out[0..1];
     } else |_| {}
@@ -405,6 +366,7 @@ fn resolve(io: Io, host: []const u8, port: u16, out: *[max_addresses]IpAddress) 
     var n: usize = 0;
     while (results.getOne(io)) |result| switch (result) {
         .address => |address| {
+            if (!inFamily(address, family)) continue;
             for (found[0..n]) |f| {
                 if (std.meta.eql(f, address)) break;
             } else if (n < found.len) {
@@ -438,9 +400,16 @@ const Identities = struct {
     }
 };
 
-/// The agent's Ed25519 keys in its order, then the default key files that
-/// hold other keys. A key file's public key reads without its passphrase.
-fn findIdentities(gpa: Allocator, io: Io, environ: *const std.process.Environ.Map, agent_path: ?[]const u8) !Identities {
+fn inFamily(address: IpAddress, family: ?args_pkg.Family) bool {
+    return switch (family orelse return true) {
+        .ip4 => address == .ip4,
+        .ip6 => address == .ip6,
+    };
+}
+
+/// The agent's Ed25519 keys in its order, then the key files that hold
+/// other keys. A key file's public key reads without its passphrase.
+fn findIdentities(gpa: Allocator, io: Io, environ: *const std.process.Environ.Map, agent_path: ?[]const u8, key_files: []const []const u8) !Identities {
     var ids: Identities = .{};
     errdefer ids.deinit(gpa);
 
@@ -463,8 +432,8 @@ fn findIdentities(gpa: Allocator, io: Io, environ: *const std.process.Environ.Ma
         }
     }
 
-    for (default_key_files) |sub_path| {
-        const path = paths.home(gpa, environ, sub_path) catch continue;
+    for (key_files) |file| {
+        const path = keyFilePath(gpa, environ, file) catch continue;
         const key = keyFilePublicKey(gpa, io, path) catch |err| {
             if (err != error.FileNotFound) std.debug.print("tx: skipping {s}: {t}\n", .{ path, err });
             gpa.free(path);
@@ -489,6 +458,33 @@ fn findIdentities(gpa: Allocator, io: Io, environ: *const std.process.Environ.Ma
         ids.list.appendAssumeCapacity(.{ .key = key, .source = .{ .file = path } });
     }
     return ids;
+}
+
+/// `~/` is the home directory, as ssh reads it in `-i` and `IdentityFile`.
+fn keyFilePath(gpa: Allocator, environ: *const std.process.Environ.Map, file: []const u8) ![]u8 {
+    if (std.mem.startsWith(u8, file, "~/")) return paths.home(gpa, environ, file[2..]);
+    return gpa.dupe(u8, file);
+}
+
+/// `-G`: the configuration, as OpenSSH prints it. git runs `-G` to tell
+/// OpenSSH from other ssh programs, and passes a port only to OpenSSH.
+fn printConfig(io: Io, environ: *const std.process.Environ.Map, args: args_pkg.Args) u8 {
+    var buf: [1024]u8 = undefined;
+    var w = Io.File.stdout().writerStreaming(io, &buf);
+    w.interface.print("user {s}\nhostname {s}\nport {d}\n", .{
+        args.user orelse paths.userName(environ) orelse "",
+        args.host,
+        args.port orelse default_port,
+    }) catch return 255;
+    w.interface.flush() catch return 255;
+    return 0;
+}
+
+/// `-n`: stdin from /dev/null.
+fn openNull() !std.posix.fd_t {
+    const fd = std.c.open("/dev/null", .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+    if (fd == -1) return error.CantOpenDevNull;
+    return fd;
 }
 
 fn keyFilePublicKey(gpa: Allocator, io: Io, path: []const u8) !auth.ssh.PublicKey {
@@ -730,6 +726,8 @@ test {
     // Analyzes `main`, and through it the crypto module, whose exports the
     // linked C code needs.
     _ = &main;
+    _ = args_pkg;
+    _ = @import("getopt.zig");
     _ = remote;
     _ = spa_keys;
 }

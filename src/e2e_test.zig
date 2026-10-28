@@ -840,6 +840,8 @@ const Tools = struct {
     tmp: testing.TmpDir,
     dir: []u8,
     environ: std.process.Environ.Map,
+    /// The server's.
+    port: u16 = 0,
 
     fn init(t: *Tools, es: *ExecServer) !void {
         var arena: std.heap.ArenaAllocator = .init(gpa);
@@ -866,12 +868,12 @@ const Tools = struct {
         try t.environ.put("GIT_CONFIG_NOSYSTEM", "1");
         for ([_][]const u8{ "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL" }) |name| try t.environ.put(name, "tx");
 
-        // git's simple ssh variant takes no port, so it goes in the
-        // command.
-        var ssh_buf: [std.fs.max_path_bytes + 64]u8 = undefined;
-        const ssh = try std.fmt.bufPrint(&ssh_buf, "{s} -p {d} -l " ++ test_user, .{ tx_exe, port });
-        try t.environ.put("GIT_SSH_COMMAND", ssh);
-        try t.environ.put("RSYNC_RSH", ssh);
+        // git finds the port and user in the URL, and passes them to tx
+        // once `tx -G` has passed for OpenSSH. rsync is given them.
+        try t.environ.put("GIT_SSH_COMMAND", tx_exe);
+        var rsh_buf: [std.fs.max_path_bytes + 64]u8 = undefined;
+        try t.environ.put("RSYNC_RSH", try std.fmt.bufPrint(&rsh_buf, "{s} -p {d} -l " ++ test_user, .{ tx_exe, port }));
+        t.port = port;
     }
 
     fn deinit(t: *Tools) void {
@@ -920,7 +922,7 @@ test "git clones and pushes with tx as its ssh" {
     try t.run(&.{ "git", "clone", "-q", "--bare", "work", "served.git" });
 
     var url_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "127.0.0.1:{s}/served.git", .{t.dir});
+    const url = try std.fmt.bufPrint(&url_buf, "ssh://" ++ test_user ++ "@127.0.0.1:{d}{s}/served.git", .{ t.port, t.dir });
     try t.run(&.{ "git", "clone", "-q", url, "clone" });
 
     // A push carries a pack on stdin.
