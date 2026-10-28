@@ -150,7 +150,8 @@ pub fn build(b: *std.Build) void {
     const dev_builds_module = b.createModule(.{ .root_source_file = dev_builds.addOutputFileArg("txd_builds.zig") });
 
     const tx = txModule(b, target, optimize, app, dev_info, dev_builds_module);
-    b.installArtifact(b.addExecutable(.{ .name = "tx", .root_module = tx }));
+    const tx_bin = b.addExecutable(.{ .name = "tx", .root_module = tx });
+    b.installArtifact(tx_bin);
     addTestRuns(b, b.addTest(.{ .name = "cli-test", .root_module = tx }), test_step, test_network_step);
 
     const txd = txdModule(b, target, optimize, app, dev_info);
@@ -177,6 +178,7 @@ pub fn build(b: *std.Build) void {
     e2e.addImport("fuzz", fuzz);
     const e2e_options = b.addOptions();
     e2e_options.addOptionPath("txd_exe", txd_bin.getEmittedBin());
+    e2e_options.addOptionPath("tx_exe", tx_bin.getEmittedBin());
     e2e.addImport("build_options", e2e_options.createModule());
     addTestRuns(b, b.addTest(.{ .name = "e2e-test", .root_module = e2e }), test_step, test_network_step);
 

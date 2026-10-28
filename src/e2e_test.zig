@@ -834,6 +834,135 @@ test "a command with a terminal runs as a new session, and its status returns" {
     try testing.expect(std.mem.indexOf(u8, pty.output.items, "on-a-terminal") != null);
 }
 
+/// The environment for git and rsync to run tx as their ssh, from a
+/// directory with a tx config that lists the server's key.
+const Tools = struct {
+    tmp: testing.TmpDir,
+    dir: []u8,
+    environ: std.process.Environ.Map,
+
+    fn init(t: *Tools, es: *ExecServer) !void {
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        defer arena.deinit();
+        t.tmp = testing.tmpDir(.{});
+        errdefer t.tmp.cleanup();
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        t.dir = try gpa.dupe(u8, buf[0..try t.tmp.dir.realPath(testing.io, &buf)]);
+        errdefer gpa.free(t.dir);
+
+        const port = es.st.addresses[0].getPort();
+        var line_buf: [256]u8 = undefined;
+        const line = try std.fmt.bufPrint(&line_buf, "[127.0.0.1]:{d} ssh-ed25519 {s}\n", .{ port, auth.ssh.KeyText.init(es.st.host_keys[0]).slice() });
+        try t.tmp.dir.createDirPath(testing.io, "config/tx");
+        try t.tmp.dir.writeFile(testing.io, .{ .sub_path = "config/tx/known_hosts", .data = line });
+
+        const tx_exe = try std.fs.path.resolve(arena.allocator(), &.{ try std.process.currentPathAlloc(testing.io, arena.allocator()), build_options.tx_exe });
+        t.environ = .init(gpa);
+        errdefer t.environ.deinit();
+        try t.environ.put("PATH", testing.environ.getPosix("PATH") orelse "/usr/bin:/bin");
+        try t.environ.put("HOME", t.dir);
+        try t.environ.put("XDG_CONFIG_HOME", try std.fs.path.join(arena.allocator(), &.{ t.dir, "config" }));
+        try t.environ.put("SSH_AUTH_SOCK", es.login.agent_path);
+        try t.environ.put("GIT_CONFIG_NOSYSTEM", "1");
+        for ([_][]const u8{ "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL" }) |name| try t.environ.put(name, "tx");
+
+        // git's simple ssh variant takes no port, so it goes in the
+        // command.
+        var ssh_buf: [std.fs.max_path_bytes + 64]u8 = undefined;
+        const ssh = try std.fmt.bufPrint(&ssh_buf, "{s} -p {d} -l " ++ test_user, .{ tx_exe, port });
+        try t.environ.put("GIT_SSH_COMMAND", ssh);
+        try t.environ.put("RSYNC_RSH", ssh);
+    }
+
+    fn deinit(t: *Tools) void {
+        t.environ.deinit();
+        gpa.free(t.dir);
+        t.tmp.cleanup();
+    }
+
+    /// Runs `argv` in the directory, and fails with the tool's stderr if
+    /// it does. A tool that isn't installed skips the test.
+    fn run(t: *Tools, argv: []const []const u8) !void {
+        const result = std.process.run(gpa, testing.io, .{
+            .argv = argv,
+            .cwd = .{ .path = t.dir },
+            .environ_map = &t.environ,
+            .stdout_limit = .limited(1 << 20),
+            .stderr_limit = .limited(1 << 20),
+        }) catch |err| switch (err) {
+            error.FileNotFound => return error.SkipZigTest,
+            else => return err,
+        };
+        defer gpa.free(result.stdout);
+        defer gpa.free(result.stderr);
+        if (!result.term.success()) {
+            std.debug.print("{s} failed: {s}\n", .{ argv[0], result.stderr });
+            return error.ToolFailed;
+        }
+    }
+
+    fn path(t: *Tools, buf: []u8, sub_path: []const u8) ![]const u8 {
+        return std.fmt.bufPrint(buf, "{s}/{s}", .{ t.dir, sub_path });
+    }
+};
+
+test "git clones and pushes with tx as its ssh" {
+    var es: ExecServer = undefined;
+    try es.init();
+    defer es.deinit();
+    var t: Tools = undefined;
+    try t.init(&es);
+    defer t.deinit();
+
+    // A repository with a commit, served bare.
+    try t.run(&.{ "git", "init", "-q", "work" });
+    try t.run(&.{ "git", "-C", "work", "commit", "-q", "--allow-empty", "-m", "first" });
+    try t.run(&.{ "git", "clone", "-q", "--bare", "work", "served.git" });
+
+    var url_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "127.0.0.1:{s}/served.git", .{t.dir});
+    try t.run(&.{ "git", "clone", "-q", url, "clone" });
+
+    // A push carries a pack on stdin.
+    const big = try gpa.alloc(u8, 2 << 20);
+    defer gpa.free(big);
+    for (big, 0..) |*b, i| b.* = @truncate(i *% 2654435761 >> 13);
+    try t.tmp.dir.writeFile(testing.io, .{ .sub_path = "clone/data", .data = big });
+    try t.run(&.{ "git", "-C", "clone", "add", "data" });
+    try t.run(&.{ "git", "-C", "clone", "commit", "-q", "-m", "second" });
+    try t.run(&.{ "git", "-C", "clone", "push", "-q", "origin", "HEAD" });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    try t.run(&.{ "git", "--git-dir", try t.path(&path_buf, "served.git"), "cat-file", "-e", "HEAD:data" });
+}
+
+test "rsync copies a directory with tx as its shell" {
+    var es: ExecServer = undefined;
+    try es.init();
+    defer es.deinit();
+    var t: Tools = undefined;
+    try t.init(&es);
+    defer t.deinit();
+
+    const big = try gpa.alloc(u8, 3 << 20);
+    defer gpa.free(big);
+    for (big, 0..) |*b, i| b.* = @truncate(i *% 2654435761 >> 11);
+    try t.tmp.dir.createDirPath(testing.io, "from/sub");
+    try t.tmp.dir.writeFile(testing.io, .{ .sub_path = "from/big", .data = big });
+    try t.tmp.dir.writeFile(testing.io, .{ .sub_path = "from/sub/small", .data = "small\n" });
+
+    var from_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const from = try std.fmt.bufPrint(&from_buf, "127.0.0.1:{s}/from/", .{t.dir});
+    try t.run(&.{ "rsync", "-a", from, "to/" });
+
+    const copied = try t.tmp.dir.readFileAlloc(testing.io, "to/big", gpa, .unlimited);
+    defer gpa.free(copied);
+    try testing.expectEqualSlices(u8, big, copied);
+    const small = try t.tmp.dir.readFileAlloc(testing.io, "to/sub/small", gpa, .unlimited);
+    defer gpa.free(small);
+    try testing.expectEqualStrings("small\n", small);
+}
+
 test "a command before the login is refused" {
     var es: ExecServer = undefined;
     try es.init();
