@@ -250,14 +250,15 @@ fn background(gpa: Allocator, io: Io, environ: *const Environ.Map, options: Opti
 
 /// Undoes `install`. Stops txd: its service, or the server it started in
 /// the background. Turns lingering off if `install` turned it on. Ends the
-/// sessions, as `tx --kill` does. Then removes `~/.local/share/tx`, where tx
-/// puts txd, and txd's files in the state directory: the default host key,
-/// the SPA key and the log. A key given with `--key` and
+/// sessions, as `tx --kill` does. Then removes txd's files in the state
+/// directory, the default host key, the SPA key and the log, and last
+/// `~/.local/share/tx`, where tx puts txd. A key given with `--key` and
 /// `~/.config/tx/authorized_keys` stay.
 ///
-/// `listen` is the address the server was installed with. Something that
-/// still has its port afterwards, such as a txd started by hand, is
-/// reported.
+/// Each step must succeed before the next. Nothing is removed while
+/// something still has the port of `listen`, the address the server was
+/// installed with, such as a txd started by hand. After a failure, running
+/// it again picks up where it stopped.
 pub fn uninstall(gpa: Allocator, io: Io, environ: *const Environ.Map, user: []const u8, listen: IpAddress) !void {
     // The service first, so that nothing starts txd again.
     switch (builtin.os.tag) {
@@ -266,31 +267,32 @@ pub fn uninstall(gpa: Allocator, io: Io, environ: *const Environ.Map, user: []co
         else => {},
     }
     try stopBackground(gpa, io, environ);
+    if (serving(listen)) {
+        std.debug.print("txd: something still has port {d}, such as a txd started by hand. Stop it, then uninstall again.\n", .{listen.getPort()});
+        return error.PortInUse;
+    }
     try endSessions(gpa, io, environ);
 
-    // txd's files. The binary running this is among them, and keeps
-    // running.
+    // The keys and the log, then the directory with txd in it, so that
+    // after a failure the next uninstall has a txd to run. The binary
+    // running this keeps running.
     const dir = Io.Dir.cwd();
-    const share = try paths.home(gpa, environ, ".local/share/tx");
-    defer gpa.free(share);
-    if (exists(io, share)) {
-        try dir.deleteTree(io, share);
-        std.debug.print("txd: removed {s}\n", .{share});
-    }
     for ([_][]const u8{ "host_key", "spa_key", name ++ ".log" }) |file| {
         const path = try paths.state(gpa, environ, file);
         defer gpa.free(path);
         try deleteIfExists(io, path);
     }
-
-    // The state directory, if nothing else is in it.
     const state_dir = try paths.state(gpa, environ, "");
     defer gpa.free(state_dir);
+    // The state directory, if nothing else is in it.
     dir.deleteDir(io, state_dir) catch {};
     std.debug.print("txd: removed txd's keys and log\n", .{});
 
-    if (serving(listen)) {
-        std.debug.print("txd: something still has port {d}, such as a txd started by hand\n", .{listen.getPort()});
+    const share = try paths.home(gpa, environ, ".local/share/tx");
+    defer gpa.free(share);
+    if (exists(io, share)) {
+        try dir.deleteTree(io, share);
+        std.debug.print("txd: removed {s}\n", .{share});
     }
 }
 
@@ -302,7 +304,10 @@ fn removeSystemd(gpa: Allocator, io: Io, environ: *const Environ.Map, user: []co
     if (exists(io, path)) {
         // `--now` stops the service too. With `KillMode=process`, its
         // sessions keep running.
-        _ = try succeeds(gpa, io, &.{ "systemctl", "--user", "--quiet", "disable", "--now", name ++ ".service" }, .show);
+        if (!try succeeds(gpa, io, &.{ "systemctl", "--user", "--quiet", "disable", "--now", name ++ ".service" }, .show)) {
+            std.debug.print("txd: can't stop {s}.service\n", .{name});
+            return error.SystemctlFailed;
+        }
         try Io.Dir.cwd().deleteFile(io, path);
         _ = try succeeds(gpa, io, &.{ "systemctl", "--user", "daemon-reload" }, .show);
         _ = try succeeds(gpa, io, &.{ "systemctl", "--user", "reset-failed", name ++ ".service" }, .quiet);
@@ -326,8 +331,11 @@ fn removeLaunchd(gpa: Allocator, io: Io, environ: *const Environ.Map) !void {
     for ([_][]const u8{ "gui", "user" }) |domain| {
         var target_buf: [64]u8 = undefined;
         const target = std.fmt.bufPrint(&target_buf, "{s}/{d}/" ++ name, .{ domain, uid }) catch unreachable;
-        if (try succeeds(gpa, io, &.{ "launchctl", "print", target }, .quiet)) {
-            _ = try succeeds(gpa, io, &.{ "launchctl", "bootout", target }, .show);
+        if (try succeeds(gpa, io, &.{ "launchctl", "print", target }, .quiet) and
+            !try succeeds(gpa, io, &.{ "launchctl", "bootout", target }, .show))
+        {
+            std.debug.print("txd: can't stop {s}\n", .{target});
+            return error.LaunchctlFailed;
         }
     }
 
@@ -345,7 +353,8 @@ fn removeLaunchd(gpa: Allocator, io: Io, environ: *const Environ.Map) !void {
 /// How long `uninstall` waits for txd and the sessions to exit.
 const stop_timeout_ms = 5000;
 
-/// Stops the server `background` started, if it still runs.
+/// Stops the server `background` started, if it still runs. The pid file
+/// goes once that server is gone.
 fn stopBackground(gpa: Allocator, io: Io, environ: *const Environ.Map) !void {
     const path = try paths.state(gpa, environ, pid_file);
     defer gpa.free(path);
@@ -354,19 +363,21 @@ fn stopBackground(gpa: Allocator, io: Io, environ: *const Environ.Map) !void {
         else => |e| return e,
     };
     defer gpa.free(text);
-    try Io.Dir.cwd().deleteFile(io, path);
 
     // After a restart the pid may be another program's.
-    const pid = std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, text, " \n"), 10) catch return;
-    if (!try isTxd(gpa, io, pid)) return;
-    if (std.c.kill(pid, .TERM) != 0) return;
-
-    var waited: u64 = 0;
-    while (std.c.kill(pid, @fromBackingInt(@intCast(0))) == 0) : (waited += 50) {
-        if (waited >= stop_timeout_ms) return error.TxdDidntStop;
-        try io.sleep(.fromMilliseconds(50), .awake);
+    const pid = std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, text, " \n"), 10) catch null;
+    if (pid != null and try isTxd(gpa, io, pid.?) and std.c.kill(pid.?, .TERM) == 0) {
+        var waited: u64 = 0;
+        while (std.c.kill(pid.?, @fromBackingInt(@intCast(0))) == 0) : (waited += 50) {
+            if (waited >= stop_timeout_ms) {
+                std.debug.print("txd: the server running in the background, pid {d}, didn't stop\n", .{pid.?});
+                return error.TxdDidntStop;
+            }
+            try io.sleep(.fromMilliseconds(50), .awake);
+        }
+        std.debug.print("txd: stopped the server running in the background\n", .{});
     }
-    std.debug.print("txd: stopped the server running in the background\n", .{});
+    try Io.Dir.cwd().deleteFile(io, path);
 }
 
 /// Whether process `pid` runs a program named txd. ps names it on Linux and
@@ -392,12 +403,20 @@ fn endSessions(gpa: Allocator, io: Io, environ: *const Environ.Map) !void {
 
     var ended: usize = 0;
     for (ids) |id| {
-        if (killSession(dir, id)) {
-            ended += 1;
-        } else |_| {
-            // A socket whose process is gone.
-            runtime_dir.remove(dir, id);
-        }
+        killSession(dir, id) catch |err| switch (err) {
+            // A socket whose process is gone, as the server treats one.
+            error.ConnectionRefused => {
+                runtime_dir.remove(dir, id);
+                continue;
+            },
+            // Gone since the listing.
+            error.FileNotFound => continue,
+            else => {
+                std.debug.print("txd: can't reach session {d}: {t}\n", .{ id, err });
+                return err;
+            },
+        };
+        ended += 1;
     }
 
     // A session process removes its socket as its session ends.
@@ -406,7 +425,12 @@ fn endSessions(gpa: Allocator, io: Io, environ: *const Environ.Map) !void {
         const left = try runtime_dir.ids(gpa, io, dir);
         defer gpa.free(left);
         if (left.len == 0) break;
-        if (waited >= stop_timeout_ms) return error.SessionsDidntEnd;
+        if (waited >= stop_timeout_ms) {
+            std.debug.print("txd: these sessions didn't end:", .{});
+            for (left) |id| std.debug.print(" {d}", .{id});
+            std.debug.print("\n", .{});
+            return error.SessionsDidntEnd;
+        }
         try io.sleep(.fromMilliseconds(50), .awake);
     }
     if (ended > 0) std.debug.print("txd: ended {d} session{s}\n", .{ ended, if (ended == 1) "" else "s" });

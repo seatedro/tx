@@ -26,9 +26,9 @@ then `~/.ssh/id_ed25519`. txd accepts the keys in `~/.ssh/authorized_keys`.
 
 tx copies txd to a host that has none, and sets it up as a user service:
 systemd on Linux, launchd on macOS, or a background process elsewhere.
-It asks before the first copy to a host; `--yes` skips the question.
-`tx --uninstall HOST` ends the host's sessions, and removes txd, its
-service and its files.
+It asks before the first copy to a host. `tx --uninstall HOST` ends the
+host's sessions, and removes txd, its service and its files, after asking
+too. `--yes` skips the questions.
 Each session runs in a process of its own, so a restart or upgrade of txd
 leaves sessions running, and attached clients reconnect to the new txd.
 A txd older than 88d63d9 runs sessions inside itself, and its sessions

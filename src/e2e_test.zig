@@ -1385,10 +1385,11 @@ fn fuzzLogin(_: void, in: fuzz.Input) !void {
 fn writeFuzzLogin(in: fuzz.Input, w: *Io.Writer, key_blob: []const u8) !void {
     var a: [600]u8 = undefined;
     var b: [600]u8 = undefined;
+    var key_buf: [64]u8 = undefined;
     for (0..8) |_| {
         if (in.done()) break;
         const user = if (in.chance(7, 1)) test_user else in.bytes(a[0..64]);
-        const key = if (in.chance(7, 1)) key_blob else in.bytes(b[0..64]);
+        const key = if (in.chance(7, 1)) key_blob else in.bytes(&key_buf);
         const message: proto.Message = switch (in.index(8)) {
             0 => .{ .hello = .{
                 .revision = if (in.chance(7, 1)) proto.revision else in.any(u32),

@@ -2,7 +2,7 @@
 //!
 //! Usage: tx [-p PORT] [-l USER] [--attach ID | --new | --list | --kill ID]
 //!           [--yes] [--server COMMAND] [--ssh PATH] [USER@]HOST
-//!        tx [-p PORT] [-l USER] [--ssh PATH] --uninstall [USER@]HOST
+//!        tx [-p PORT] [-l USER] [--yes] [--ssh PATH] --uninstall [USER@]HOST
 //!        tx --version
 //!
 //! With none of `--attach`, `--new`, `--list` and `--kill`, tx attaches to
@@ -22,8 +22,9 @@
 //! to a host, tx asks, unless it is given `--yes`.
 //!
 //! `--uninstall` runs `txd --uninstall` over ssh, which ends the host's
-//! sessions and removes txd, its service and its files. tx then forgets the
-//! host's keys, since a txd installed later has new ones.
+//! sessions and removes txd, its service and its files. tx asks first,
+//! unless it is given `--yes`. tx then forgets the host's keys, since a txd
+//! installed later has new ones.
 //!
 //! txd answers only clients that hold its SPA key. Each ssh command
 //! reads it, and tx keeps it in `~/.config/tx/spa_keys` (see `spa_keys.zig`).
@@ -54,7 +55,7 @@ const default_port = remote.default_port;
 
 const usage_text =
     \\usage: tx [-p PORT] [-l USER] [--attach ID | --new | --list | --kill ID] [--yes] [--server COMMAND] [--ssh PATH] [USER@]HOST
-    \\       tx [-p PORT] [-l USER] [--ssh PATH] --uninstall [USER@]HOST
+    \\       tx [-p PORT] [-l USER] [--yes] [--ssh PATH] --uninstall [USER@]HOST
     \\       tx --version
 ;
 
@@ -86,7 +87,8 @@ pub fn main(init: std.process.Init) !u8 {
     // `--attach`, `--new`, `--list`, `--kill` and `--uninstall` exclude
     // each other.
     var modes: usize = 0;
-    var first_install: remote.FirstInstall = .ask;
+    // `--yes`: no questions before installing or uninstalling.
+    var yes = false;
     var server_command: ?[]const u8 = null;
     var ssh_path: []const u8 = "ssh";
     var destination: ?[]const u8 = null;
@@ -117,7 +119,7 @@ pub fn main(init: std.process.Init) !u8 {
             uninstall = true;
             modes += 1;
         } else if (std.mem.eql(u8, arg, "--yes")) {
-            first_install = .yes;
+            yes = true;
         } else if (std.mem.eql(u8, arg, "--server") and i + 1 < args.len) {
             i += 1;
             server_command = args[i];
@@ -151,7 +153,7 @@ pub fn main(init: std.process.Init) !u8 {
         .port = port,
         .signal_mask = signal_mask,
         .environ = environ,
-        .first_install = first_install,
+        .first_install = if (yes) .yes else .ask,
     };
 
     // The host's name in tx's files, and the files.
@@ -162,7 +164,19 @@ pub fn main(init: std.process.Init) !u8 {
     const tx_spa_keys = try paths.config(gpa, environ, "spa_keys");
     defer gpa.free(tx_spa_keys);
 
-    if (uninstall) return uninstallOverSsh(gpa, io, ssh, tx_known_hosts, tx_spa_keys, known_name);
+    if (uninstall) {
+        // Ending the sessions loses what runs in them.
+        if (!yes) {
+            var buf: [1024]u8 = undefined;
+            const question = std.fmt.bufPrint(&buf,
+                \\This ends every session on {s}, and removes txd, its service and its keys.
+                \\Uninstall txd?
+            , .{ssh_destination}) catch return fail("host name too long", .{});
+            const answer = remote.ask(io, question, false) catch |err| return fail("can't ask: {t}", .{err});
+            if (!(answer orelse return fail("there's no terminal to ask on; with --yes, tx uninstalls without asking", .{}))) return 255;
+        }
+        return uninstallOverSsh(gpa, io, ssh, tx_known_hosts, tx_spa_keys, known_name);
+    }
 
     const login_user = user orelse paths.userName(environ) orelse return fail("can't tell the local user name; use -l", .{});
     if (login_user.len == 0 or login_user.len > auth.login.max_user_len) return fail("invalid user name", .{});
@@ -508,17 +522,18 @@ fn installOverSsh(gpa: Allocator, io: Io, source: remote.Source, ssh_spa_key: Ss
 
 /// Runs `txd --uninstall` on the host, then removes the host's lines from
 /// tx's known_hosts and SPA keys. A host where tx never put txd is left
-/// alone.
+/// alone, and its lines are removed.
 fn uninstallOverSsh(gpa: Allocator, io: Io, source: remote.Source, tx_known_hosts: []const u8, tx_spa_keys: []const u8, name: []const u8) u8 {
     var s = source;
     s.first_install = .no;
-    const result = remote.runTxd(gpa, io, s, &.{"--uninstall"}) catch |err| switch (err) {
-        error.NotInstalled => return fail("{s} has no txd from tx", .{source.destination}),
+    if (remote.runTxd(gpa, io, s, &.{"--uninstall"})) |result| {
+        gpa.free(result.stdout);
+        if (!result.ok) return fail("txd --uninstall failed on {s}", .{source.destination});
+    } else |err| switch (err) {
+        error.NotInstalled => std.debug.print("tx: {s} has no txd from tx\n", .{source.destination}),
         error.NoTxd => return 255,
         else => return fail("can't run txd over ssh: {t}", .{err}),
-    };
-    gpa.free(result.stdout);
-    if (!result.ok) return fail("txd --uninstall failed on {s}", .{source.destination});
+    }
 
     // A txd installed later has new keys.
     auth.known_hosts.remove(gpa, io, tx_known_hosts, name) catch |err| {

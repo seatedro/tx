@@ -102,7 +102,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     // Before the keys, which it removes.
     if (uninstall) {
-        if (install_service or print_host_key or print_spa_key) return usage("--uninstall goes with --listen only");
+        if (install_service or print_host_key or print_spa_key or key_path != null or open) return usage("--uninstall goes with --listen only");
         install.uninstall(gpa, io, init.environ_map, user, listen) catch |err| {
             std.debug.print("txd: --uninstall failed: {t}\n", .{err});
             return 1;

@@ -40,6 +40,8 @@ jobs:
           rm -f .zig-cache/f/crash
           timeout 30m zig build fuzz --fuzz > fuzz.log 2>&1 || test $? -eq 124
           tail -n 40 fuzz.log
+          # The corpus: a directory of inputs for each fuzz test.
+          for dir in .zig-cache/f/*/; do echo "$dir: $(find "$dir" -type f | wc -l) inputs"; done
           if [ -e .zig-cache/f/crash ]; then
             echo "::error::a fuzz test failed; see fuzz.log in the fuzz-crash artifact"
             exit 1
