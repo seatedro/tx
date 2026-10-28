@@ -12,7 +12,7 @@ const PosixAddress = Io.Threaded.PosixAddress;
 const Ed25519 = std.crypto.sign.Ed25519;
 const crypto = @import("crypto");
 const c = @import("c");
-const knock = @import("knock.zig");
+const spa = @import("spa.zig");
 
 pub const Error = error{
     OutOfMemory,
@@ -213,8 +213,8 @@ pub const Connection = struct {
         /// `consume`.
         connection_window: u64 = 32 << 20,
         /// Client only. Marks the connection's source ID with the key, so
-        /// that a server that knocks answers. See `knock`.
-        knock: ?*const knock.Key = null,
+        /// that a server with an SPA key answers. See `spa`.
+        spa_key: ?*const spa.Key = null,
     };
 
     /// Error code carried by a CONNECTION_CLOSE frame.
@@ -246,7 +246,7 @@ pub const Connection = struct {
         };
 
         const dcid = randomCid(16);
-        const scid = if (options.knock) |key| cidOf(&knock.cid(io, key)) else randomCid(16);
+        const scid = if (options.spa_key) |key| cidOf(&spa.cid(io, key)) else randomCid(16);
         var settings = defaultSettings(io);
         if (options.handshake_timeout_ns) |ns| settings.handshake_timeout = ns;
         var params = defaultParams(options);

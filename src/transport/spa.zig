@@ -1,4 +1,5 @@
-//! The knock: a server with a knock key answers only clients that hold it.
+//! Single Packet Authorization (SPA): a server with an SPA key answers only
+//! clients that hold it.
 //!
 //! A QUIC client picks the source connection ID of its first packets. A
 //! client with the key makes it `nonce || minute || tag`: 8 random bytes,

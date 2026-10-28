@@ -1347,16 +1347,16 @@ test "past retry_from, a client logs in after a Retry" {
     try testing.expect(@atomicLoad(u64, &st.server.pending.retries, .monotonic) >= 1);
 }
 
-test "a server that knocks answers only clients with its key" {
+test "a server with an SPA key answers only clients with its key" {
     transport.crypto.init(testing.io);
     var environ: std.process.Environ.Map = .init(gpa);
     defer environ.deinit();
     var login: Login = undefined;
     try login.init(null);
     defer login.deinit();
-    const key = transport.knock.generate();
+    const key = transport.spa.generate();
     var options = try login.serverOptions(&environ, &.{ "/bin/sh", "-c", "sleep 10" });
-    options.knock = key;
+    options.spa_key = key;
     var st: ServerThread = undefined;
     try st.init(options);
     defer st.deinit();
@@ -1364,10 +1364,10 @@ test "a server that knocks answers only clients with its key" {
     // Without the key, or with another, nothing answers.
     var pty: TestPty = try .open();
     defer pty.close();
-    for ([_]?transport.knock.Key{ null, transport.knock.generate() }) |knock| {
+    for ([_]?transport.spa.Key{ null, transport.spa.generate() }) |spa_key| {
         var ct: ClientThread = .{ .options = login.clientOptions(&st, &pty, &.{login.key.public_key.toBytes()}) };
         ct.options.command = .list;
-        ct.options.knock = knock;
+        ct.options.spa_key = spa_key;
         ct.options.handshake_timeout_ns = std.time.ns_per_s;
         try ct.start();
         const outcome = try ct.join(&pty);
@@ -1377,23 +1377,23 @@ test "a server that knocks answers only clients with its key" {
     // With it, the client logs in.
     var ct: ClientThread = .{ .options = login.clientOptions(&st, &pty, &.{login.key.public_key.toBytes()}) };
     ct.options.command = .list;
-    ct.options.knock = key;
+    ct.options.spa_key = key;
     try ct.start();
     const listed = (try ct.join(&pty)).listed;
     defer gpa.free(listed);
     try testing.expectEqual(0, listed.len);
 }
 
-test "a client with the knock key logs in after a Retry" {
+test "a client with the SPA key logs in after a Retry" {
     transport.crypto.init(testing.io);
     var environ: std.process.Environ.Map = .init(gpa);
     defer environ.deinit();
     var login: Login = undefined;
     try login.init(null);
     defer login.deinit();
-    const key = transport.knock.generate();
+    const key = transport.spa.generate();
     var options = try login.serverOptions(&environ, &.{ "/bin/sh", "-c", "sleep 10" });
-    options.knock = key;
+    options.spa_key = key;
     options.pending.retry_from = 0;
     var st: ServerThread = undefined;
     try st.init(options);
@@ -1405,23 +1405,23 @@ test "a client with the knock key logs in after a Retry" {
     defer pty.close();
     var ct: ClientThread = .{ .options = login.clientOptions(&st, &pty, &.{login.key.public_key.toBytes()}) };
     ct.options.command = .list;
-    ct.options.knock = key;
+    ct.options.spa_key = key;
     try ct.start();
     const listed = (try ct.join(&pty)).listed;
     defer gpa.free(listed);
     try testing.expect(@atomicLoad(u64, &st.server.pending.retries, .monotonic) >= 1);
 }
 
-test "a server that knocks sends nothing to a copy of a first packet from another address" {
+test "a server with an SPA key sends nothing to a copy of a first packet from another address" {
     transport.crypto.init(testing.io);
     var environ: std.process.Environ.Map = .init(gpa);
     defer environ.deinit();
     var login: Login = undefined;
     try login.init(null);
     defer login.deinit();
-    const key = transport.knock.generate();
+    const key = transport.spa.generate();
     var options = try login.serverOptions(&environ, &.{ "/bin/sh", "-c", "sleep 10" });
-    options.knock = key;
+    options.spa_key = key;
     // The connection the first packet starts is gone a few seconds later:
     // ngtcp2 waits at least three probe timeouts.
     options.idle_timeout_ns = 500 * std.time.ns_per_ms;
@@ -1457,9 +1457,9 @@ test "a server that knocks sends nothing to a copy of a first packet from anothe
     try testing.expect(answered(first, marked, server, timeout_ms));
 }
 
-/// The first datagram of a client, marked with `knock` if it is set,
+/// The first datagram of a client, marked with `spa_key` if it is set,
 /// caught on a socket of the test's before it reaches any server.
-fn firstDatagram(knock: ?*const transport.knock.Key, buf: []u8) ![]u8 {
+fn firstDatagram(spa_key: ?*const transport.spa.Key, buf: []u8) ![]u8 {
     const catcher = try Relay.open(0);
     defer _ = c.close(catcher);
     var addr: c.sockaddr.in = undefined;
@@ -1474,7 +1474,7 @@ fn firstDatagram(knock: ?*const transport.knock.Key, buf: []u8) ![]u8 {
     try endpoint.init(gpa, testing.io, &loop, .{
         .local = try .parseIp4("127.0.0.1", 0),
         .role = .{ .client = &tls },
-        .knock = knock,
+        .spa_key = spa_key,
     });
     defer endpoint.deinit();
 

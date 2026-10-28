@@ -1,7 +1,7 @@
 //! txd: serves the user's sessions over QUIC.
 //!
 //! Usage: txd [--listen ADDRESS:PORT] [--key PATH] [--open]
-//!            [--print-host-key] [--print-knock] [--install]
+//!            [--print-host-key] [--print-spa-key] [--install]
 //!        txd --version
 //!        txd --session --fd N
 //!
@@ -13,17 +13,17 @@
 //! and exits, creating the key if there is none. `tx` runs it over ssh to
 //! learn a new host's key.
 //!
-//! txd answers only clients that hold its knock key (see
-//! `transport.knock`), kept in `knock_key` next to the default host key.
-//! To anyone else the port looks closed. `--print-knock` prints
-//! `knock KEY TIME`, the key in base64 and txd's clock in Unix seconds,
+//! txd answers only clients that hold its SPA key (see
+//! `transport.spa`), kept in `spa_key` next to the default host key.
+//! To anyone else the port looks closed. `--print-spa-key` prints
+//! `spa-key KEY TIME`, the key in base64 and txd's clock in Unix seconds,
 //! creating the key if there is none. `tx` runs it over ssh with
 //! `--print-host-key`. `--open` answers every client.
 //!
 //! `--install` sets up a service that keeps txd running with the
 //! given `--listen`, `--key` and `--open`, starts it if it isn't running,
 //! and exits; see `install.zig`. With `--print-host-key` or
-//! `--print-knock`, those are printed first.
+//! `--print-spa-key`, those are printed first.
 //!
 //! `--session` runs one session, on the socket txd passes as fd N. txd
 //! starts it; see `session.process`.
@@ -61,7 +61,7 @@ pub fn main(init: std.process.Init) !u8 {
     var listen: Io.net.IpAddress = try .parseIp6("::", default_port);
     var key_path: ?[]const u8 = null;
     var print_host_key = false;
-    var print_knock = false;
+    var print_spa_key = false;
     var open = false;
     var install_service = false;
     // `--listen` and `--key` as given, for the service.
@@ -78,8 +78,8 @@ pub fn main(init: std.process.Init) !u8 {
             key_path = args[i];
         } else if (std.mem.eql(u8, arg, "--print-host-key")) {
             print_host_key = true;
-        } else if (std.mem.eql(u8, arg, "--print-knock")) {
-            print_knock = true;
+        } else if (std.mem.eql(u8, arg, "--print-spa-key")) {
+            print_spa_key = true;
         } else if (std.mem.eql(u8, arg, "--open")) {
             open = true;
         } else if (std.mem.eql(u8, arg, "--install")) {
@@ -96,21 +96,21 @@ pub fn main(init: std.process.Init) !u8 {
     const path = key_path orelse try paths.state(gpa, init.environ_map, "host_key");
     defer if (key_path == null) gpa.free(path);
     const identity = try keyfile.loadOrCreate(io, path);
-    const knock_path = try paths.state(gpa, init.environ_map, "knock_key");
-    defer gpa.free(knock_path);
-    var knock_key = try keyfile.loadOrCreateSecret(io, knock_path);
-    defer std.crypto.secureZero(u8, &knock_key);
+    const spa_path = try paths.state(gpa, init.environ_map, "spa_key");
+    defer gpa.free(spa_path);
+    var spa_key = try keyfile.loadOrCreateSecret(io, spa_path);
+    defer std.crypto.secureZero(u8, &spa_key);
 
-    if (print_host_key or print_knock) {
+    if (print_host_key or print_spa_key) {
         var buf: [256]u8 = undefined;
         var w = Io.File.stdout().writerStreaming(io, &buf);
         if (print_host_key) {
             try w.interface.print("{s} {s}\n", .{ auth.ssh.ed25519, auth.ssh.KeyText.init(identity.public_key.toBytes()).slice() });
         }
-        if (print_knock) {
-            var text: [std.base64.standard.Encoder.calcSize(knock_key.len)]u8 = undefined;
-            _ = std.base64.standard.Encoder.encode(&text, &knock_key);
-            try w.interface.print("knock {s} {d}\n", .{ &text, Io.Clock.real.now(io).toSeconds() });
+        if (print_spa_key) {
+            var text: [std.base64.standard.Encoder.calcSize(spa_key.len)]u8 = undefined;
+            _ = std.base64.standard.Encoder.encode(&text, &spa_key);
+            try w.interface.print("spa-key {s} {d}\n", .{ &text, Io.Clock.real.now(io).toSeconds() });
         }
         try w.interface.flush();
         if (!install_service) return 0;
@@ -192,7 +192,7 @@ pub fn main(init: std.process.Init) !u8 {
         .argv = &.{login_name},
         .program = shell,
         .cwd = if (init.environ_map.get("HOME")) |home| .{ .path = home } else .inherit,
-        .knock = if (open) null else knock_key,
+        .spa_key = if (open) null else spa_key,
     }) catch |err| switch (err) {
         error.AddressInUse => {
             std.debug.print("txd: port {d} is in use, by another txd or another program\n", .{listen.getPort()});
@@ -212,7 +212,7 @@ pub fn main(init: std.process.Init) !u8 {
 }
 
 fn usage(reason: []const u8) u8 {
-    std.debug.print("txd: {s}\nusage: txd [--listen ADDRESS:PORT] [--key PATH] [--open] [--print-host-key] [--print-knock] [--install]\n       txd --version\n       txd --session --fd N\n", .{reason});
+    std.debug.print("txd: {s}\nusage: txd [--listen ADDRESS:PORT] [--key PATH] [--open] [--print-host-key] [--print-spa-key] [--install]\n       txd --version\n       txd --session --fd N\n", .{reason});
     return 2;
 }
 

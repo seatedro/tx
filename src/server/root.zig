@@ -6,9 +6,9 @@
 //! server's own user only. Once logged in, the client sends `Attach`. The
 //! server answers with `HelloReply`, `AuthProbeReply` and `AuthOk`.
 //!
-//! With `Options.knock`, the server answers only clients that mark their
+//! With `Options.spa_key`, the server answers only clients that mark their
 //! first packets with the key, and sends nothing to anyone else (see
-//! `transport.knock`).
+//! `transport.spa`).
 //!
 //! Each session runs in a process of its own (see `session.process`),
 //! listening on a socket in the runtime directory (see `runtime_dir`). An
@@ -84,8 +84,8 @@ pub const Options = struct {
     /// Limits on connections that haven't logged in.
     pending: transport.pending.Limits = .{},
     /// Only clients with this key get an answer. Null answers any client.
-    /// See `transport.knock`.
-    knock: ?transport.knock.Key = null,
+    /// See `transport.spa`.
+    spa_key: ?transport.spa.Key = null,
 };
 
 pub const ErrorCode = proto.ErrorCode;
@@ -124,7 +124,7 @@ pub const Server = struct {
     tls: transport.quic.Server,
     /// Shared by the endpoints.
     pending: transport.pending.Pending,
-    guard: ?transport.knock.Guard,
+    guard: ?transport.spa.Guard,
     /// One per address listened on. They don't move.
     endpoints: std.ArrayList(*Endpoint) = .empty,
     /// Endpoints whose address went away, freed once stopped.
@@ -159,7 +159,7 @@ pub const Server = struct {
             .options = options,
             .tls = try .init(options.identity),
             .pending = .init(gpa, options.pending),
-            .guard = if (options.knock) |key| .init(gpa, key) else null,
+            .guard = if (options.spa_key) |key| .init(gpa, key) else null,
         };
         errdefer self.deinit();
 

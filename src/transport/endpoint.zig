@@ -17,7 +17,7 @@ const xev = @import("xev");
 const c = @import("c");
 const quic = @import("quic.zig");
 const pending = @import("pending.zig");
-const knock = @import("knock.zig");
+const spa = @import("spa.zig");
 
 const log = std.log.scoped(.endpoint);
 
@@ -80,11 +80,11 @@ pub const Options = struct {
     /// Server only. Limits on connections until `Conn.admit`. Null leaves
     /// them unlimited and admitted from the start.
     pending: ?*pending.Pending = null,
-    /// Client only. The server's knock key, if it has one.
-    knock: ?*const knock.Key = null,
-    /// Server only. Drops first packets that don't carry a client's knock.
+    /// Client only. The server's SPA key, if it has one.
+    spa_key: ?*const spa.Key = null,
+    /// Server only. Drops first packets that don't carry a client's SPA mark.
     /// Null answers any client.
-    guard: ?*knock.Guard = null,
+    guard: ?*spa.Guard = null,
 };
 
 /// How long a connection that wasn't admitted in time stays open after
@@ -232,7 +232,7 @@ pub const Endpoint = struct {
             .keep_alive_ns = self.options.keep_alive_ns,
             .stream_window = self.options.stream_window,
             .connection_window = self.options.connection_window,
-            .knock = self.options.knock,
+            .spa_key = self.options.spa_key,
         };
     }
 
@@ -327,12 +327,12 @@ pub const Endpoint = struct {
         var vc: c.ngtcp2_version_cid = undefined;
         if (c.ngtcp2_pkt_decode_version_cid(&vc, packet.ptr, packet.len, cid_len) != 0) return;
 
-        // Before anything else reads the packet, the knock. Without it,
+        // Before anything else reads the packet, the SPA check. Without it,
         // nothing is sent back.
         if (self.options.guard) |g| {
             // A short header packet has no source ID.
             const scid: []const u8 = if (vc.scidlen == 0) &.{} else vc.scid[0..vc.scidlen];
-            if (!g.check(scid, from, knock.minuteNow(self.io))) return;
+            if (!g.check(scid, from, spa.minuteNow(self.io))) return;
         }
 
         const hd = quic.initialHeader(packet) orelse return;

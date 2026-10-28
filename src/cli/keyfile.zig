@@ -1,5 +1,5 @@
 //! The server's secrets, each 32 bytes in a file readable only by its
-//! owner: the Ed25519 identity, stored as its seed, and the knock key.
+//! owner: the Ed25519 identity, stored as its seed, and the SPA key.
 const std = @import("std");
 const Io = std.Io;
 const Ed25519 = std.crypto.sign.Ed25519;

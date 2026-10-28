@@ -29,9 +29,9 @@ leaves sessions running, and attached clients reconnect to the new txd.
 A txd older than 88d63d9 runs sessions inside itself, and its sessions
 end when it is replaced.
 
-txd answers only clients that hold its knock key, which tx reads over ssh
-along with the host key. To anyone else the port looks closed.
-`txd --open` answers every client.
+txd uses Single Packet Authorization (SPA): it answers only clients that
+hold its SPA key, which tx reads over ssh along with the host key. To
+anyone else the port looks closed. `txd --open` answers every client.
 
 ## Build
 
