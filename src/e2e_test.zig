@@ -122,8 +122,9 @@ const Login = struct {
     }
 
     /// Client options for a client on `pty`, logging in with `keys` from
-    /// the agent. The result points into `l`, until the next call.
-    fn clientOptions(l: *Login, st: *const ServerThread, pty: *const TestPty, keys: []const auth.Key) client.session.Options {
+    /// the agent. The result points into `l`, until the next call. Without
+    /// a pty, the caller sets the fds.
+    fn clientOptions(l: *Login, st: *const ServerThread, pty: ?*const TestPty, keys: []const auth.Key) client.session.Options {
         for (keys, 0..) |key, i| l.identities[i] = .{ .key = .fromEd25519(key), .source = .agent };
         return .{
             .servers = &st.addresses,
@@ -131,8 +132,8 @@ const Login = struct {
             .user = test_user,
             .agent = l.agent_path,
             .identities = l.identities[0..keys.len],
-            .in_fd = pty.slave,
-            .out_fd = pty.slave,
+            .in_fd = if (pty) |p| p.slave else -1,
+            .out_fd = if (pty) |p| p.slave else -1,
             .term = "xterm-256color",
         };
     }
@@ -575,6 +576,267 @@ const ClientThread = struct {
         return ct.result.?;
     }
 };
+
+/// A client running a command, with its stdin, stdout and stderr on pipes
+/// the test holds.
+const ExecClient = struct {
+    client: ClientThread,
+    /// The test writes `stdin[1]`, and reads `stdout[0]` and `stderr[0]`.
+    stdin: [2]posix.fd_t,
+    stdout: [2]posix.fd_t,
+    stderr: [2]posix.fd_t,
+    out: std.ArrayList(u8) = .empty,
+    err: std.ArrayList(u8) = .empty,
+
+    fn start(ec: *ExecClient, login: *Login, st: *const ServerThread, command: []const u8) !void {
+        ec.* = .{ .client = undefined, .stdin = try testPipe(), .stdout = try testPipe(), .stderr = try testPipe() };
+        for ([_]posix.fd_t{ ec.stdout[0], ec.stderr[0] }) |fd| _ = c.fcntl(fd, posix.F.SETFL, @as(c_int, @bitCast(posix.O{ .NONBLOCK = true })));
+        var options = login.clientOptions(st, null, &.{login.key.public_key.toBytes()});
+        options.in_fd = ec.stdin[0];
+        options.out_fd = ec.stdout[1];
+        options.err_fd = ec.stderr[1];
+        options.command = .{ .exec = command };
+        ec.client = .{ .options = options };
+        try ec.client.start();
+    }
+
+    /// Writes all of `bytes` to the command's stdin, reading its output
+    /// meanwhile.
+    fn write(ec: *ExecClient, bytes: []const u8) !void {
+        var rest = bytes;
+        while (rest.len > 0) {
+            var fds = [_]posix.pollfd{.{ .fd = ec.stdin[1], .events = posix.POLL.OUT, .revents = 0 }};
+            _ = c.poll(&fds, 1, 10);
+            if (fds[0].revents & posix.POLL.OUT != 0) {
+                const n = c.write(ec.stdin[1], rest.ptr, @min(rest.len, 64 << 10));
+                if (n > 0) rest = rest[@intCast(n)..];
+            }
+            try ec.drain();
+        }
+    }
+
+    /// Ends the command's stdin.
+    fn closeStdin(ec: *ExecClient) void {
+        closeFd(&ec.stdin[1]);
+    }
+
+    /// Reads what the command wrote so far.
+    fn drain(ec: *ExecClient) !void {
+        for ([_]struct { posix.fd_t, *std.ArrayList(u8) }{ .{ ec.stdout[0], &ec.out }, .{ ec.stderr[0], &ec.err } }) |entry| {
+            const fd, const list = entry;
+            if (fd == -1) continue;
+            var buf: [64 << 10]u8 = undefined;
+            while (true) {
+                const n = c.read(fd, &buf, buf.len);
+                if (n <= 0) break;
+                try list.appendSlice(gpa, buf[0..@intCast(n)]);
+            }
+        }
+    }
+
+    /// Reads the output until the client returns, then the rest.
+    fn join(ec: *ExecClient) !client.session.Outcome {
+        const deadline = nowMs() + timeout_ms;
+        while (!ec.client.done.load(.acquire)) {
+            if (nowMs() > deadline) return error.Timeout;
+            try ec.drain();
+            testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+        }
+        ec.client.thread.join();
+        try ec.drain();
+        return ec.client.result.?;
+    }
+
+    fn deinit(ec: *ExecClient) void {
+        for ([_]*[2]posix.fd_t{ &ec.stdin, &ec.stdout, &ec.stderr }) |pair| for (pair) |*fd| closeFd(fd);
+        ec.out.deinit(gpa);
+        ec.err.deinit(gpa);
+    }
+
+    fn closeFd(fd: *posix.fd_t) void {
+        if (fd.* == -1) return;
+        _ = c.close(fd.*);
+        fd.* = -1;
+    }
+};
+
+fn testPipe() ![2]posix.fd_t {
+    var fds: [2]posix.fd_t = undefined;
+    if (c.pipe(&fds) != 0) return error.SystemResources;
+    return fds;
+}
+
+/// The commands the server runs.
+fn execCount(st: *ServerThread) usize {
+    const Count = struct {
+        req: ServerThread.Request = .{ .run = run },
+        n: usize = 0,
+
+        fn run(req: *ServerThread.Request, s: *ServerThread) void {
+            const count: *@This() = @fieldParentPtr("req", req);
+            count.n = s.server.execs.items.len;
+        }
+    };
+    var count: Count = .{};
+    st.call(&count.req);
+    return count.n;
+}
+
+/// Waits until the server has freed every command.
+fn waitNoExecs(st: *ServerThread) !void {
+    const deadline = nowMs() + timeout_ms;
+    while (execCount(st) > 0) {
+        if (nowMs() > deadline) return error.Timeout;
+        try testing.io.sleep(.fromMilliseconds(10), .awake);
+    }
+}
+
+/// A server for `ExecClient`s, with `/bin/sh` as the user's shell.
+const ExecServer = struct {
+    environ: std.process.Environ.Map,
+    login: Login,
+    st: ServerThread,
+
+    fn init(es: *ExecServer) !void {
+        transport.crypto.init(testing.io);
+        es.environ = try testEnviron();
+        errdefer es.environ.deinit();
+        try es.login.init(null);
+        errdefer es.login.deinit();
+        try es.st.init(try es.login.serverOptions(&es.environ, &.{ "/bin/sh", "-c", "sleep 10" }));
+    }
+
+    fn deinit(es: *ExecServer) void {
+        es.st.deinit();
+        es.login.deinit();
+        es.environ.deinit();
+    }
+
+    /// Runs `command` with `stdin` and returns the outcome; the output is
+    /// in `ec`.
+    fn run(es: *ExecServer, ec: *ExecClient, command: []const u8, stdin: []const u8) !client.session.Outcome {
+        try ec.start(&es.login, &es.st, command);
+        try ec.write(stdin);
+        ec.closeStdin();
+        return ec.join();
+    }
+};
+
+test "a command's stdout, stderr and exit status reach the client apart" {
+    var es: ExecServer = undefined;
+    try es.init();
+    defer es.deinit();
+
+    var ec: ExecClient = undefined;
+    defer ec.deinit();
+    const outcome = try es.run(&ec, "printf out; printf err >&2; exit 3", "");
+    try testing.expectEqual(3, outcome.exited.status);
+    try testing.expectEqualStrings("out", ec.out.items);
+    try testing.expectEqualStrings("err", ec.err.items);
+    try waitNoExecs(&es.st);
+}
+
+test "a command reads all of its stdin, and its end" {
+    var es: ExecServer = undefined;
+    try es.init();
+    defer es.deinit();
+
+    // Empty, and more than the flow control windows hold.
+    const big = try gpa.alloc(u8, 3 << 20);
+    defer gpa.free(big);
+    @memset(big, 'x');
+    for ([_][]const u8{ "", big }) |stdin| {
+        var ec: ExecClient = undefined;
+        defer ec.deinit();
+        const outcome = try es.run(&ec, "wc -c | tr -d ' '", stdin);
+        try testing.expectEqual(0, outcome.exited.status);
+        var want_buf: [32]u8 = undefined;
+        try testing.expectEqualStrings(try std.fmt.bufPrint(&want_buf, "{d}\n", .{stdin.len}), ec.out.items);
+    }
+}
+
+test "output the command wrote just before it exited arrives in full" {
+    var es: ExecServer = undefined;
+    try es.init();
+    defer es.deinit();
+
+    var ec: ExecClient = undefined;
+    defer ec.deinit();
+    const outcome = try es.run(&ec, "head -c 8388608 /dev/zero; exit 5", "");
+    try testing.expectEqual(5, outcome.exited.status);
+    try testing.expectEqual(8 << 20, ec.out.items.len);
+}
+
+test "a command that closes its stdout early, or ends by a signal, is reported" {
+    var es: ExecServer = undefined;
+    try es.init();
+    defer es.deinit();
+
+    var closed: ExecClient = undefined;
+    defer closed.deinit();
+    const outcome = try es.run(&closed, "exec 1>&-; sleep 0.1; echo done >&2", "");
+    try testing.expectEqual(0, outcome.exited.status);
+    try testing.expectEqualStrings("", closed.out.items);
+    try testing.expectEqualStrings("done\n", closed.err.items);
+
+    var killed: ExecClient = undefined;
+    defer killed.deinit();
+    const signaled = try es.run(&killed, "kill -TERM $$", "");
+    try testing.expectEqual(128 + 15, signaled.exited.status);
+    try testing.expectEqualStrings("TERM", signaled.exited.signal.?.slice());
+}
+
+test "a client whose stdout closes ends, and the server frees the command" {
+    var es: ExecServer = undefined;
+    try es.init();
+    defer es.deinit();
+
+    // The command echoes its stdin, which stays open, to the closed pipe.
+    var ec: ExecClient = undefined;
+    defer ec.deinit();
+    try ec.start(&es.login, &es.st, "cat");
+    ExecClient.closeFd(&ec.stdout[0]);
+    try ec.write("line\n");
+    try testing.expectEqual(.ended, try ec.join());
+
+    // Its connection gone, the command sees the end of its stdin.
+    try waitNoExecs(&es.st);
+}
+
+test "a server that stops ends the commands it runs" {
+    var es: ExecServer = undefined;
+    try es.init();
+
+    var ec: ExecClient = undefined;
+    defer ec.deinit();
+    try ec.start(&es.login, &es.st, "sleep 30");
+    const deadline = nowMs() + timeout_ms;
+    while (execCount(&es.st) == 0) {
+        if (nowMs() > deadline) return error.Timeout;
+        try testing.io.sleep(.fromMilliseconds(10), .awake);
+    }
+    es.deinit();
+    _ = try ec.join();
+}
+
+test "a command before the login is refused" {
+    var es: ExecServer = undefined;
+    try es.init();
+    defer es.deinit();
+
+    var rc: RawClient = undefined;
+    try rc.init(&es.st, es.login.key, raw_hello);
+    defer rc.deinit();
+    rc.login = .scripted;
+    try rc.waitConnected();
+    var buf: [64]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    try proto.encode(&w, .{ .hello = raw_hello });
+    try proto.encode(&w, .{ .exec = .{ .command = "true" } });
+    try rc.stream.?.write(w.buffered());
+    try testing.expectEqual(@backingInt(server_pkg.ErrorCode.protocol), try rc.waitError());
+    try testing.expectEqual(0, execCount(&es.st));
+}
 
 /// A terminal fed `bytes` ends in the session's primary terminal's state.
 fn expectMatchesPrimary(st: *ServerThread, session_id: u64, bytes: []const u8) !void {
@@ -1390,7 +1652,7 @@ fn writeFuzzLogin(in: fuzz.Input, w: *Io.Writer, key_blob: []const u8) !void {
         if (in.done()) break;
         const user = if (in.chance(7, 1)) test_user else in.bytes(a[0..64]);
         const key = if (in.chance(7, 1)) key_blob else in.bytes(&key_buf);
-        const message: proto.Message = switch (in.index(8)) {
+        const message: proto.Message = switch (in.index(9)) {
             0 => .{ .hello = .{
                 .revision = if (in.chance(7, 1)) proto.revision else in.any(u32),
                 .term = in.bytes(a[0..64]),
@@ -1407,6 +1669,7 @@ fn writeFuzzLogin(in: fuzz.Input, w: *Io.Writer, key_blob: []const u8) !void {
             4 => .{ .attach = .{ .session_id = if (in.any(bool)) in.any(u64) else null, .reuse = in.any(bool) } },
             5 => .{ .list = .{} },
             6 => .{ .kill = .{ .session_id = in.any(u64) } },
+            7 => .{ .exec = .{ .command = in.bytes(&a) } },
             else => {
                 try w.writeAll(in.bytes(&a));
                 continue;

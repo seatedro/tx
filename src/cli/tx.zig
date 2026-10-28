@@ -1,13 +1,18 @@
 //! tx: a session on a txd server.
 //!
 //! Usage: tx [-p PORT] [-l USER] [--attach ID | --new | --list | --kill ID]
-//!           [--yes] [--server COMMAND] [--ssh PATH] [USER@]HOST
+//!           [--yes] [--server COMMAND] [--ssh PATH] [USER@]HOST [COMMAND...]
 //!        tx [-p PORT] [-l USER] [--yes] [--ssh PATH] --uninstall [USER@]HOST
 //!        tx --version
 //!
 //! With none of `--attach`, `--new`, `--list` and `--kill`, tx attaches to
 //! the host's detached session if it has exactly one, and starts a session
 //! if it has none.
+//!
+//! With a command, tx runs it instead, as ssh does: the words after the
+//! host, joined with spaces, go to the user's shell with `-c`. The
+//! command's stdin, stdout and stderr are tx's, and tx exits with its exit
+//! status.
 //!
 //! The server's key is checked against `~/.config/tx/known_hosts` and
 //! `~/.ssh/known_hosts`. For a host in neither, tx reads the key over ssh
@@ -54,7 +59,7 @@ const spa_keys = @import("spa_keys.zig");
 const default_port = remote.default_port;
 
 const usage_text =
-    \\usage: tx [-p PORT] [-l USER] [--attach ID | --new | --list | --kill ID] [--yes] [--server COMMAND] [--ssh PATH] [USER@]HOST
+    \\usage: tx [-p PORT] [-l USER] [--attach ID | --new | --list | --kill ID] [--yes] [--server COMMAND] [--ssh PATH] [USER@]HOST [COMMAND...]
     \\       tx [-p PORT] [-l USER] [--yes] [--ssh PATH] --uninstall [USER@]HOST
     \\       tx --version
 ;
@@ -92,9 +97,15 @@ pub fn main(init: std.process.Init) !u8 {
     var server_command: ?[]const u8 = null;
     var ssh_path: []const u8 = "ssh";
     var destination: ?[]const u8 = null;
+    // The words after the destination.
+    var command_words: []const []const u8 = &.{};
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
+        if (destination != null) {
+            command_words = args[i..];
+            break;
+        }
         if (std.mem.eql(u8, arg, "-p") and i + 1 < args.len) {
             i += 1;
             port = std.fmt.parseInt(u16, args[i], 10) catch return usage("invalid port");
@@ -134,7 +145,11 @@ pub fn main(init: std.process.Init) !u8 {
         } else return usage("unknown argument");
     }
 
-    if (modes > 1) return usage("--attach, --new, --list, --kill and --uninstall don't go together");
+    if (command_words.len > 0) {
+        command = .{ .exec = try std.mem.join(init.arena.allocator(), " ", command_words) };
+        modes += 1;
+    }
+    if (modes > 1) return usage("a command, --attach, --new, --list, --kill and --uninstall don't go together");
 
     // `user@host`. A `-l` user wins, as in ssh.
     var host = destination orelse return usage("no host");
@@ -274,6 +289,7 @@ pub fn main(init: std.process.Init) !u8 {
             std.debug.print("tx: killed session {d}\n", .{id});
             return 0;
         },
+        .ended => return 255,
     }
 }
 

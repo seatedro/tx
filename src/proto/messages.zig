@@ -547,6 +547,34 @@ pub const Killed = struct {
     }
 };
 
+/// Runs a command, as `tx HOST COMMAND` does: the user's shell runs
+/// `command` with `-c`, with no terminal. Sent after the login only.
+///
+/// Once the command starts, the server opens three streams: two
+/// unidirectional ones, the command's stdout and then its stderr, and a
+/// bidirectional one whose client side carries its stdin. The end of a
+/// stream is the end of file. The server answers with `Exit` when the
+/// command exits, or with `Error` if it doesn't start. A client is done
+/// once it has `Exit` and the end of both output streams.
+pub const Exec = struct {
+    command: []const u8,
+
+    pub const type_id = 23;
+    pub const tags = .{ .command = 1 };
+
+    pub fn encodedLen(m: Exec) usize {
+        return bodyLen(Exec, m);
+    }
+
+    pub fn encode(m: Exec, w: *Writer) Writer.Error!void {
+        return encodeBody(Exec, m, w);
+    }
+
+    pub fn decode(bytes: []const u8) DecodeError!Exec {
+        return decodeBody(Exec, bytes);
+    }
+};
+
 /// The revision of the messages between txd and its session processes,
 /// from `Connect` on. A session process refuses `Start` and `Connect` from
 /// another revision. `List` and `Kill` stay as they are, so that any txd
@@ -748,6 +776,7 @@ pub const Message = union(enum) {
     list_end: ListEnd,
     kill: Kill,
     killed: Killed,
+    exec: Exec,
     connect: Connect,
     start: Start,
     started: Started,
@@ -980,6 +1009,7 @@ test "every message round trips" {
         .{ .list_end = .{} },
         .{ .kill = .{ .session_id = 2 } },
         .{ .killed = .{ .session_id = 2 } },
+        .{ .exec = .{ .command = "git-upload-pack 'repo'" } },
         .{ .connect = .{ .remote = "[::1]:5000", .cols = 80, .rows = 24, .cell_width_px = 9, .cell_height_px = 18, .resume_exporter = "exporter" } },
         .{ .connect = .{ .remote = "", .cols = 1, .rows = 1 } },
         .{ .start = .{

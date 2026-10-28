@@ -30,6 +30,7 @@ pub const Resume = messages.Resume;
 pub const ErrorCode = messages.ErrorCode;
 pub const SessionInfo = messages.SessionInfo;
 pub const Kill = messages.Kill;
+pub const Exec = messages.Exec;
 pub const Connect = messages.Connect;
 pub const Start = messages.Start;
 pub const DumpReply = messages.DumpReply;
