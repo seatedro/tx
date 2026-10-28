@@ -49,6 +49,7 @@ const auth = @import("auth");
 const addresses = @import("addresses.zig");
 pub const runtime_dir = @import("runtime_dir.zig");
 pub const exec = @import("exec.zig");
+pub const terminfo = @import("terminfo.zig");
 
 const Endpoint = transport.endpoint.Endpoint;
 const Exec = exec.Exec;
@@ -79,6 +80,9 @@ pub const Options = struct {
     environ: *const std.process.Environ.Map,
     /// The user's shell, which runs the commands of `Exec` with `-c`.
     shell: []const u8 = "/bin/sh",
+    /// Where clients' terminfo entries are compiled (see `terminfo`). Null
+    /// leaves them out.
+    terminfo_dir: ?[]const u8 = null,
     /// argv of the program new sessions run. See `session.pty.Options`.
     argv: []const []const u8,
     program: ?[]const u8 = null,
@@ -497,9 +501,9 @@ pub const Server = struct {
     }
 
     /// Starts a session process for the client that said `hello`, and
-    /// returns the channel to it, with `Start` sent. The session runs
-    /// `command` with the shell's `-c`, or the login shell.
-    fn startSession(self: *Server, hello: *const Hello, command: ?[]const u8, handler: session.channel.Handler) !*Channel {
+    /// returns the channel to it, with `Start` sent.
+    fn startSession(self: *Server, hello: *const Hello, new: NewSession, handler: session.channel.Handler) !*Channel {
+        const command = new.command;
         const id = try self.newId();
         var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena_state.deinit();
@@ -511,6 +515,17 @@ pub const Server = struct {
         try environ.put("TERM", hello.term.items);
         if (hello.colorterm.items.len > 0) try environ.put("COLORTERM", hello.colorterm.items);
         try environ.put("TX_SESSION_ID", try std.fmt.allocPrint(arena, "{d}", .{id}));
+
+        // The client's terminfo entry, which the host may lack. Without it,
+        // an entry every host has, in place of the client's.
+        if (new.terminfo) |source| if (self.options.terminfo_dir) |base| {
+            if (terminfo.install(arena, self.io, base, source)) |dir| {
+                try environ.put("TERMINFO", dir);
+            } else |err| {
+                log.warn("session {d}: can't compile the terminfo entry for {s}, so TERM is {s}: {t}", .{ id, hello.term.items, fallback_term, err });
+                try environ.put("TERM", fallback_term);
+            }
+        };
 
         // Lists of NUL-terminated items.
         var environ_list: std.ArrayList(u8) = .empty;
@@ -554,6 +569,17 @@ pub const Server = struct {
         return ch;
     }
 };
+
+/// What a new session runs, past what its client said in `Hello`.
+const NewSession = struct {
+    /// Runs with the shell's `-c`, in place of the login shell.
+    command: ?[]const u8 = null,
+    /// See `proto.Attach.terminfo`.
+    terminfo: ?[]const u8 = null,
+};
+
+/// The `TERM` of a session whose client's terminfo entry can't be used.
+const fallback_term = "xterm-256color";
 
 /// macOS's Terminal sets `LC_CTYPE=UTF-8`, which names no locale on Linux.
 /// There, it is `C.UTF-8`.
@@ -603,6 +629,8 @@ const Client = struct {
     query: ?*Query = null,
     /// The command the client runs, until it frees itself.
     exec: ?*Exec = null,
+    /// From `Attach`, for the session it starts. Empty without one.
+    terminfo: std.ArrayList(u8) = .empty,
     /// Stream bytes not yet consumed. The client's input waits while the
     /// session's channel is congested.
     held: usize = 0,
@@ -620,6 +648,7 @@ const Client = struct {
         if (client.query) |q| q.abandon();
         // The command keeps running, without its streams.
         if (client.exec) |e| e.detach();
+        client.terminfo.deinit(gpa);
         client.decoder.deinit();
         if (client.hello) |*h| h.deinit(gpa);
         gpa.destroy(client);
@@ -776,6 +805,12 @@ const Client = struct {
         if (client.hello == null) return client.fail(.protocol, "attach before hello");
         if (client.upstream != null or client.query != null or client.exec != null) return client.fail(.protocol, "second attach");
 
+        // Copied: a new session may start after the sessions answer.
+        if (m.terminfo) |source| {
+            if (source.len > terminfo.max_source_len) return client.fail(.protocol, "terminfo entry too long");
+            client.terminfo.appendSlice(client.server.gpa, source) catch return client.fail(.protocol, "out of memory");
+        }
+
         // A command runs in a new session.
         if (m.command) |command| {
             if (m.session_id != null or m.reuse) return client.fail(.protocol, "a command needs a new session");
@@ -794,7 +829,11 @@ const Client = struct {
     }
 
     fn startNew(client: *Client, command: ?[]const u8) void {
-        const ch = client.server.startSession(&client.hello.?, command, client.upstreamHandler()) catch |err| {
+        const new: NewSession = .{
+            .command = command,
+            .terminfo = if (client.terminfo.items.len > 0) client.terminfo.items else null,
+        };
+        const ch = client.server.startSession(&client.hello.?, new, client.upstreamHandler()) catch |err| {
             log.warn("starting a session failed: {t}", .{err});
             return client.fail(.spawn, "can't start the session");
         };
@@ -1143,6 +1182,8 @@ const Query = struct {
 
 test {
     _ = addresses;
+    _ = exec;
+    _ = terminfo;
     // Analyzes the crypto module, whose exports the linked C code needs.
     _ = &transport.crypto.init;
 }

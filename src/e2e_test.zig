@@ -38,6 +38,7 @@ const Login = struct {
     agent_path: []u8,
     authorized_keys: []u8,
     runtime_dir: []u8,
+    terminfo_dir: []u8,
     /// txd, from the build, as an absolute path.
     session_exe: []u8,
     /// /dev/null, for the session processes' log. The test runner would
@@ -61,6 +62,7 @@ const Login = struct {
             .agent_path = try std.fs.path.join(gpa, &.{ dir, "agent.sock" }),
             .authorized_keys = try std.fs.path.join(gpa, &.{ dir, "authorized_keys" }),
             .runtime_dir = try std.fs.path.join(gpa, &.{ dir, "run" }),
+            .terminfo_dir = try std.fs.path.join(gpa, &.{ dir, "terminfo" }),
             .session_exe = try std.fs.path.resolve(gpa, &.{ try std.process.currentPathAlloc(testing.io, arena.allocator()), build_options.txd_exe }),
             .session_log = c.open("/dev/null", .{ .ACCMODE = .WRONLY, .CLOEXEC = true }),
         };
@@ -101,6 +103,7 @@ const Login = struct {
         gpa.free(l.agent_path);
         gpa.free(l.authorized_keys);
         gpa.free(l.runtime_dir);
+        gpa.free(l.terminfo_dir);
         gpa.free(l.session_exe);
         _ = c.close(l.session_log);
         l.tmp.cleanup();
@@ -114,6 +117,7 @@ const Login = struct {
             .user = test_user,
             .authorized_keys = (&l.authorized_keys)[0..1],
             .runtime_dir = l.runtime_dir,
+            .terminfo_dir = l.terminfo_dir,
             .session_exe = l.session_exe,
             .session_log = l.session_log,
             .environ = environ,
@@ -963,6 +967,40 @@ test "rsync copies a directory with tx as its shell" {
     const small = try t.tmp.dir.readFileAlloc(testing.io, "to/sub/small", gpa, .unlimited);
     defer gpa.free(small);
     try testing.expectEqualStrings("small\n", small);
+}
+
+test "a new session finds the terminfo entry its client sent, or a common one" {
+    var es: ExecServer = undefined;
+    try es.init();
+    defer es.deinit();
+    const program =
+        \\if infocmp -x "$TERM" >/dev/null 2>&1; then echo "found $TERM"; else echo "no $TERM"; fi
+    ;
+    const entry =
+        \\tx-test-term|a terminal for tx's tests,
+        \\    am, cols#80, lines#24, clear=\E[H\E[2J,
+        \\
+    ;
+
+    for ([_]struct { []const u8, []const u8 }{
+        .{ entry, "found tx-test-term" },
+        // An entry that doesn't compile leaves a common TERM.
+        .{ "not terminfo\n", "found xterm-256color" },
+    }) |case| {
+        const source, const want = case;
+        var pty: TestPty = try .open();
+        defer pty.close();
+        var ct: ClientThread = .{ .options = es.login.clientOptions(&es.st, &pty, &.{es.login.key.public_key.toBytes()}) };
+        ct.options.term = "tx-test-term";
+        ct.options.terminfo = source;
+        ct.options.session_command = program;
+        try ct.start();
+        _ = try ct.join(&pty);
+        if (std.mem.indexOf(u8, pty.output.items, want) == null) {
+            std.debug.print("output: {s}\n", .{pty.output.items});
+            return error.TestUnexpectedResult;
+        }
+    }
 }
 
 test "a command before the login is refused" {
