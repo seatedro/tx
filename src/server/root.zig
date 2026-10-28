@@ -578,6 +578,34 @@ const NewSession = struct {
     terminfo: ?[]const u8 = null,
 };
 
+/// The colors from a client's `Attach`, copied out of the decoder's
+/// buffer.
+const Colors = struct {
+    foreground: ?u32 = null,
+    background: ?u32 = null,
+    palette: [16 * 4]u8 = undefined,
+    palette_len: usize = 0,
+    dark: ?bool = null,
+
+    fn of(m: proto.Attach) Colors {
+        var colors: Colors = .{ .foreground = m.foreground, .background = m.background, .dark = m.dark };
+        const palette = m.palette orelse "";
+        colors.palette_len = @min(palette.len, colors.palette.len);
+        @memcpy(colors.palette[0..colors.palette_len], palette[0..colors.palette_len]);
+        return colors;
+    }
+
+    /// `m` with these colors. It points into `colors`.
+    fn in(colors: *const Colors, m: proto.Attach) proto.Attach {
+        var with = m;
+        with.foreground = colors.foreground;
+        with.background = colors.background;
+        with.palette = if (colors.palette_len > 0) colors.palette[0..colors.palette_len] else null;
+        with.dark = colors.dark;
+        return with;
+    }
+};
+
 /// The `TERM` of a session whose client's terminfo entry can't be used.
 const fallback_term = "xterm-256color";
 
@@ -631,6 +659,8 @@ const Client = struct {
     exec: ?*Exec = null,
     /// From `Attach`, for the session it starts. Empty without one.
     terminfo: std.ArrayList(u8) = .empty,
+    /// From `Attach`, for every `Attach` sent to a session.
+    colors: Colors = .{},
     /// Stream bytes not yet consumed. The client's input waits while the
     /// session's channel is congested.
     held: usize = 0,
@@ -806,6 +836,7 @@ const Client = struct {
         if (client.upstream != null or client.query != null or client.exec != null) return client.fail(.protocol, "second attach");
 
         // Copied: a new session may start after the sessions answer.
+        client.colors = .of(m);
         if (m.terminfo) |source| {
             if (source.len > terminfo.max_source_len) return client.fail(.protocol, "terminfo entry too long");
             client.terminfo.appendSlice(client.server.gpa, source) catch return client.fail(.protocol, "out of memory");
@@ -879,8 +910,10 @@ const Client = struct {
             .resume_exporter = resume_exporter,
             .internal_revision = proto.internal_revision,
         } });
+        // Every `Attach` carries the client's colors, the server's own for
+        // a new session included.
         u.send(switch (first) {
-            .attach => |m| .{ .attach = m },
+            .attach => |m| .{ .attach = client.colors.in(m) },
             .@"resume" => |m| .{ .@"resume" = m },
         });
     }

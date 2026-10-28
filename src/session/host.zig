@@ -17,6 +17,7 @@ const Io = std.Io;
 const posix = std.posix;
 const c = std.c;
 const term = @import("term");
+const proto = @import("proto");
 const Wake = @import("wake").Wake;
 const pty_pkg = @import("pty.zig");
 
@@ -63,6 +64,9 @@ pub const Host = struct {
     /// Clear while a client is attached. Queries then reach the client's
     /// terminal in the client stream, and its replies arrive as input.
     answer_queries: bool = true,
+    /// The color scheme the last client's terminal reported, for
+    /// `CSI ? 996 n` while none is attached.
+    dark: ?bool = null,
     /// Set by `processOutput` once the program has exited and all its
     /// output is processed. Then call `reap`.
     finished: bool = false,
@@ -139,6 +143,7 @@ pub const Host = struct {
         // The primary's query replies go to the pty through the input queue.
         primary.context = self;
         primary.handler().effects.write_pty = &writePty;
+        primary.handler().effects.color_scheme = &colorScheme;
 
         self.thread = try std.Thread.spawn(.{}, threadMain, .{self});
         return self;
@@ -227,6 +232,37 @@ pub const Host = struct {
     pub fn resize(self: *Host, size: term.log.Resize) !void {
         try self.primary.resize(size);
         try self.pty.resize(ptySize(size));
+    }
+
+    /// The colors an attaching client's terminal reported (see
+    /// `proto.Attach.foreground`), as the primary's defaults. The primary
+    /// answers color queries with them while no client is attached, and
+    /// rebuilds don't carry them.
+    pub fn setColors(self: *Host, m: proto.Attach) void {
+        const colors = &self.primary.terminal.colors;
+        if (m.foreground) |rgb| colors.foreground.default = toRgb(rgb);
+        if (m.background) |rgb| colors.background.default = toRgb(rgb);
+        if (m.dark) |dark| self.dark = dark;
+
+        // Each entry is an index, then red, green and blue.
+        const entries = m.palette orelse return;
+        var palette = colors.palette.original.*;
+        var i: usize = 0;
+        while (i + 4 <= entries.len) : (i += 4) {
+            if (entries[i] >= 16) continue;
+            palette[entries[i]] = .{ .r = entries[i + 1], .g = entries[i + 2], .b = entries[i + 3] };
+        }
+        colors.palette.changeDefault(self.primary.gpa, palette) catch log.warn("palette dropped: out of memory", .{});
+    }
+
+    fn toRgb(rgb: u32) term.vt.color.RGB {
+        return .{ .r = @truncate(rgb >> 16), .g = @truncate(rgb >> 8), .b = @truncate(rgb) };
+    }
+
+    fn colorScheme(h: *term.primary.Handler) ?term.vt.device_status.ColorScheme {
+        const self: *Host = @ptrCast(@alignCast(Primary.fromHandler(h).context.?));
+        const dark = self.dark orelse return null;
+        return if (dark) .dark else .light;
     }
 
     fn writePty(h: *term.primary.Handler, data: []const u8) void {
@@ -476,6 +512,32 @@ test "primary answers queries through the pty" {
     try testing.expectEqual(pty_pkg.Term{ .exited = 0 }, try finish(host));
     // ESC [ 1 ; 3 R
     try testing.expect(screenContains(host, "reply:1b 5b 31 3b 33 52"));
+}
+
+test "with no client attached, the primary answers with the last client's colors" {
+    var environ = try testEnviron();
+    defer environ.deinit();
+    // The queries wait for `setColors`, as a program's would for an
+    // attach. Escapes print as E.
+    const host = try spawnTest(&environ,
+        \\stty -icanon -echo min 0 time 10
+        \\sleep 0.2
+        \\printf '\033]11;?\033\\\033]4;1;?\033\\\033[?996n'
+        \\reply=$(dd bs=1 count=128 2>/dev/null | tr '\033' E)
+        \\printf '\r\nreply:[%s]\r\n' "$reply"
+    );
+    defer host.destroy();
+    host.setColors(.{ .background = 0x102030, .palette = &.{ 1, 0xaa, 0xbb, 0xcc }, .dark = true });
+
+    try testing.expectEqual(pty_pkg.Term{ .exited = 0 }, try finish(host));
+    const text = try screenText(host);
+    defer testing.allocator.free(text);
+    for ([_][]const u8{ "11;rgb:1010/2020/3030", "4;1;rgb:aaaa/bbbb/cccc", "[?997;1n" }) |want| {
+        if (std.mem.indexOf(u8, text, want) == null) {
+            std.debug.print("screen: {s}\n", .{text});
+            return error.TestUnexpectedResult;
+        }
+    }
 }
 
 test "primary stays silent while answer_queries is clear" {

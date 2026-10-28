@@ -216,6 +216,14 @@ pub fn main(init: std.process.Init) !u8 {
     };
 
     const term = environ.get("TERM") orelse "xterm-256color";
+
+    // The terminal's colors, for the session's terminal to answer with
+    // while no client is attached.
+    var typed: std.ArrayList(u8) = .empty;
+    const colors: client.report.Colors = if (command == .attach and !std.mem.eql(u8, term, "dumb") and std.c.isatty(std.posix.STDIN_FILENO) != 0)
+        try client.report.ask(std.posix.STDIN_FILENO, &typed, arena)
+    else
+        .{};
     var options: client.session.Options = .{
         .servers = addresses,
         .host_keys = trusted.keys,
@@ -230,6 +238,8 @@ pub fn main(init: std.process.Init) !u8 {
         .show_session_id = session_command == null,
         .term = term,
         .terminfo = if (command == .attach) terminfoSource(arena, io, term) else null,
+        .colors = colors,
+        .typed = typed.items,
         .colorterm = environ.get("COLORTERM"),
         .locale = try localeVariables(arena, environ),
         .escape_char = args.escape_char,

@@ -99,9 +99,28 @@ pub const Attach = struct {
     /// The terminfo source for the client's `TERM`, as `infocmp -x` prints
     /// it, for a new session on a host that may lack the entry.
     terminfo: ?[]const u8 = null,
+    /// The client's terminal's colors, as `0xRRGGBB`, which the session's
+    /// terminal answers queries with while no client is attached. Null
+    /// where the terminal didn't say.
+    foreground: ?u32 = null,
+    background: ?u32 = null,
+    /// The base colors it reported, each as 4 bytes: index, red, green,
+    /// blue.
+    palette: ?[]const u8 = null,
+    /// Its color scheme is dark, or light.
+    dark: ?bool = null,
 
     pub const type_id = 3;
-    pub const tags = .{ .session_id = 1, .reuse = 2, .command = 3, .terminfo = 4 };
+    pub const tags = .{
+        .session_id = 1,
+        .reuse = 2,
+        .command = 3,
+        .terminfo = 4,
+        .foreground = 5,
+        .background = 6,
+        .palette = 7,
+        .dark = 8,
+    };
 
     pub fn encodedLen(m: Attach) usize {
         return bodyLen(Attach, m);

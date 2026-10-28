@@ -45,6 +45,7 @@ const auth = @import("auth");
 const Wake = @import("wake").Wake;
 const tty = @import("tty.zig");
 const escape = @import("escape.zig");
+const report = @import("report.zig");
 const passphrase = @import("passphrase.zig");
 const connect = @import("connect.zig");
 
@@ -94,6 +95,11 @@ pub const Options = struct {
     colorterm: ?[]const u8 = null,
     /// See `proto.Attach.terminfo`.
     terminfo: ?[]const u8 = null,
+    /// What the user's terminal reported about its colors (see `report`).
+    colors: report.Colors = .{},
+    /// What the user typed while tx asked the terminal, sent once
+    /// attached.
+    typed: []const u8 = "",
     /// See `proto.Hello.locale`.
     locale: ?[]const u8 = null,
     /// Null disables `~.`.
@@ -441,6 +447,9 @@ const Run = struct {
         errdefer r.decoder.deinit();
         r.wake.wait(loop, &r.wake_c, Run, r, onWake);
 
+        // Held as input typed before the attach is.
+        try r.held_input.appendSlice(gpa, options.typed[0..@min(options.typed.len, max_held_input)]);
+
         // From the start, so a terminating signal during the login ends it.
         // Restoring the saved attributes before raw mode turns echo back on
         // after a passphrase prompt.
@@ -772,12 +781,17 @@ const Run = struct {
         defer r.gpa.free(sig);
 
         r.send(.{ .auth_signature = .{ .user = r.options.user, .key = identity.key.blob(), .signature = sig } });
+        var palette_buf: [64]u8 = undefined;
         r.send(switch (r.options.command) {
             .attach => .{ .attach = .{
                 .session_id = r.options.session_id,
                 .reuse = r.options.reuse_detached,
                 .command = r.options.session_command,
                 .terminfo = r.options.terminfo,
+                .foreground = report.packRgb(r.options.colors.foreground),
+                .background = report.packRgb(r.options.colors.background),
+                .palette = report.paletteBytes(&r.options.colors, &palette_buf),
+                .dark = r.options.colors.dark,
             } },
             .list => .{ .list = .{} },
             .kill => |id| .{ .kill = .{ .session_id = id } },
