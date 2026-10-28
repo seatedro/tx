@@ -6,6 +6,10 @@
 //! server's own user only. Once logged in, the client sends `Attach`. The
 //! server answers with `HelloReply`, `AuthProbeReply` and `AuthOk`.
 //!
+//! With `Options.spa_key`, the server answers only clients that mark their
+//! first packets with the key, and sends nothing to anyone else (see
+//! `transport.spa`).
+//!
 //! Each session runs in a process of its own (see `session.process`),
 //! listening on a socket in the runtime directory (see `runtime_dir`). An
 //! attach starts one, or connects to one, and hands it a `Connect`
@@ -79,6 +83,9 @@ pub const Options = struct {
     idle_timeout_ns: u64 = 30 * std.time.ns_per_s,
     /// Limits on connections that haven't logged in.
     pending: transport.pending.Limits = .{},
+    /// Only clients with this key get an answer. Null answers any client.
+    /// See `transport.spa`.
+    spa_key: ?transport.spa.Key = null,
 };
 
 pub const ErrorCode = proto.ErrorCode;
@@ -117,6 +124,7 @@ pub const Server = struct {
     tls: transport.quic.Server,
     /// Shared by the endpoints.
     pending: transport.pending.Pending,
+    guard: ?transport.spa.Guard,
     /// One per address listened on. They don't move.
     endpoints: std.ArrayList(*Endpoint) = .empty,
     /// Endpoints whose address went away, freed once stopped.
@@ -151,6 +159,7 @@ pub const Server = struct {
             .options = options,
             .tls = try .init(options.identity),
             .pending = .init(gpa, options.pending),
+            .guard = if (options.spa_key) |key| .init(gpa, key) else null,
         };
         errdefer self.deinit();
 
@@ -197,6 +206,7 @@ pub const Server = struct {
             r.timer.deinit();
         }
         self.pending.deinit();
+        if (self.guard) |*g| g.deinit();
         self.tls.deinit();
         self.* = undefined;
     }
@@ -210,6 +220,7 @@ pub const Server = struct {
             .role = .{ .server = &self.tls },
             .idle_timeout_ns = self.options.idle_timeout_ns,
             .pending = &self.pending,
+            .guard = if (self.guard) |*g| g else null,
             .handler = .{
                 .ctx = self,
                 .connected = onConnected,

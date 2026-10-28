@@ -38,6 +38,8 @@ pub const Options = struct {
     keep_alive_ns: ?u64 = null,
     stream_window: u64 = 8 << 20,
     connection_window: u64 = 32 << 20,
+    /// The server's SPA key, if it has one. See `transport.spa`.
+    spa_key: ?*const transport.spa.Key = null,
     /// Gets the winner's events, and `closed` once every attempt failed.
     handler: Handler,
 };
@@ -196,6 +198,7 @@ pub const Racer = struct {
             .keep_alive_ns = r.options.keep_alive_ns,
             .stream_window = r.options.stream_window,
             .connection_window = r.options.connection_window,
+            .spa_key = r.options.spa_key,
             .handler = .{
                 .ctx = a,
                 .connected = onConnected,

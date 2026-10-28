@@ -12,6 +12,7 @@ const PosixAddress = Io.Threaded.PosixAddress;
 const Ed25519 = std.crypto.sign.Ed25519;
 const crypto = @import("crypto");
 const c = @import("c");
+const spa = @import("spa.zig");
 
 pub const Error = error{
     OutOfMemory,
@@ -211,6 +212,9 @@ pub const Connection = struct {
         /// Bytes the peer may send on all streams together ahead of
         /// `consume`.
         connection_window: u64 = 32 << 20,
+        /// Client only. Marks the connection's source ID with the key, so
+        /// that a server with an SPA key answers. See `spa`.
+        spa_key: ?*const spa.Key = null,
     };
 
     /// Error code carried by a CONNECTION_CLOSE frame.
@@ -242,7 +246,7 @@ pub const Connection = struct {
         };
 
         const dcid = randomCid(16);
-        const scid = randomCid(16);
+        const scid = if (options.spa_key) |key| cidOf(&spa.cid(io, key)) else randomCid(16);
         var settings = defaultSettings(io);
         if (options.handshake_timeout_ns) |ns| settings.handshake_timeout = ns;
         var params = defaultParams(options);
@@ -585,6 +589,13 @@ const Path = struct {
 
 fn now(io: Io) c.ngtcp2_tstamp {
     return @intCast(Io.Clock.awake.now(io).nanoseconds);
+}
+
+fn cidOf(bytes: []const u8) c.ngtcp2_cid {
+    var cid = std.mem.zeroes(c.ngtcp2_cid);
+    cid.datalen = bytes.len;
+    @memcpy(cid.data[0..bytes.len], bytes);
+    return cid;
 }
 
 fn randomCid(len: usize) c.ngtcp2_cid {

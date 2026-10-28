@@ -301,6 +301,7 @@ fn txModule(
         .link_libc = true,
     });
     mod.addImport("client", app.client);
+    mod.addImport("transport", app.transport);
     mod.addImport("auth", app.auth);
     mod.addImport("proto", app.proto);
     mod.addImport("build_options", info);
