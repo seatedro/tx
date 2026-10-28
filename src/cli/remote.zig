@@ -63,6 +63,9 @@ pub const default_port = 8739;
 pub const Source = struct {
     /// The ssh client.
     ssh: []const u8,
+    /// Options for it, given to tx running as ssh. tx's own come after,
+    /// and win.
+    ssh_options: []const []const u8 = &.{},
     /// `host` or `user@host`, as ssh takes it.
     destination: []const u8,
     /// A txd command given with `--server`. It runs as given, and is never
@@ -273,14 +276,17 @@ pub const Result = struct {
 fn runOverSsh(gpa: Allocator, io: Io, source: Source, command: []const u8, stdin: ?Io.File) !Result {
     // ssh asks for passwords and its own host keys on the terminal, not on
     // stdin. A copy is compressed on the way.
-    const argv: []const []const u8 = if (stdin != null)
-        &.{ source.ssh, "-T", "-C", "-o", "ConnectTimeout=10", "--", source.destination, command }
-    else
-        &.{ source.ssh, "-T", "-o", "ConnectTimeout=10", "--", source.destination, command };
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(gpa);
+    try argv.append(gpa, source.ssh);
+    try argv.appendSlice(gpa, source.ssh_options);
+    try argv.appendSlice(gpa, &.{ "-T", "-o", "ConnectTimeout=10" });
+    if (stdin != null) try argv.append(gpa, "-C");
+    try argv.appendSlice(gpa, &.{ "--", source.destination, command });
     var blocked: std.posix.sigset_t = undefined;
     _ = std.c.pthread_sigmask(std.posix.SIG.SETMASK, &source.signal_mask, &blocked);
     const spawned = std.process.spawn(io, .{
-        .argv = argv,
+        .argv = argv.items,
         .stdin = if (stdin) |file| .{ .file = file } else .ignore,
         .stdout = .pipe,
         .stderr = .inherit,

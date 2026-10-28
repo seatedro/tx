@@ -8,6 +8,10 @@
 //! tx takes ssh's options, as ssh reads them, so that tools that run ssh
 //! can run tx (see `args.zig`). `-p` is txd's port.
 //!
+//! Run as `ssh`, from a link named ssh ahead of ssh in PATH, tx takes ssh's
+//! place (see `Shim`): `-p` is sshd's port, the ssh tx runs gets the same
+//! options, and the real ssh runs in tx's place for what tx can't do.
+//!
 //! With none of `--attach`, `--new`, `--list` and `--kill`, tx attaches to
 //! the host's detached session if it has exactly one, and starts a session
 //! if it has none.
@@ -97,11 +101,20 @@ pub fn main(init: std.process.Init) !u8 {
     const arena = init.arena.allocator();
     const argv = try init.minimal.args.toSlice(arena);
 
+    const shim: ?Shim = if (Shim.named(argv[0])) .{
+        .ssh = Shim.findSsh(arena, io, environ) catch |err| return fail("can't find ssh in PATH: {t}", .{err}),
+        .argv = argv,
+        .signal_mask = signal_mask,
+    } else null;
+
     const args = switch (try args_pkg.parse(arena, argv[1..])) {
         .ok => |a| a,
-        .usage => |problem| return usage(problem),
-        .unsupported => |option| return fail("{s} isn't supported", .{option}),
+        // ssh says what's wrong in its own words.
+        .usage => |problem| return if (shim) |sh| sh.run(io, null) else usage(problem),
+        .unsupported => |option| return if (shim) |sh| sh.run(io, null) else fail("{s} isn't supported", .{option}),
     };
+    // ssh describes itself and its configuration.
+    if (shim) |sh| if (args.version or args.print_config) return sh.run(io, null);
     if (args.version) {
         Io.File.stdout().writeStreamingAll(io, "tx " ++ build_options.version ++ "\n") catch return 255;
         return 0;
@@ -110,7 +123,8 @@ pub fn main(init: std.process.Init) !u8 {
 
     const host = args.host;
     const user = args.user;
-    const port = args.port orelse default_port;
+    // As ssh, `-p` is sshd's.
+    const port = if (shim != null) default_port else args.port orelse default_port;
     if (args.print_config) return printConfig(io, environ, args);
 
     // What to do once logged in. A command runs in a session of its own
@@ -133,7 +147,8 @@ pub fn main(init: std.process.Init) !u8 {
     var ssh_buf: [512]u8 = undefined;
     const ssh_destination = if (user) |u| std.fmt.bufPrint(&ssh_buf, "{s}@{s}", .{ u, host }) catch host else host;
     const ssh: remote.Source = .{
-        .ssh = args.ssh_path,
+        .ssh = if (shim) |sh| sh.ssh else args.ssh_path,
+        .ssh_options = if (shim != null) args.ssh_options else &.{},
         .destination = ssh_destination,
         .server_command = args.server_command,
         .port = port,
@@ -176,13 +191,19 @@ pub fn main(init: std.process.Init) !u8 {
     const key_files = if (args.key_files.len > 0) args.key_files else &default_key_files;
     var identities = try findIdentities(gpa, io, environ, agent_path, key_files);
     defer identities.deinit(gpa);
-    if (identities.list.items.len == 0) return fail("no keys to log in with: the SSH agent has no Ed25519 or RSA keys, and there is no ~/.ssh/id_ed25519", .{});
+    if (identities.list.items.len == 0) {
+        if (shim) |sh| return sh.run(io, "tx has no key to log in with");
+        return fail("no keys to log in with: the SSH agent has no Ed25519 or RSA keys, and there is no ~/.ssh/id_ed25519", .{});
+    }
 
     // The keys known_hosts lists for the host, or the one the user accepts.
     const ssh_spa_key: SshSpaKey = .{ .path = tx_spa_keys, .name = known_name, .host = host };
-    const trusted = trustedKeys(gpa, io, environ, tx_known_hosts, known_name, addresses, ssh, ssh_spa_key) catch |err| switch (err) {
-        error.Declined => return 255,
-        else => return fail("checking the host key failed: {t}", .{err}),
+    const trusted = trustedKeys(gpa, io, environ, tx_known_hosts, known_name, addresses, ssh, ssh_spa_key) catch |err| {
+        if (shim) |sh| return sh.run(io, if (err == error.Declined) "txd isn't installed there" else "can't check txd's host key");
+        return switch (err) {
+            error.Declined => 255,
+            else => fail("checking the host key failed: {t}", .{err}),
+        };
     };
     defer gpa.free(trusted.keys);
 
@@ -219,7 +240,7 @@ pub fn main(init: std.process.Init) !u8 {
     if (outcome == .no_connection and install == .not_run) {
         std.debug.print("tx: nothing answers on {s} port {d}; starting txd over ssh\n", .{ host, port });
         install = installOverSsh(gpa, io, ssh, ssh_spa_key, &options.spa_key);
-        if (install == .declined) return 255;
+        if (install == .declined) return if (shim) |sh| sh.run(io, "txd isn't installed there") else 255;
         if (install == .done) outcome = client.session.run(gpa, io, options) catch |err| return fail("{t}", .{err});
     }
 
@@ -236,6 +257,7 @@ pub fn main(init: std.process.Init) !u8 {
             return 0;
         },
         .no_connection => |reason| {
+            if (shim) |sh| return sh.run(io, "nothing answers on txd's port");
             if (install == .done) return fail("txd is running on {s}, but nothing answers on UDP port {d}. A firewall may be blocking it.", .{ host, port });
             return fail("can't connect to {s} port {d}: {t}", .{ host, port, reason });
         },
@@ -296,6 +318,51 @@ test localeVariables {
     try std.testing.expect(std.mem.indexOf(u8, items, "LANG=en_US.UTF-8\x00") != null);
     try std.testing.expect(std.mem.indexOf(u8, items, "LC_TIME=en_GB.UTF-8\x00") != null);
 }
+
+/// tx run as `ssh`. The real ssh runs, with tx's arguments, what tx can't:
+/// options tx lacks, usage errors, `-V` and `-G`, and hosts where txd isn't
+/// there to use.
+const Shim = struct {
+    /// The first ssh in PATH that isn't tx.
+    ssh: []const u8,
+    /// tx's arguments, which ssh gets.
+    argv: []const []const u8,
+    /// See `remote.Source.signal_mask`.
+    signal_mask: std.posix.sigset_t,
+
+    fn named(arg0: []const u8) bool {
+        return std.mem.eql(u8, std.fs.path.basename(arg0), "ssh");
+    }
+
+    fn findSsh(arena: Allocator, io: Io, environ: *const std.process.Environ.Map) ![]const u8 {
+        const self = try std.process.executablePathAlloc(io, arena);
+        var dirs = std.mem.tokenizeScalar(u8, environ.get("PATH") orelse return error.NoPath, ':');
+        while (dirs.next()) |dir| {
+            const path = try std.fs.path.join(arena, &.{ dir, "ssh" });
+            const real = Io.Dir.cwd().realPathFileAlloc(io, path, arena) catch continue;
+            if (std.mem.eql(u8, real, self)) continue;
+            Io.Dir.cwd().access(io, path, .{ .execute = true }) catch continue;
+            return path;
+        }
+        return error.FileNotFound;
+    }
+
+    /// Runs ssh in tx's place, saying why, if there's a reason to give.
+    /// Returns only if that fails.
+    fn run(sh: Shim, io: Io, why: ?[]const u8) u8 {
+        if (why) |reason| std.debug.print("tx: {s}; running ssh\n", .{reason});
+        var argv_buf: [256][]const u8 = undefined;
+        if (sh.argv.len > argv_buf.len) return fail("too many arguments", .{});
+        argv_buf[0] = sh.ssh;
+        @memcpy(argv_buf[1..sh.argv.len], sh.argv[1..]);
+
+        // ssh starts with the signal mask tx was given.
+        var blocked: std.posix.sigset_t = undefined;
+        _ = std.c.pthread_sigmask(std.posix.SIG.SETMASK, &sh.signal_mask, &blocked);
+        const err = std.process.replace(io, .{ .argv = argv_buf[0..sh.argv.len] });
+        return fail("can't run {s}: {t}", .{ sh.ssh, err });
+    }
+};
 
 /// One line per session, under a header.
 fn printListing(io: Io, listed: []const client.session.Outcome.Listed) !void {
