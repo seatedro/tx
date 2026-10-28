@@ -109,6 +109,10 @@ pub const Attach = struct {
     palette: ?[]const u8 = null,
     /// Its color scheme is dark, or light.
     dark: ?bool = null,
+    /// With `command`, the program gets SIGHUP when its client goes, as
+    /// under ssh: when the client closes its connection, or doesn't resume
+    /// within a grace period after losing it.
+    hangup: bool = false,
 
     pub const type_id = 3;
     pub const tags = .{
@@ -120,6 +124,7 @@ pub const Attach = struct {
         .background = 6,
         .palette = 7,
         .dark = 8,
+        .hangup = 9,
     };
 
     pub fn encodedLen(m: Attach) usize {

@@ -291,6 +291,13 @@ pub const Pty = struct {
         return posix.kill(self.pid orelse return error.ProcessNotFound, sig);
     }
 
+    /// Sends `sig` to the child's process group: the child, which leads
+    /// it, and the commands a non-interactive shell runs. An interactive
+    /// shell's jobs are in groups of their own.
+    pub fn killGroup(self: *Pty, sig: posix.SIG) KillError!void {
+        return posix.kill(-(self.pid orelse return error.ProcessNotFound), sig);
+    }
+
     /// Blocks until the child exits and reaps it. After that, returns the
     /// saved Term.
     pub fn wait(self: *Pty) WaitError!Term {

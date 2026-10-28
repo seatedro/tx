@@ -37,6 +37,10 @@ const rebuild_part = 256 << 10;
 /// How long `stop` and `kill` give a program to exit after SIGHUP.
 pub const stop_grace_ms = 1000;
 
+/// How long a session whose program gets SIGHUP with its client (see
+/// `proto.Attach.hangup`) waits for a client that lost its connection.
+pub const hangup_grace_ms = 5 * 60 * 1000;
+
 /// Bounds on a client's terminal size. libghostty-vt asserts on zero, and
 /// the size sets how much memory the primary terminal allocates.
 const max_cols = 1024;
@@ -153,6 +157,14 @@ pub const Session = struct {
     /// Sends SIGKILL after `kill`.
     kill_timer: xev.Timer,
     kill_c: xev.Completion = .{},
+    /// The program gets SIGHUP when its client goes (see `disconnect`).
+    hangup: bool = false,
+    /// Waits `hangup_grace_ms` for a client that lost its connection.
+    hangup_timer: xev.Timer,
+    hangup_c: xev.Completion = .{},
+    hangup_cancel_c: xev.Completion = .{},
+    /// When the last client went, on `Io.Clock.boot`.
+    detached_at: Io.Timestamp = .zero,
     /// On `Io.Clock.boot`.
     started: Io.Timestamp,
     /// The program exited and the client got `Exit`.
@@ -168,6 +180,8 @@ pub const Session = struct {
         errdefer grace.deinit();
         var kill_timer: xev.Timer = try .init();
         errdefer kill_timer.deinit();
+        var hangup_timer: xev.Timer = try .init();
+        errdefer hangup_timer.deinit();
 
         // The host's thread can notify as soon as it starts. `wake` has to
         // exist first.
@@ -182,6 +196,7 @@ pub const Session = struct {
             .wake = wake,
             .grace = grace,
             .kill_timer = kill_timer,
+            .hangup_timer = hangup_timer,
         };
         s.host = try Host.create(gpa, io, .{
             .argv = options.argv,
@@ -206,6 +221,7 @@ pub const Session = struct {
         s.wake.deinit();
         s.grace.deinit();
         s.kill_timer.deinit();
+        s.hangup_timer.deinit();
         s.gpa.destroy(s);
     }
 
@@ -221,8 +237,12 @@ pub const Session = struct {
         const remote = c.remote[0..@min(c.remote.len, s.remote_buf.len)];
 
         // The colors this client's terminal answers with, for the primary
-        // to answer with while it's gone.
-        if (first == .attach) s.host.setColors(first.attach);
+        // to answer with while it's gone. A new session's first attach
+        // says whether the program goes with its client.
+        if (first == .attach) {
+            s.host.setColors(first.attach);
+            if (s.fresh) s.hangup = first.attach.hangup;
+        }
 
         const start: Start, const how: How = switch (first) {
             .attach => if (s.fresh) .{ .new, .attached } else .{ .{ .rebuild = .attach }, .attached },
@@ -297,9 +317,43 @@ pub const Session = struct {
         }
     }
 
-    /// The attached client went away. The session keeps running.
-    pub fn disconnect(s: *Session) void {
+    /// The attached client went away, having said it was leaving if
+    /// `left`. The session keeps running, unless its program goes with its
+    /// client: it gets SIGHUP now if the client left, and otherwise if no
+    /// client comes back within `hangup_grace_ms`.
+    pub fn disconnect(s: *Session, left: bool) void {
         s.detach();
+        if (!s.hangup) return;
+        if (left) return s.hangUp();
+        s.detached_at = Io.Clock.boot.now(s.io);
+        if (s.hangup_c.state() != .active) s.hangup_timer.run(s.loop, &s.hangup_c, hangup_grace_ms, Session, s, onHangupTimer);
+    }
+
+    fn hangUp(s: *Session) void {
+        if (s.ended) return;
+        log.info("session {d}: its client is gone, so its program gets SIGHUP", .{s.id});
+        s.host.pty.killGroup(.HUP) catch {};
+    }
+
+    fn onHangupTimer(s_: ?*Session, _: *xev.Loop, _: *xev.Completion, result: xev.Timer.RunError!void) xev.CallbackAction {
+        const s = s_.?;
+        result catch {
+            s.freeIfEnded();
+            return .disarm;
+        };
+        if (s.ended or s.link != null) {
+            s.freeIfEnded();
+            return .disarm;
+        }
+
+        // A client may have come and gone since the timer started.
+        const gone_ms = s.detached_at.durationTo(Io.Clock.boot.now(s.io)).toMilliseconds();
+        if (gone_ms < hangup_grace_ms) {
+            s.hangup_timer.run(s.loop, &s.hangup_c, @intCast(hangup_grace_ms - gone_ms), Session, s, onHangupTimer);
+            return .disarm;
+        }
+        s.hangUp();
+        return .disarm;
     }
 
     /// The link is no longer congested.
@@ -465,6 +519,12 @@ pub const Session = struct {
         s.ended = true;
         if (s.ended_callback) |cb| cb.call(cb.context, s);
 
+        // Nothing is left to hang up.
+        if (s.hangup_c.state() == .active and s.hangup_cancel_c.state() != .active) {
+            s.hangup_cancel_c = .{ .op = .{ .cancel = .{ .c = &s.hangup_c } } };
+            s.loop.add(&s.hangup_cancel_c);
+        }
+
         // `end` may run outside `onWake`, from `drained`. The notification
         // makes `onWake` run and free the session.
         s.wake.notify() catch {};
@@ -484,7 +544,7 @@ pub const Session = struct {
     /// After `stop`: the grace period is over and the program still runs.
     /// The owner destroys the session, which kills it.
     pub fn stopped(s: *const Session) bool {
-        return s.grace_over and !s.ended and s.wake_c.state() == .dead and s.grace_c.state() == .dead and s.kill_c.state() == .dead;
+        return s.grace_over and !s.ended and s.wake_c.state() == .dead and s.grace_c.state() == .dead and s.kill_c.state() == .dead and s.hangup_c.state() == .dead;
     }
 
     /// Sends the program SIGHUP, and SIGKILL if it is still running after
@@ -514,7 +574,8 @@ pub const Session = struct {
     /// Frees an ended session once no completion holds a pointer to it. A
     /// session that hasn't ended is destroyed by its owner.
     fn freeIfEnded(s: *Session) void {
-        if (s.ended and s.wake_c.state() == .dead and s.grace_c.state() == .dead and s.kill_c.state() == .dead) s.destroy();
+        if (s.ended and s.wake_c.state() == .dead and s.grace_c.state() == .dead and s.kill_c.state() == .dead and
+            s.hangup_c.state() == .dead and s.hangup_cancel_c.state() == .dead) s.destroy();
     }
 };
 
@@ -603,7 +664,7 @@ const TestSession = struct {
     /// first.
     fn deinit(t: *TestSession) void {
         if (!t.ended) {
-            t.session.disconnect();
+            t.session.disconnect(false);
             t.session.kill();
             t.runUntil(endedCheck) catch {};
         }
@@ -684,7 +745,7 @@ test "a resume needs the proof for its connection, and continues from its seq" {
         }
     }.f);
     const seq = t.session.next_seq;
-    t.session.disconnect();
+    t.session.disconnect(false);
 
     // A proof made for another connection's exporter.
     const exporter: [auth.resume_.exporter_len]u8 = @splat(1);

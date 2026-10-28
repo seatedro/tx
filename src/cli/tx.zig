@@ -22,9 +22,11 @@
 //! status.
 //!
 //! With `-t`, the command runs on a terminal: it is a new session's
-//! program, attached as any session is. Unlike with ssh, it keeps running
-//! when tx detaches or loses the connection, and `--attach` reattaches it.
-//! `-T`, no terminal, is the default, and is accepted for ssh's sake.
+//! program, attached as any session is. As with ssh, it gets SIGHUP when
+//! tx goes: at once when tx exits or detaches, and after a grace period
+//! when the connection is lost and tx doesn't come back (see
+//! `session.session.hangup_grace_ms`). `-T`, no terminal, is the default,
+//! and is accepted for ssh's sake.
 //!
 //! The server's key is checked against `~/.config/tx/known_hosts` and
 //! `~/.ssh/known_hosts`. For a host in neither, tx reads the key over ssh
@@ -265,8 +267,10 @@ pub fn main(init: std.process.Init) !u8 {
             // default.
             var port_buf: [16]u8 = undefined;
             const port_arg = if (port == default_port) "" else std.fmt.bufPrint(&port_buf, "-p {d} ", .{port}) catch unreachable;
-            // Before the attach, there's no session to come back to.
+            // Before the attach, there's no session to come back to, and a
+            // command on a terminal got SIGHUP.
             const n = id orelse return fail("interrupted before the session started", .{});
+            if (session_command != null) return 255;
             std.debug.print("tx: detached from session {d}; reattach with tx {s}--attach {d} {s}\n", .{ n, port_arg, n, ssh_destination });
             return 0;
         },

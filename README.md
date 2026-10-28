@@ -16,16 +16,16 @@ tx is early and changes often. Don't rely on it yet.
     tx --kill ID HOST       # end session ID
     tx --uninstall HOST     # end the sessions, and remove txd from HOST
     tx HOST COMMAND...      # run COMMAND, as ssh does
-    tx -t HOST COMMAND...   # run COMMAND on a terminal, as a session
+    tx -t HOST COMMAND...   # run COMMAND on a terminal, as ssh -t does
 
 tx takes ssh's options, read as ssh reads them, so tools that run ssh can
 run tx: `GIT_SSH_COMMAND=tx git clone ssh://host/repo`, `rsync -e tx`. `-p`
 is txd's port. Options for features tx lacks, such as `-L`, are refused.
 
 Linked as `ssh` in a directory ahead of ssh in `PATH`, tx takes ssh's
-place: `-p` is then sshd's port, the ssh that tx runs for installs gets the
-same options, and the real ssh runs instead for what tx can't do, such as
-`-L`, or a host without txd.
+place: `-p` is then sshd's port, and txd keeps its own, 8739. The ssh that
+tx runs for installs gets the same options, and the real ssh runs instead
+for what tx can't do, such as `-L`, or a host without txd.
 
     ln -s "$(command -v tx)" ~/.local/bin/ssh
 
