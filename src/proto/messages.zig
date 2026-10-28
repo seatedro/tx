@@ -92,9 +92,13 @@ pub const Attach = struct {
     /// exactly one, and starts one if there is none. With several, the
     /// server answers `Error` with `several_detached`.
     reuse: bool = false,
+    /// A new session runs this with the user's shell's `-c`, in place of
+    /// the shell, as `tx -t HOST COMMAND` does. Only without `session_id`
+    /// and `reuse`.
+    command: ?[]const u8 = null,
 
     pub const type_id = 3;
-    pub const tags = .{ .session_id = 1, .reuse = 2 };
+    pub const tags = .{ .session_id = 1, .reuse = 2, .command = 3 };
 
     pub fn encodedLen(m: Attach) usize {
         return bodyLen(Attach, m);

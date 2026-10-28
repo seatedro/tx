@@ -497,8 +497,9 @@ pub const Server = struct {
     }
 
     /// Starts a session process for the client that said `hello`, and
-    /// returns the channel to it, with `Start` sent.
-    fn startSession(self: *Server, hello: *const Hello, handler: session.channel.Handler) !*Channel {
+    /// returns the channel to it, with `Start` sent. The session runs
+    /// `command` with the shell's `-c`, or the login shell.
+    fn startSession(self: *Server, hello: *const Hello, command: ?[]const u8, handler: session.channel.Handler) !*Channel {
         const id = try self.newId();
         var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena_state.deinit();
@@ -516,7 +517,8 @@ pub const Server = struct {
         var it = environ.iterator();
         while (it.next()) |entry| try environ_list.print(arena, "{s}={s}\x00", .{ entry.key_ptr.*, entry.value_ptr.* });
         var argv_list: std.ArrayList(u8) = .empty;
-        for (self.options.argv) |arg| try argv_list.print(arena, "{s}\x00", .{arg});
+        const argv: []const []const u8 = if (command) |cmd| &.{ std.fs.path.basename(self.options.shell), "-c", cmd } else self.options.argv;
+        for (argv) |arg| try argv_list.print(arena, "{s}\x00", .{arg});
 
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const socket_path = try self.socketPath(&path_buf, id);
@@ -532,7 +534,7 @@ pub const Server = struct {
             .session_id = id,
             .socket_path = socket_path,
             .argv = argv_list.items,
-            .program = self.options.program,
+            .program = if (command != null) self.options.shell else self.options.program,
             .cwd = switch (self.options.cwd) {
                 .path => |path| path,
                 else => null,
@@ -772,7 +774,13 @@ const Client = struct {
 
     fn onAttach(client: *Client, m: proto.Attach) void {
         if (client.hello == null) return client.fail(.protocol, "attach before hello");
-        if (client.upstream != null or client.query != null) return client.fail(.protocol, "second attach");
+        if (client.upstream != null or client.query != null or client.exec != null) return client.fail(.protocol, "second attach");
+
+        // A command runs in a new session.
+        if (m.command) |command| {
+            if (m.session_id != null or m.reuse) return client.fail(.protocol, "a command needs a new session");
+            return client.startNew(command);
+        }
 
         // An ID reattaches, and so does `reuse` with one detached session,
         // once the sessions have answered. Otherwise a new session starts,
@@ -782,11 +790,11 @@ const Client = struct {
             return client.connectTo(fd, null, .{ .attach = m });
         }
         if (m.reuse) return client.startQuery(.reuse);
-        client.startNew();
+        client.startNew(null);
     }
 
-    fn startNew(client: *Client) void {
-        const ch = client.server.startSession(&client.hello.?, client.upstreamHandler()) catch |err| {
+    fn startNew(client: *Client, command: ?[]const u8) void {
+        const ch = client.server.startSession(&client.hello.?, command, client.upstreamHandler()) catch |err| {
             log.warn("starting a session failed: {t}", .{err});
             return client.fail(.spawn, "can't start the session");
         };
@@ -905,8 +913,8 @@ const Client = struct {
             w.writeAll(" are detached") catch {};
             return client.fail(.several_detached, w.buffered());
         }
-        const id = found orelse return client.startNew();
-        const fd = client.server.connectSession(id) orelse return client.startNew();
+        const id = found orelse return client.startNew(null);
+        const fd = client.server.connectSession(id) orelse return client.startNew(null);
         client.connectTo(fd, null, .{ .attach = .{} });
     }
 
