@@ -266,6 +266,8 @@ pub const ErrorCode = enum(u32) {
     attached_elsewhere = 7,
     /// `Attach` with `reuse` found more than one detached session.
     several_detached = 8,
+    /// The session's process ended without the program exiting.
+    session_lost = 9,
 };
 
 pub const Error = struct {
@@ -455,9 +457,11 @@ pub const SessionInfo = struct {
     attached_from: ?[]const u8 = null,
     /// The title the program set, if any.
     title: ?[]const u8 = null,
+    /// The session process's pid.
+    pid: ?u64 = null,
 
     pub const type_id = 19;
-    pub const tags = .{ .session_id = 1, .cols = 2, .rows = 3, .running_s = 4, .attached_from = 5, .title = 6 };
+    pub const tags = .{ .session_id = 1, .cols = 2, .rows = 3, .running_s = 4, .attached_from = 5, .title = 6, .pid = 7 };
 
     pub fn encodedLen(m: SessionInfo) usize {
         return bodyLen(SessionInfo, m);
@@ -530,6 +534,12 @@ pub const Killed = struct {
     }
 };
 
+/// The revision of the messages between txd and its session processes,
+/// from `Connect` on. A session process refuses `Start` and `Connect` from
+/// another revision. `List` and `Kill` stay as they are, so that any txd
+/// can list and end any session.
+pub const internal_revision: u32 = 0;
+
 /// Describes the client about to attach. txd sends it to a session before
 /// the client's `Attach` or `Resume`. Message types from 1000 on are txd's
 /// own, and txd refuses them from clients.
@@ -544,9 +554,10 @@ pub const Connect = struct {
     /// The client connection's TLS exporter value for `auth.resume_`,
     /// which a `Resume` proof is checked against.
     resume_exporter: ?[]const u8 = null,
+    internal_revision: u32 = 0,
 
     pub const type_id = 1000;
-    pub const tags = .{ .remote = 1, .cols = 2, .rows = 3, .cell_width_px = 4, .cell_height_px = 5, .resume_exporter = 6 };
+    pub const tags = .{ .remote = 1, .cols = 2, .rows = 3, .cell_width_px = 4, .cell_height_px = 5, .resume_exporter = 6, .internal_revision = 7 };
 
     pub fn encodedLen(m: Connect) usize {
         return bodyLen(Connect, m);
@@ -558,6 +569,146 @@ pub const Connect = struct {
 
     pub fn decode(bytes: []const u8) DecodeError!Connect {
         return decodeBody(Connect, bytes);
+    }
+};
+
+/// Starts a session. txd sends it first, on the socket a new session
+/// process inherits. Lists are NUL-terminated items, one after another.
+pub const Start = struct {
+    session_id: u64,
+    /// Where the session process listens (see `server.runtime_dir`).
+    socket_path: []const u8,
+    /// The program's argv.
+    argv: []const u8,
+    /// See `session.pty.Options`.
+    program: ?[]const u8 = null,
+    cwd: ?[]const u8 = null,
+    /// The program's environment, as `NAME=value` items.
+    environ: []const u8,
+    cols: u16,
+    rows: u16,
+    cell_width_px: ?u32 = null,
+    cell_height_px: ?u32 = null,
+    /// See `session.host.Options.TerminalOptions`. Null is no limit.
+    max_scrollback_bytes: ?u64 = null,
+    max_scrollback_lines: ?u64 = null,
+    kitty_image_storage_limit: u64,
+    log_capacity: u64,
+    internal_revision: u32 = 0,
+
+    pub const type_id = 1001;
+    pub const tags = .{
+        .session_id = 1,
+        .socket_path = 2,
+        .argv = 3,
+        .program = 4,
+        .cwd = 5,
+        .environ = 6,
+        .cols = 7,
+        .rows = 8,
+        .cell_width_px = 9,
+        .cell_height_px = 10,
+        .max_scrollback_bytes = 11,
+        .max_scrollback_lines = 12,
+        .kitty_image_storage_limit = 13,
+        .log_capacity = 14,
+        .internal_revision = 15,
+    };
+
+    pub fn encodedLen(m: Start) usize {
+        return bodyLen(Start, m);
+    }
+
+    pub fn encode(m: Start, w: *Writer) Writer.Error!void {
+        return encodeBody(Start, m, w);
+    }
+
+    pub fn decode(bytes: []const u8) DecodeError!Start {
+        return decodeBody(Start, bytes);
+    }
+};
+
+/// The session process is running its program. A process that can't start
+/// it answers `Start` with `Error` instead.
+pub const Started = struct {
+    pid: u64,
+
+    pub const type_id = 1002;
+    pub const tags = .{ .pid = 1 };
+
+    pub fn encodedLen(m: Started) usize {
+        return bodyLen(Started, m);
+    }
+
+    pub fn encode(m: Started, w: *Writer) Writer.Error!void {
+        return encodeBody(Started, m, w);
+    }
+
+    pub fn decode(bytes: []const u8) DecodeError!Started {
+        return decodeBody(Started, bytes);
+    }
+};
+
+/// Asks a session for its primary terminal's state, for tests.
+pub const Dump = struct {
+    pub const type_id = 1003;
+    pub const tags = .{};
+
+    pub fn encodedLen(m: Dump) usize {
+        return bodyLen(Dump, m);
+    }
+
+    pub fn encode(m: Dump, w: *Writer) Writer.Error!void {
+        return encodeBody(Dump, m, w);
+    }
+
+    pub fn decode(bytes: []const u8) DecodeError!Dump {
+        return decodeBody(Dump, bytes);
+    }
+};
+
+pub const DumpReply = struct {
+    /// See `term.state.dump`.
+    state: []const u8,
+    /// The visible text.
+    text: []const u8,
+    cols: u16,
+    rows: u16,
+
+    pub const type_id = 1004;
+    pub const tags = .{ .state = 1, .text = 2, .cols = 3, .rows = 4 };
+
+    pub fn encodedLen(m: DumpReply) usize {
+        return bodyLen(DumpReply, m);
+    }
+
+    pub fn encode(m: DumpReply, w: *Writer) Writer.Error!void {
+        return encodeBody(DumpReply, m, w);
+    }
+
+    pub fn decode(bytes: []const u8) DecodeError!DumpReply {
+        return decodeBody(DumpReply, bytes);
+    }
+};
+
+/// Bytes for a session's program, as if an attached client had typed them,
+/// for tests.
+pub const Inject = struct {
+    bytes: []const u8,
+
+    pub const type_id = 1005;
+    pub const tags = .{ .bytes = 1 };
+
+    pub fn encodedLen(m: Inject) usize {
+        return bodyLen(Inject, m);
+    }
+
+    pub fn encode(m: Inject, w: *Writer) Writer.Error!void {
+        return encodeBody(Inject, m, w);
+    }
+
+    pub fn decode(bytes: []const u8) DecodeError!Inject {
+        return decodeBody(Inject, bytes);
     }
 };
 
@@ -585,6 +736,11 @@ pub const Message = union(enum) {
     kill: Kill,
     killed: Killed,
     connect: Connect,
+    start: Start,
+    started: Started,
+    dump: Dump,
+    dump_reply: DumpReply,
+    inject: Inject,
     /// A message type this revision does not define.
     unknown: Unknown,
 
@@ -805,13 +961,30 @@ test "every message round trips" {
         .{ .@"resume" = .{ .session_id = 3, .proof = "" } },
         .{ .attach = .{ .reuse = true } },
         .{ .list = .{} },
-        .{ .session_info = .{ .session_id = 2, .cols = 80, .rows = 24, .running_s = 3600, .attached_from = "127.0.0.1:5000", .title = "vim" } },
+        .{ .session_info = .{ .session_id = 2, .cols = 80, .rows = 24, .running_s = 3600, .attached_from = "127.0.0.1:5000", .title = "vim", .pid = 99 } },
         .{ .session_info = .{ .session_id = 3, .cols = 80, .rows = 24, .running_s = 0 } },
         .{ .list_end = .{} },
         .{ .kill = .{ .session_id = 2 } },
         .{ .killed = .{ .session_id = 2 } },
         .{ .connect = .{ .remote = "[::1]:5000", .cols = 80, .rows = 24, .cell_width_px = 9, .cell_height_px = 18, .resume_exporter = "exporter" } },
         .{ .connect = .{ .remote = "", .cols = 1, .rows = 1 } },
+        .{ .start = .{
+            .session_id = 4,
+            .socket_path = "/run/user/1000/tx/4.sock",
+            .argv = "-zsh\x00",
+            .program = "/bin/zsh",
+            .cwd = "/home/rohit",
+            .environ = "TERM=xterm\x00HOME=/home/rohit\x00",
+            .cols = 80,
+            .rows = 24,
+            .max_scrollback_bytes = 1 << 20,
+            .kitty_image_storage_limit = 0,
+            .log_capacity = 4096,
+        } },
+        .{ .started = .{ .pid = 4321 } },
+        .{ .dump = .{} },
+        .{ .dump_reply = .{ .state = "state", .text = "text", .cols = 80, .rows = 24 } },
+        .{ .inject = .{ .bytes = "ls\r" } },
         .{ .unknown = .{ .type_id = 1999, .body = "\x01\x00" } },
     };
     var buf: [256]u8 = undefined;

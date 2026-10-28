@@ -31,6 +31,9 @@ pub const ErrorCode = messages.ErrorCode;
 pub const SessionInfo = messages.SessionInfo;
 pub const Kill = messages.Kill;
 pub const Connect = messages.Connect;
+pub const Start = messages.Start;
+pub const DumpReply = messages.DumpReply;
+pub const internal_revision = messages.internal_revision;
 
 pub const Decoder = frame.Decoder;
 pub const encode = frame.encode;

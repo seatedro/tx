@@ -668,14 +668,14 @@ fn aboveStdio(fd: posix.fd_t) SpawnError!posix.fd_t {
 
 /// One past the highest fd the child may have inherited, for closeFrom's
 /// fallback.
-fn maxFd() posix.fd_t {
+pub fn maxFd() posix.fd_t {
     var limit: posix.rlimit = undefined;
     if (c.getrlimit(.NOFILE, &limit) != 0) return max_fd_limit;
     return @intCast(@min(limit.cur, max_fd_limit));
 }
 
 /// Async-signal-safe. Listing /proc/self/fd or /dev/fd would allocate.
-fn closeFrom(first: posix.fd_t, max_fd: posix.fd_t) void {
+pub fn closeFrom(first: posix.fd_t, max_fd: posix.fd_t) void {
     if (native_os == .linux) {
         const linux = std.os.linux;
         if (linux.errno(linux.close_range(first, std.math.maxInt(posix.fd_t), .{ .UNSHARE = false, .CLOEXEC = false })) == .SUCCESS) return;
