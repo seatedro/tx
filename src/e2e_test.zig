@@ -21,6 +21,7 @@ const term = @import("term");
 const proto = @import("proto");
 const auth = @import("auth");
 const build_options = @import("build_options");
+const fuzz = @import("fuzz");
 
 const gpa = testing.allocator;
 const timeout_ms = 10_000;
@@ -1263,6 +1264,127 @@ test "attaching before login is refused" {
 
 const raw_hello: proto.Hello = .{ .revision = proto.revision, .term = "xterm-256color", .cols = 80, .rows = 24 };
 
+test "a client that sends more after the server's error is closed when its stream ends" {
+    transport.crypto.init(testing.io);
+    var environ: std.process.Environ.Map = .init(gpa);
+    defer environ.deinit();
+    var login: Login = undefined;
+    try login.init(null);
+    defer login.deinit();
+    var st: ServerThread = undefined;
+    try st.init(try login.serverOptions(&environ, &.{ "/bin/sh", "-c", "sleep 10" }));
+    defer st.deinit();
+
+    var rc: RawClient = undefined;
+    try rc.init(&st, login.key, raw_hello);
+    defer rc.deinit();
+    rc.login = .scripted;
+    try rc.waitConnected();
+
+    // The server refuses the attach with bytes of the chunk left over,
+    // then gets more.
+    var buf: [64]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    try proto.encode(&w, .{ .attach = .{} });
+    try proto.encode(&w, .{ .hello = raw_hello });
+    try rc.stream.?.write(w.buffered());
+    try rc.waitEnded();
+    try testing.expectEqual(@backingInt(server_pkg.ErrorCode.protocol), rc.error_code.?);
+    try rc.stream.?.write("more");
+    rc.stream.?.finish();
+    try rc.waitClosed();
+}
+
+test "fuzz: a server ends a client that can't log in, whatever it sends, and frees what it held" {
+    try fuzz.run({}, fuzzLogin, .{ .count = 24 });
+}
+
+/// One input: what a client sends before it logs in, from
+/// `writeFuzzLogin`, in fuzzed chunks, then the end of its stream. Each
+/// input gets a server of its own.
+///
+/// The client can't sign, so it never logs in or attaches. The server
+/// answers the end of the stream by closing the connection, unless it has
+/// ended its side of the stream with an `Error` already. Once the client
+/// closes, the server frees the connection's pending slot.
+fn fuzzLogin(_: void, in: fuzz.Input) !void {
+    transport.crypto.init(testing.io);
+    var environ: std.process.Environ.Map = .init(gpa);
+    defer environ.deinit();
+    var login: Login = undefined;
+    try login.init(null);
+    defer login.deinit();
+    var st: ServerThread = undefined;
+    try st.init(try login.serverOptions(&environ, &.{ "/bin/sh", "-c", "sleep 10" }));
+    defer st.deinit();
+
+    var rc: RawClient = undefined;
+    try rc.init(&st, login.key, raw_hello);
+    defer rc.deinit();
+    rc.login = .scripted;
+    try rc.waitConnected();
+
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try writeFuzzLogin(in, &out.writer, &auth.ssh.keyBlob(login.key.public_key.toBytes()));
+    var rest = out.written();
+    while (rest.len > 0 and !rc.closed) {
+        const n = @min(rest.len, in.int(usize, 1, 1500));
+        try rc.stream.?.write(rest[0..n]);
+        rest = rest[n..];
+        try rc.loop.run(.no_wait);
+    }
+    if (!rc.closed) rc.stream.?.finish();
+
+    try rc.waitEnded();
+    try testing.expect(!rc.logged_in);
+    try testing.expectEqual(null, rc.attached);
+
+    if (!rc.closed) rc.conn.?.close(0);
+    try rc.waitClosed();
+    const deadline = nowMs() + timeout_ms;
+    while (@atomicLoad(u32, &st.server.pending.total, .monotonic) > 0) {
+        if (nowMs() > deadline) return error.Timeout;
+        try testing.io.sleep(.fromMilliseconds(5), .awake);
+    }
+}
+
+/// Writes up to 8 messages a client may send before it logs in, with
+/// fuzzed fields, or bytes. Logins name the test user and the key in
+/// `authorized_keys` mostly, so that the server gets as far as checking
+/// signatures.
+fn writeFuzzLogin(in: fuzz.Input, w: *Io.Writer, key_blob: []const u8) !void {
+    var a: [600]u8 = undefined;
+    var b: [600]u8 = undefined;
+    for (0..8) |_| {
+        if (in.done()) break;
+        const user = if (in.chance(7, 1)) test_user else in.bytes(a[0..64]);
+        const key = if (in.chance(7, 1)) key_blob else in.bytes(b[0..64]);
+        const message: proto.Message = switch (in.index(8)) {
+            0 => .{ .hello = .{
+                .revision = if (in.chance(7, 1)) proto.revision else in.any(u32),
+                .term = in.bytes(a[0..64]),
+                .colorterm = if (in.any(bool)) in.bytes(b[0..64]) else null,
+                .cols = in.any(u16),
+                .rows = in.any(u16),
+                .cell_width_px = if (in.any(bool)) in.any(u32) else null,
+                .cell_height_px = if (in.any(bool)) in.any(u32) else null,
+            } },
+            1 => .{ .auth_probe = .{ .user = user, .key = key } },
+            2 => .{ .auth_signature = .{ .user = user, .key = key, .signature = in.bytes(&b) } },
+            3 => .{ .@"resume" = .{ .session_id = in.any(u64), .next_seq = if (in.any(bool)) in.any(u64) else null, .proof = in.bytes(&a) } },
+            4 => .{ .attach = .{ .session_id = if (in.any(bool)) in.any(u64) else null, .reuse = in.any(bool) } },
+            5 => .{ .list = .{} },
+            6 => .{ .kill = .{ .session_id = in.any(u64) } },
+            else => {
+                try w.writeAll(in.bytes(&a));
+                continue;
+            },
+        };
+        try proto.encode(w, message);
+    }
+}
+
 test "a client that doesn't log in in time is told so and closed" {
     transport.crypto.init(testing.io);
     var environ: std.process.Environ.Map = .init(gpa);
@@ -1354,7 +1476,7 @@ test "a server with an SPA key answers only clients with its key" {
     var login: Login = undefined;
     try login.init(null);
     defer login.deinit();
-    const key = transport.spa.generate();
+    const key = transport.spa.generate(testing.io);
     var options = try login.serverOptions(&environ, &.{ "/bin/sh", "-c", "sleep 10" });
     options.spa_key = key;
     var st: ServerThread = undefined;
@@ -1364,7 +1486,7 @@ test "a server with an SPA key answers only clients with its key" {
     // Without the key, or with another, nothing answers.
     var pty: TestPty = try .open();
     defer pty.close();
-    for ([_]?transport.spa.Key{ null, transport.spa.generate() }) |spa_key| {
+    for ([_]?transport.spa.Key{ null, transport.spa.generate(testing.io) }) |spa_key| {
         var ct: ClientThread = .{ .options = login.clientOptions(&st, &pty, &.{login.key.public_key.toBytes()}) };
         ct.options.command = .list;
         ct.options.spa_key = spa_key;
@@ -1391,7 +1513,7 @@ test "a client with the SPA key logs in after a Retry" {
     var login: Login = undefined;
     try login.init(null);
     defer login.deinit();
-    const key = transport.spa.generate();
+    const key = transport.spa.generate(testing.io);
     var options = try login.serverOptions(&environ, &.{ "/bin/sh", "-c", "sleep 10" });
     options.spa_key = key;
     options.pending.retry_from = 0;
@@ -1419,7 +1541,7 @@ test "a server with an SPA key sends nothing to a copy of a first packet from an
     var login: Login = undefined;
     try login.init(null);
     defer login.deinit();
-    const key = transport.spa.generate();
+    const key = transport.spa.generate(testing.io);
     var options = try login.serverOptions(&environ, &.{ "/bin/sh", "-c", "sleep 10" });
     options.spa_key = key;
     // The connection the first packet starts is gone a few seconds later:
@@ -1637,13 +1759,17 @@ const RawClient = struct {
     decoder: proto.Decoder,
     hello: proto.Hello,
     key: Ed25519.KeyPair,
-    /// Set before the loop first runs. `idle` says hello and nothing more.
-    login: enum { normal, wrong_exporter, skip, idle } = .normal,
+    /// Set before the loop first runs. `idle` says hello and nothing more,
+    /// and `scripted` sends nothing: the test writes to `stream`.
+    login: enum { normal, wrong_exporter, skip, idle, scripted } = .normal,
+    logged_in: bool = false,
     attached: ?u64 = null,
     error_code: ?u32 = null,
     error_message: [64]u8 = undefined,
     error_message_len: usize = 0,
     closed: bool = false,
+    /// The server finished its side of the stream.
+    finished: bool = false,
     output: std.ArrayList(u8) = .empty,
 
     fn init(rc: *RawClient, st: *const ServerThread, key: Ed25519.KeyPair, hello: proto.Hello) !void {
@@ -1693,6 +1819,7 @@ const RawClient = struct {
         const stream = conn.openStream(.bidi) catch @panic("stream");
         rc.conn = conn;
         rc.stream = stream;
+        if (rc.login == .scripted) return;
         send(stream, .{ .hello = rc.hello });
         switch (rc.login) {
             .skip => send(stream, .{ .attach = .{} }),
@@ -1724,12 +1851,14 @@ const RawClient = struct {
         send(stream, .{ .attach = .{} });
     }
 
-    fn onData(ctx: ?*anyopaque, stream: *transport.endpoint.Stream, bytes: []const u8, _: bool) void {
+    fn onData(ctx: ?*anyopaque, stream: *transport.endpoint.Stream, bytes: []const u8, fin: bool) void {
         const rc: *RawClient = @ptrCast(@alignCast(ctx.?));
         stream.consume(bytes.len);
+        if (fin) rc.finished = true;
         rc.decoder.feed(bytes);
         while (rc.decoder.next() catch null) |message| switch (message) {
-            .auth_probe_reply => |m| if (m.accepted) rc.signIn(stream),
+            .auth_probe_reply => |m| if (m.accepted and rc.login != .scripted) rc.signIn(stream),
+            .auth_ok => rc.logged_in = true,
             .attached => |m| rc.attached = m.session_id,
             .output => |m| rc.output.appendSlice(gpa, m.bytes) catch @panic("OOM"),
             .@"error" => |m| {
@@ -1749,6 +1878,17 @@ const RawClient = struct {
     fn waitConnected(rc: *RawClient) !void {
         const deadline = nowMs() + timeout_ms;
         while (rc.conn == null) {
+            if (nowMs() > deadline) return error.Timeout;
+            try rc.loop.run(.no_wait);
+            testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+        }
+    }
+
+    /// Waits until the server has closed the connection or finished its
+    /// side of the stream.
+    fn waitEnded(rc: *RawClient) !void {
+        const deadline = nowMs() + timeout_ms;
+        while (!rc.closed and !rc.finished) {
             if (nowMs() > deadline) return error.Timeout;
             try rc.loop.run(.no_wait);
             testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
