@@ -413,9 +413,11 @@ pub const Server = struct {
     }
 
     /// The session, if any, keeps running detached.
-    fn onClosed(_: ?*anyopaque, conn: *Conn, _: transport.endpoint.CloseReason) void {
+    fn onClosed(_: ?*anyopaque, conn: *Conn, reason: transport.endpoint.CloseReason) void {
         const client = Client.of(conn) orelse return;
-        client.destroy();
+        // A client that closes its connection left on purpose. One that
+        // went silent may resume.
+        client.destroy(reason == .peer);
         conn.context = null;
     }
 
@@ -661,6 +663,7 @@ const Client = struct {
     terminfo: std.ArrayList(u8) = .empty,
     /// From `Attach`, for every `Attach` sent to a session.
     colors: Colors = .{},
+    hangup: bool = false,
     /// Stream bytes not yet consumed. The client's input waits while the
     /// session's channel is congested.
     held: usize = 0,
@@ -671,10 +674,19 @@ const Client = struct {
         return @ptrCast(@alignCast(conn.context orelse return null));
     }
 
-    fn destroy(client: *Client) void {
+    /// `left`: the client left on purpose, which the session is told.
+    fn destroy(client: *Client, left: bool) void {
         const gpa = client.server.gpa;
         // The session sees its channel close, and detaches.
-        if (client.upstream) |u| u.close();
+        if (client.upstream) |u| {
+            if (left) {
+                // Written before the channel closes. No handler call
+                // follows: the client is gone.
+                u.handler = null;
+                u.send(.{ .detach = .{} });
+                u.finish();
+            } else u.close();
+        }
         if (client.query) |q| q.abandon();
         // The command keeps running, without its streams.
         if (client.exec) |e| e.detach();
@@ -837,6 +849,7 @@ const Client = struct {
 
         // Copied: a new session may start after the sessions answer.
         client.colors = .of(m);
+        client.hangup = m.hangup;
         if (m.terminfo) |source| {
             if (source.len > terminfo.max_source_len) return client.fail(.protocol, "terminfo entry too long");
             client.terminfo.appendSlice(client.server.gpa, source) catch return client.fail(.protocol, "out of memory");
@@ -910,10 +923,14 @@ const Client = struct {
             .resume_exporter = resume_exporter,
             .internal_revision = proto.internal_revision,
         } });
-        // Every `Attach` carries the client's colors, the server's own for
-        // a new session included.
+        // Every `Attach` carries the client's colors and `hangup`, the
+        // server's own for a new session included.
         u.send(switch (first) {
-            .attach => |m| .{ .attach = client.colors.in(m) },
+            .attach => |m| attach: {
+                var with = client.colors.in(m);
+                with.hangup = client.hangup;
+                break :attach .{ .attach = with };
+            },
             .@"resume" => |m| .{ .@"resume" = m },
         });
     }

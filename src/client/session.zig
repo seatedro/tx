@@ -783,16 +783,20 @@ const Run = struct {
         r.send(.{ .auth_signature = .{ .user = r.options.user, .key = identity.key.blob(), .signature = sig } });
         var palette_buf: [64]u8 = undefined;
         r.send(switch (r.options.command) {
-            .attach => .{ .attach = .{
-                .session_id = r.options.session_id,
-                .reuse = r.options.reuse_detached,
-                .command = r.options.session_command,
-                .terminfo = r.options.terminfo,
-                .foreground = report.packRgb(r.options.colors.foreground),
-                .background = report.packRgb(r.options.colors.background),
-                .palette = report.paletteBytes(&r.options.colors, &palette_buf),
-                .dark = r.options.colors.dark,
-            } },
+            .attach => .{
+                .attach = .{
+                    .session_id = r.options.session_id,
+                    .reuse = r.options.reuse_detached,
+                    .command = r.options.session_command,
+                    .terminfo = r.options.terminfo,
+                    .foreground = report.packRgb(r.options.colors.foreground),
+                    .background = report.packRgb(r.options.colors.background),
+                    .palette = report.paletteBytes(&r.options.colors, &palette_buf),
+                    .dark = r.options.colors.dark,
+                    // As under ssh, a command on a terminal goes with tx.
+                    .hangup = r.options.session_command != null,
+                },
+            },
             .list => .{ .list = .{} },
             .kill => |id| .{ .kill = .{ .session_id = id } },
             .exec => |command| .{ .exec = .{ .command = command } },

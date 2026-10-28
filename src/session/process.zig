@@ -299,6 +299,8 @@ const Peer = struct {
     } = .new,
     /// The session holds this channel as its link.
     attached: bool = false,
+    /// txd said the client left on purpose (`Detach`).
+    left: bool = false,
     connect: proto.Connect = undefined,
     remote_buf: [64]u8 = undefined,
     exporter_buf: [auth.resume_.exporter_len]u8 = undefined,
@@ -358,8 +360,11 @@ const Peer = struct {
         const s = peer.process.session orelse return;
         switch (message) {
             .input, .resize => s.handle(message),
-            // The client left. Its channel closing detaches it.
-            .detach => peer.channel.finish(),
+            // The client left, on purpose. Its channel closing detaches it.
+            .detach => {
+                peer.left = true;
+                peer.channel.finish();
+            },
             else => {},
         }
     }
@@ -405,7 +410,7 @@ const Peer = struct {
     fn onClosed(context: *anyopaque, _: *Channel) void {
         const peer = of(context);
         const p = peer.process;
-        if (peer.attached) if (p.session) |s| s.disconnect();
+        if (peer.attached) if (p.session) |s| s.disconnect(peer.left);
         p.removePeer(peer);
     }
 

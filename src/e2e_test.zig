@@ -1003,6 +1003,32 @@ test "a new session finds the terminfo entry its client sent, or a common one" {
     }
 }
 
+test "a command with a terminal gets SIGHUP when its client leaves" {
+    var es: ExecServer = undefined;
+    try es.init();
+    defer es.deinit();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const marker = try std.fmt.bufPrint(&path_buf, "{s}/hup", .{std.fs.path.dirname(es.login.runtime_dir).?});
+    var command_buf: [std.fs.max_path_bytes + 128]u8 = undefined;
+    const command = try std.fmt.bufPrint(&command_buf, "trap 'echo hup > {s}; exit 0' HUP; echo ready; while :; do sleep 0.1; done", .{marker});
+
+    var pty: TestPty = try .open();
+    defer pty.close();
+    var ct: ClientThread = .{ .options = es.login.clientOptions(&es.st, &pty, &.{es.login.key.public_key.toBytes()}) };
+    ct.options.session_command = command;
+    try ct.start();
+    try pty.readUntil("ready");
+    try pty.type_("~.");
+    _ = try ct.join(&pty);
+
+    const deadline = nowMs() + timeout_ms;
+    while (true) {
+        if (Io.Dir.cwd().access(testing.io, marker, .{})) break else |_| {}
+        if (nowMs() > deadline) return error.Timeout;
+        try testing.io.sleep(.fromMilliseconds(10), .awake);
+    }
+}
+
 test "a command before the login is refused" {
     var es: ExecServer = undefined;
     try es.init();
