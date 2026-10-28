@@ -1,8 +1,10 @@
-//! A program running on a pseudo-terminal.
+//! A program running on a pseudo-terminal (`Pty`), or with its stdin,
+//! stdout and stderr on sockets (`Pipes`).
 //!
-//! The master is non-blocking and public, for the caller to poll in its own
-//! event loop. The caller reaps the child (see `Pty.wait`). Uses libc only;
-//! supports Linux (glibc and musl) and macOS.
+//! The master, or the parent's ends of the pipes, are non-blocking and
+//! public, for the caller to poll in its own event loop. The caller reaps
+//! the child (see `Pty.wait`). Uses libc only; supports Linux (glibc and
+//! musl) and macOS.
 const std = @import("std");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
@@ -134,16 +136,6 @@ pub const Pty = struct {
     /// and does not allocate, since a malloc lock held by another thread at
     /// fork would deadlock it.
     pub fn spawn(gpa: Allocator, options: Options) SpawnError!Pty {
-        assert(options.argv.len > 0);
-        var arena_state = std.heap.ArenaAllocator.init(gpa);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
-
-        const argv = try arena.allocSentinel(?[*:0]const u8, options.argv.len, null);
-        for (options.argv, argv) |arg, *ptr| ptr.* = (try arena.dupeSentinel(u8, arg, 0)).ptr;
-        const envp = try options.environ.createPosixBlock(arena, .{});
-        const program = try arena.dupeSentinel(u8, options.program orelse options.argv[0], 0);
-
         var self: Pty = .{
             .master = try openMaster(),
             .pid = null,
@@ -184,64 +176,15 @@ pub const Pty = struct {
         try setAttrs(slave, &attrs);
         try self.resize(options.size);
 
-        const flags = c.fcntl(self.master, posix.F.GETFL);
-        if (flags == -1) return posix.unexpectedErrno(posix.errno(-1));
-        const nonblock: c_int = @bitCast(posix.O{ .NONBLOCK = true });
-        if (c.fcntl(self.master, posix.F.SETFL, flags | nonblock) == -1)
-            return posix.unexpectedErrno(posix.errno(-1));
+        try setNonblocking(self.master);
 
-        var child: Child = .{
-            .argv = argv.ptr,
-            .envp = envp.slice.ptr,
-            .program = program,
-            .search_path = if (std.mem.indexOfScalar(u8, program, '/') == null)
-                options.environ.get("PATH") orelse default_path
-            else
-                null,
-            .cwd = switch (options.cwd) {
-                .inherit => .inherit,
-                .dir => |dir| .{ .fd = dir.handle },
-                .path => |path| .{ .path = try arena.dupeSentinel(u8, path, 0) },
-            },
-            .slave = slave,
-            .err_fd = undefined,
-            .max_fd = maxFd(),
-            .default_action = .{ .handler = .{ .handler = posix.SIG.DFL }, .mask = undefined, .flags = 0 },
-            .empty_mask = undefined,
-        };
-        _ = c.sigemptyset(&child.default_action.mask);
-        _ = c.sigemptyset(&child.empty_mask);
-
-        // The child writes a ChildError here if it fails before exec. A
-        // successful exec closes the pipe unwritten.
-        const err_pipe = try pipe();
-        child.err_fd = err_pipe[1];
-
-        // Block all signals across fork so the child can't run a host
-        // handler before resetting dispositions to the default.
-        var all_signals: posix.sigset_t = undefined;
-        _ = c.sigfillset(&all_signals);
-        var old_mask: posix.sigset_t = undefined;
-        _ = c.pthread_sigmask(posix.SIG.SETMASK, &all_signals, &old_mask);
-        const pid = c.fork();
-        if (pid == 0) child.run();
-        _ = c.pthread_sigmask(posix.SIG.SETMASK, &old_mask, &all_signals);
-
-        closeFd(err_pipe[1]);
-        defer closeFd(err_pipe[0]);
-        if (pid == -1) return switch (posix.errno(-1)) {
-            .AGAIN, .NOMEM => error.SystemResources,
-            else => |err| posix.unexpectedErrno(err),
-        };
-        if (readChildError(err_pipe[0])) |failure| {
-            // If reading the pipe failed, the child may have exec'd and still
-            // be running.
-            _ = c.kill(pid, .KILL);
-            _ = reap(pid, 0) catch {};
-            if (options.diagnostic) |diagnostic| diagnostic.* = .{ .step = failure.step, .errno = failure.errno };
-            return failure.toError();
-        }
-        self.pid = pid;
+        self.pid = try startChild(gpa, .{
+            .argv = options.argv,
+            .program = options.program,
+            .environ = options.environ,
+            .cwd = options.cwd,
+            .diagnostic = options.diagnostic,
+        }, .{ .pty = slave });
         return self;
     }
 
@@ -336,18 +279,7 @@ pub const Pty = struct {
     /// safe to call from another thread meanwhile, since the pid can't be
     /// reused before the child is reaped. Reap it with `tryWait` afterwards.
     pub fn waitExited(self: *const Pty) WaitError!void {
-        const pid = self.pid orelse return;
-
-        // Larger than siginfo_t on every supported platform. Only the
-        // return value is used.
-        var info: [128]u8 align(8) = undefined;
-
-        // WNOWAIT leaves the child a zombie. Its pid stays reserved.
-        while (libc.waitid(p_pid, @intCast(pid), &info, w_exited | w_nowait) == -1) switch (posix.errno(-1)) {
-            .INTR => {},
-            .CHILD => return error.ProcessNotFound,
-            else => |err| return posix.unexpectedErrno(err),
-        };
+        return waitExitedPid(self.pid orelse return);
     }
 
     fn reapChild(self: *Pty, flags: c_int) WaitError!?Term {
@@ -385,6 +317,185 @@ pub const Pty = struct {
     }
 };
 
+pub const PipesOptions = struct {
+    /// As in `Options`.
+    argv: []const []const u8,
+    program: ?[]const u8 = null,
+    environ: *const std.process.Environ.Map,
+    cwd: std.process.Child.Cwd = .inherit,
+    diagnostic: ?*Diagnostic = null,
+};
+
+/// A child process whose stdin, stdout and stderr are Unix stream socket
+/// pairs, as sshd uses for a command without a terminal. To the child they
+/// work as pipes do. Unlike a pipe, the parent's end can be shut down,
+/// which ends a read in flight on it. The child runs in a session of its
+/// own, with no controlling terminal.
+///
+/// Reap the child with `wait` or `tryWait` only, as for `Pty`.
+pub const Pipes = struct {
+    /// The parent's ends, non-blocking and close-on-exec. -1 once closed.
+    stdin: posix.fd_t,
+    stdout: posix.fd_t,
+    stderr: posix.fd_t,
+    /// Null once the child is reaped.
+    pid: ?posix.pid_t,
+    /// Set when the child is reaped.
+    term: ?Term = null,
+
+    /// Starts a program on new socket pairs. Returns after the program has
+    /// been exec'd, as `Pty.spawn` does.
+    pub fn spawn(gpa: Allocator, options: PipesOptions) SpawnError!Pipes {
+        // The child's ends close here once it has them.
+        const stdin = try socketPair();
+        defer closeFd(stdin[0]);
+        errdefer closeFd(stdin[1]);
+        const stdout = try socketPair();
+        defer closeFd(stdout[1]);
+        errdefer closeFd(stdout[0]);
+        const stderr = try socketPair();
+        defer closeFd(stderr[1]);
+        errdefer closeFd(stderr[0]);
+        for ([_]posix.fd_t{ stdin[1], stdout[0], stderr[0] }) |fd| try setNonblocking(fd);
+
+        const pid = try startChild(gpa, .{
+            .argv = options.argv,
+            .program = options.program,
+            .environ = options.environ,
+            .cwd = options.cwd,
+            .diagnostic = options.diagnostic,
+        }, .{ .pipes = .{ stdin[0], stdout[1], stderr[1] } });
+        return .{ .stdin = stdin[1], .stdout = stdout[0], .stderr = stderr[0], .pid = pid };
+    }
+
+    /// Closes one of the parent's ends: the child's stdin sees end of file,
+    /// and a write to its stdout or stderr fails with EPIPE.
+    pub fn close(self: *Pipes, fd: *posix.fd_t) void {
+        _ = self;
+        if (fd.* == -1) return;
+        closeFd(fd.*);
+        fd.* = -1;
+    }
+
+    /// As `Pty.kill`.
+    pub fn kill(self: *Pipes, sig: posix.SIG) KillError!void {
+        return posix.kill(self.pid orelse return error.ProcessNotFound, sig);
+    }
+
+    /// As `Pty.waitExited`.
+    pub fn waitExited(self: *const Pipes) WaitError!void {
+        return waitExitedPid(self.pid orelse return);
+    }
+
+    /// As `Pty.tryWait`.
+    pub fn tryWait(self: *Pipes) WaitError!?Term {
+        const pid = self.pid orelse return self.term orelse error.ProcessNotFound;
+        const term = reap(pid, posix.W.NOHANG) catch |err| {
+            if (err == error.ProcessNotFound) self.pid = null;
+            return err;
+        };
+        if (term != null) {
+            self.pid = null;
+            self.term = term;
+        }
+        return term;
+    }
+
+    /// Closes the parent's ends, then sends SIGKILL to the child and reaps
+    /// it if it hasn't been reaped.
+    pub fn deinit(self: *Pipes) void {
+        self.close(&self.stdin);
+        self.close(&self.stdout);
+        self.close(&self.stderr);
+        if (self.pid) |pid| {
+            _ = c.kill(pid, .KILL);
+            _ = reap(pid, 0) catch {};
+        }
+        self.* = undefined;
+    }
+};
+
+/// What `startChild` runs: `Options` without the terminal.
+const Program = struct {
+    argv: []const []const u8,
+    program: ?[]const u8,
+    environ: *const std.process.Environ.Map,
+    cwd: std.process.Child.Cwd,
+    diagnostic: ?*Diagnostic,
+};
+
+/// Forks a child that runs `program` on `stdio`, and returns its pid once it
+/// has exec'd. If the child fails before exec, it is reaped and its errno
+/// is mapped to the returned error.
+///
+/// Between fork and exec the child makes only async-signal-safe calls and
+/// does not allocate, since a malloc lock held by another thread at fork
+/// would deadlock it.
+fn startChild(gpa: Allocator, program: Program, stdio: Child.Stdio) SpawnError!posix.pid_t {
+    assert(program.argv.len > 0);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const argv = try arena.allocSentinel(?[*:0]const u8, program.argv.len, null);
+    for (program.argv, argv) |arg, *ptr| ptr.* = (try arena.dupeSentinel(u8, arg, 0)).ptr;
+    const envp = try program.environ.createPosixBlock(arena, .{});
+    const path = try arena.dupeSentinel(u8, program.program orelse program.argv[0], 0);
+
+    var child: Child = .{
+        .argv = argv.ptr,
+        .envp = envp.slice.ptr,
+        .program = path,
+        .search_path = if (std.mem.indexOfScalar(u8, path, '/') == null)
+            program.environ.get("PATH") orelse default_path
+        else
+            null,
+        .cwd = switch (program.cwd) {
+            .inherit => .inherit,
+            .dir => |dir| .{ .fd = dir.handle },
+            .path => |p| .{ .path = try arena.dupeSentinel(u8, p, 0) },
+        },
+        .stdio = stdio,
+        .err_fd = undefined,
+        .max_fd = maxFd(),
+        .default_action = .{ .handler = .{ .handler = posix.SIG.DFL }, .mask = undefined, .flags = 0 },
+        .empty_mask = undefined,
+    };
+    _ = c.sigemptyset(&child.default_action.mask);
+    _ = c.sigemptyset(&child.empty_mask);
+
+    // The child writes a ChildError here if it fails before exec. A
+    // successful exec closes the pipe unwritten.
+    const err_pipe = try pipe();
+    child.err_fd = err_pipe[1];
+
+    // Block all signals across fork so the child can't run a host handler
+    // before resetting dispositions to the default.
+    var all_signals: posix.sigset_t = undefined;
+    _ = c.sigfillset(&all_signals);
+    var old_mask: posix.sigset_t = undefined;
+    _ = c.pthread_sigmask(posix.SIG.SETMASK, &all_signals, &old_mask);
+    const pid = c.fork();
+    if (pid == 0) child.run();
+    _ = c.pthread_sigmask(posix.SIG.SETMASK, &old_mask, &all_signals);
+
+    closeFd(err_pipe[1]);
+    defer closeFd(err_pipe[0]);
+    if (pid == -1) return switch (posix.errno(-1)) {
+        .AGAIN, .NOMEM => error.SystemResources,
+        else => |err| posix.unexpectedErrno(err),
+    };
+    if (readChildError(err_pipe[0])) |failure| {
+        // If reading the pipe failed, the child may have exec'd and still be
+        // running.
+        _ = c.kill(pid, .KILL);
+        _ = reap(pid, 0) catch {};
+        if (program.diagnostic) |diagnostic| diagnostic.* = .{ .step = failure.step, .errno = failure.errno };
+        return failure.toError();
+    }
+    return pid;
+}
+
 /// What execvp uses when PATH is unset.
 const default_path = "/usr/bin:/bin";
 
@@ -414,13 +525,21 @@ const Child = struct {
         fd: posix.fd_t,
         path: [*:0]const u8,
     },
-    /// `slave` and `err_fd` are above 2, so dup2 onto stdio doesn't clobber
-    /// them.
-    slave: posix.fd_t,
+    stdio: Stdio,
+    /// Above 2, as the fds of `stdio` are, so dup2 onto stdio doesn't
+    /// clobber it.
     err_fd: posix.fd_t,
     max_fd: posix.fd_t,
     default_action: posix.Sigaction,
     empty_mask: posix.sigset_t,
+
+    /// What the child's stdin, stdout and stderr become.
+    const Stdio = union(enum) {
+        /// A pty's slave, which becomes the controlling terminal.
+        pty: posix.fd_t,
+        /// The child's ends of the sockets for stdin, stdout and stderr.
+        pipes: [3]posix.fd_t,
+    };
 
     fn run(child: *const Child) noreturn {
         switch (child.cwd) {
@@ -431,13 +550,20 @@ const Child = struct {
 
         // A new session has no controlling terminal, so TIOCSCTTY can make
         // the slave this one's. The child becomes the foreground process
-        // group, which receives ^C and SIGWINCH.
+        // group, which receives ^C and SIGWINCH. On pipes, it keeps none of
+        // the host's.
         if (c.setsid() == -1) fail(child.err_fd, .setsid, posix.errno(-1));
-        if (ioctl(child.slave, tiocsctty, @as(c_ulong, 0)) == -1)
-            fail(child.err_fd, .controlling_terminal, posix.errno(-1));
-
-        for ([_]posix.fd_t{ 0, 1, 2 }) |fd| {
-            if (c.dup2(child.slave, fd) == -1) fail(child.err_fd, .stdio, posix.errno(-1));
+        switch (child.stdio) {
+            .pty => |slave| {
+                if (ioctl(slave, tiocsctty, @as(c_ulong, 0)) == -1)
+                    fail(child.err_fd, .controlling_terminal, posix.errno(-1));
+                for ([_]posix.fd_t{ 0, 1, 2 }) |fd| {
+                    if (c.dup2(slave, fd) == -1) fail(child.err_fd, .stdio, posix.errno(-1));
+                }
+            },
+            .pipes => |fds| for (fds, 0..) |from, to| {
+                if (c.dup2(from, @intCast(to)) == -1) fail(child.err_fd, .stdio, posix.errno(-1));
+            },
         }
         // Close inherited fds other than the error pipe, moved to 3.
         const err_fd: posix.fd_t = 3;
@@ -549,6 +675,20 @@ fn readChildError(fd: posix.fd_t) ?ChildError.Failure {
     };
 }
 
+/// Blocks until `pid` has exited, and leaves it unreaped.
+fn waitExitedPid(pid: posix.pid_t) WaitError!void {
+    // Larger than siginfo_t on every supported platform. Only the return
+    // value is used.
+    var info: [128]u8 align(8) = undefined;
+
+    // WNOWAIT leaves the child a zombie. Its pid stays reserved.
+    while (libc.waitid(p_pid, @intCast(pid), &info, w_exited | w_nowait) == -1) switch (posix.errno(-1)) {
+        .INTR => {},
+        .CHILD => return error.ProcessNotFound,
+        else => |err| return posix.unexpectedErrno(err),
+    };
+}
+
 fn reap(pid: posix.pid_t, flags: c_int) WaitError!?Term {
     var status: c_int = undefined;
     while (true) {
@@ -635,6 +775,32 @@ fn openError(err: posix.E) SpawnError {
 
 /// A close-on-exec pipe with both ends above 2. macOS has no pipe2; there,
 /// a thread that forks between pipe and fcntl inherits the pipe.
+fn setNonblocking(fd: posix.fd_t) SpawnError!void {
+    const flags = c.fcntl(fd, posix.F.GETFL);
+    if (flags == -1) return posix.unexpectedErrno(posix.errno(-1));
+    const nonblock: c_int = @bitCast(posix.O{ .NONBLOCK = true });
+    if (c.fcntl(fd, posix.F.SETFL, flags | nonblock) == -1) return posix.unexpectedErrno(posix.errno(-1));
+}
+
+/// A connected pair of Unix stream sockets, close-on-exec and above 2.
+fn socketPair() SpawnError![2]posix.fd_t {
+    var fds: [2]posix.fd_t = undefined;
+    const cloexec: u32 = if (native_os == .linux) posix.SOCK.CLOEXEC else 0;
+    if (c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | cloexec, 0, &fds) != 0) return openError(posix.errno(-1));
+    if (native_os != .linux) for (fds) |fd| {
+        if (c.fcntl(fd, posix.F.SETFD, @as(c_int, posix.FD_CLOEXEC)) == -1) {
+            closeFd(fds[0]);
+            closeFd(fds[1]);
+            return posix.unexpectedErrno(posix.errno(-1));
+        }
+    };
+    errdefer closeFd(fds[1]);
+    fds[0] = try aboveStdio(fds[0]);
+    errdefer closeFd(fds[0]);
+    fds[1] = try aboveStdio(fds[1]);
+    return fds;
+}
+
 fn pipe() SpawnError![2]posix.fd_t {
     var fds: [2]posix.fd_t = undefined;
     if (@TypeOf(c.pipe2) != void) {
@@ -1017,4 +1183,66 @@ test "no fds leak into the program" {
     try out.readToEnd(&pty);
     try testing.expectEqual(Term{ .exited = 0 }, try waitTest(&pty));
     try testing.expectEqualStrings("end\r\n", out.bytes());
+}
+
+/// Reads `fd`, a nonblocking pipe, to end of file.
+fn readPipeToEnd(fd: posix.fd_t, out: *std.ArrayList(u8)) !void {
+    var buf: [1024]u8 = undefined;
+    while (true) {
+        var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+        if (c.poll(&fds, fds.len, test_timeout_ms) == 0) return error.Timeout;
+        const rc = c.read(fd, &buf, buf.len);
+        switch (posix.errno(rc)) {
+            .SUCCESS => {
+                if (rc == 0) return;
+                try out.appendSlice(testing.allocator, buf[0..@intCast(rc)]);
+            },
+            .INTR, .AGAIN => {},
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    }
+}
+
+test "a program on pipes reads its stdin, and writes stdout and stderr apart" {
+    var environ = try testEnviron();
+    defer environ.deinit();
+    var pipes: Pipes = try .spawn(testing.allocator, .{
+        .argv = &.{ "/bin/sh", "-c", "read line; echo \"got $line\"; echo oops >&2; exit 4" },
+        .environ = &environ,
+    });
+    defer pipes.deinit();
+
+    try testing.expectEqual(5, c.write(pipes.stdin, "data\n", 5));
+    pipes.close(&pipes.stdin);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    var err: std.ArrayList(u8) = .empty;
+    defer err.deinit(testing.allocator);
+    try readPipeToEnd(pipes.stdout, &out);
+    try readPipeToEnd(pipes.stderr, &err);
+
+    try pipes.waitExited();
+    try testing.expectEqual(Term{ .exited = 4 }, (try pipes.tryWait()).?);
+    try testing.expectEqualStrings("got data\n", out.items);
+    try testing.expectEqualStrings("oops\n", err.items);
+}
+
+test "a program on pipes gets SIGPIPE once its stdout is closed" {
+    // The host ignores SIGPIPE, as txd does; the child mustn't.
+    const ignore: posix.Sigaction = .{ .handler = .{ .handler = posix.SIG.IGN }, .mask = posix.sigemptyset(), .flags = 0 };
+    var old: posix.Sigaction = undefined;
+    _ = c.sigaction(.PIPE, &ignore, &old);
+    defer _ = c.sigaction(.PIPE, &old, null);
+
+    var environ = try testEnviron();
+    defer environ.deinit();
+    var pipes: Pipes = try .spawn(testing.allocator, .{
+        .argv = &.{ "/bin/sh", "-c", "while :; do echo y; done" },
+        .environ = &environ,
+    });
+    defer pipes.deinit();
+    pipes.close(&pipes.stdout);
+
+    try pipes.waitExited();
+    try testing.expectEqual(Term{ .signal = .PIPE }, (try pipes.tryWait()).?);
 }

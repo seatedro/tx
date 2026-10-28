@@ -26,6 +26,7 @@ const auth = @import("auth");
 const term = @import("term");
 const host_pkg = @import("host.zig");
 const Host = host_pkg.Host;
+const pty = @import("pty.zig");
 
 const log = std.log.scoped(.session);
 
@@ -42,6 +43,16 @@ const max_cols = 1024;
 const max_rows = 1024;
 
 /// A client's size within bounds, or null to ignore it.
+/// How a program ended, as `Exit` reports it. A signal is reported as a
+/// shell reports it, 128 plus its number, and by name.
+pub fn exitMessage(t: pty.Term) proto.Exit {
+    return switch (t) {
+        .exited => |code| .{ .status = code },
+        .signal => |sig| .{ .status = 128 +| @as(u8, @truncate(@backingInt(sig))), .signal = @tagName(sig) },
+        else => .{ .status = 255 },
+    };
+}
+
 pub fn boundedSize(cols: u16, rows: u16, cell: ?term.log.Resize.CellSize) ?term.log.Resize {
     if (cols == 0 or rows == 0) return null;
     return .{ .cols = @min(cols, max_cols), .rows = @min(rows, max_rows), .cell_size_px = cell };
@@ -436,13 +447,7 @@ pub const Session = struct {
             return s.end(.{ .status = 255 });
         };
 
-        // A signal is reported as a shell reports it, 128 plus its number,
-        // and by name.
-        s.end(switch (t) {
-            .exited => |code| .{ .status = code },
-            .signal => |sig| .{ .status = 128 +| @as(u8, @truncate(@backingInt(sig))), .signal = @tagName(sig) },
-            else => .{ .status = 255 },
-        });
+        s.end(exitMessage(t));
     }
 
     /// The `wake` callback frees the session.

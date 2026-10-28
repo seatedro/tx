@@ -207,6 +207,7 @@ pub fn main(init: std.process.Init) !u8 {
         .environ = &environ,
         .argv = &.{login_name},
         .program = shell,
+        .shell = shell,
         .cwd = if (init.environ_map.get("HOME")) |home| .{ .path = home } else .inherit,
         .spa_key = if (open) null else spa_key,
     }) catch |err| switch (err) {

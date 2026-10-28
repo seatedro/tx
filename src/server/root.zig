@@ -28,8 +28,8 @@
 //! which the session checks against its resume key. The login completes
 //! when the session answers with `Attached`.
 //!
-//! A logged-in client may also list the sessions (`List`), or end one
-//! (`Kill`).
+//! A logged-in client may also list the sessions (`List`), end one
+//! (`Kill`), or run a command (`Exec`, see `exec`).
 //!
 //! Listening on a wildcard address binds each address it covers, and
 //! follows addresses as they come and go (see `addresses`).
@@ -48,8 +48,10 @@ const term = @import("term");
 const auth = @import("auth");
 const addresses = @import("addresses.zig");
 pub const runtime_dir = @import("runtime_dir.zig");
+pub const exec = @import("exec.zig");
 
 const Endpoint = transport.endpoint.Endpoint;
+const Exec = exec.Exec;
 const Conn = transport.endpoint.Conn;
 const Stream = transport.endpoint.Stream;
 const Channel = session.Channel;
@@ -75,6 +77,8 @@ pub const Options = struct {
     /// The environment of new sessions. `TERM` and `COLORTERM` come from the
     /// client, and so do the `LANG` and `LC_*` variables it sends.
     environ: *const std.process.Environ.Map,
+    /// The user's shell, which runs the commands of `Exec` with `-c`.
+    shell: []const u8 = "/bin/sh",
     /// argv of the program new sessions run. See `session.pty.Options`.
     argv: []const []const u8,
     program: ?[]const u8 = null,
@@ -132,6 +136,8 @@ pub const Server = struct {
     retired: std.ArrayList(*Endpoint) = .empty,
     /// Set when `Options.listen` is a wildcard address.
     rescan: ?Rescan = null,
+    /// The commands clients run. Each removes itself when it frees itself.
+    execs: std.ArrayList(*Exec) = .empty,
     stopping: bool = false,
     /// No session started by this server has an ID below it.
     next_id: u64 = 1,
@@ -190,6 +196,9 @@ pub const Server = struct {
     /// the loop until it has no active completions, then call `deinit`.
     pub fn stop(self: *Server) void {
         self.stopping = true;
+        // Their connections close too. The commands may not end on their
+        // own, and the loop runs until they do.
+        for (self.execs.items) |e| e.kill();
         for (self.endpoints.items) |e| e.stop();
         if (self.rescan) |*r| if (r.c.state() == .active) {
             r.cancel_c = .{ .op = .{ .cancel = .{ .c = &r.c } } };
@@ -199,6 +208,9 @@ pub const Server = struct {
 
     pub fn deinit(self: *Server) void {
         for (self.endpoints.items) |e| self.destroyEndpoint(e);
+        // Commands left from a server that wasn't stopped.
+        while (self.execs.items.len > 0) self.execs.items[0].destroy();
+        self.execs.deinit(self.gpa);
         self.endpoints.deinit(self.gpa);
         for (self.retired.items) |e| self.destroyEndpoint(e);
         self.retired.deinit(self.gpa);
@@ -351,6 +363,7 @@ pub const Server = struct {
 
     fn onData(_: ?*anyopaque, stream: *Stream, bytes: []const u8, fin: bool) void {
         const client = Client.of(stream.conn) orelse return stream.consume(bytes.len);
+        if (client.exec) |e| if (e.owns(stream)) return e.received(stream, bytes, fin);
         if (client.stream != stream) return stream.consume(bytes.len);
 
         // Credit is returned at once while the session's channel keeps up,
@@ -384,12 +397,14 @@ pub const Server = struct {
     /// it is below `low_water`.
     fn onAcked(_: ?*anyopaque, stream: *Stream) void {
         const client = Client.of(stream.conn) orelse return;
+        if (client.exec) |e| if (e.owns(stream)) return e.acked(stream);
         const u = client.upstream orelse return;
         if (u.paused and stream.buffered() <= low_water) u.resumeReading();
     }
 
     fn onStreamClosed(_: ?*anyopaque, stream: *Stream) void {
         const client = Client.of(stream.conn) orelse return;
+        if (client.exec) |e| e.streamClosed(stream);
         if (client.stream == stream) client.stream = null;
     }
 
@@ -466,23 +481,10 @@ pub const Server = struct {
         return id;
     }
 
-    /// Starts a session process for the client that said `hello`, and
-    /// returns the channel to it, with `Start` sent.
-    fn startSession(self: *Server, hello: *const Hello, handler: session.channel.Handler) !*Channel {
-        const id = try self.newId();
-        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
-
-        // The server's environment, plus what describes the client's
-        // terminal and the session's ID.
+    /// The server's environment, with the client's locale variables in
+    /// place of the server's. Items that aren't one are left out.
+    fn clientEnviron(self: *Server, arena: Allocator, hello: *const Hello) !std.process.Environ.Map {
         var environ = try self.options.environ.clone(arena);
-        try environ.put("TERM", hello.term.items);
-        if (hello.colorterm.items.len > 0) try environ.put("COLORTERM", hello.colorterm.items);
-        try environ.put("TX_SESSION_ID", try std.fmt.allocPrint(arena, "{d}", .{id}));
-
-        // The client's locale variables, in place of the server's. Items
-        // that aren't one are left out.
         var items = std.mem.splitScalar(u8, hello.locale.items, 0);
         while (items.next()) |item| {
             const eq = std.mem.indexOfScalar(u8, item, '=') orelse continue;
@@ -491,6 +493,23 @@ pub const Server = struct {
             if (!proto.isLocaleName(name) or value.len == 0) continue;
             try environ.put(name, localeValue(value));
         }
+        return environ;
+    }
+
+    /// Starts a session process for the client that said `hello`, and
+    /// returns the channel to it, with `Start` sent.
+    fn startSession(self: *Server, hello: *const Hello, handler: session.channel.Handler) !*Channel {
+        const id = try self.newId();
+        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        // The client's environment, plus what describes its terminal and
+        // the session's ID.
+        var environ = try self.clientEnviron(arena, hello);
+        try environ.put("TERM", hello.term.items);
+        if (hello.colorterm.items.len > 0) try environ.put("COLORTERM", hello.colorterm.items);
+        try environ.put("TX_SESSION_ID", try std.fmt.allocPrint(arena, "{d}", .{id}));
 
         // Lists of NUL-terminated items.
         var environ_list: std.ArrayList(u8) = .empty;
@@ -580,6 +599,8 @@ const Client = struct {
     /// A `List`, or an `Attach` with `reuse`, waiting for the sessions'
     /// answers.
     query: ?*Query = null,
+    /// The command the client runs, until it frees itself.
+    exec: ?*Exec = null,
     /// Stream bytes not yet consumed. The client's input waits while the
     /// session's channel is congested.
     held: usize = 0,
@@ -595,6 +616,8 @@ const Client = struct {
         // The session sees its channel close, and detaches.
         if (client.upstream) |u| u.close();
         if (client.query) |q| q.abandon();
+        // The command keeps running, without its streams.
+        if (client.exec) |e| e.detach();
         client.decoder.deinit();
         if (client.hello) |*h| h.deinit(gpa);
         gpa.destroy(client);
@@ -618,6 +641,7 @@ const Client = struct {
             .@"resume" => |m| client.onResume(m),
             .list => client.startQuery(.list),
             .kill => |m| client.onKill(m),
+            .exec => |m| client.onExec(m),
             .input, .resize => if (client.upstream) |u| u.send(message),
             .ack => |m| client.acked = m.seq,
             .detach => client.conn.close(0),
@@ -701,6 +725,49 @@ const Client = struct {
             return false;
         }
         return true;
+    }
+
+    fn onExec(client: *Client, m: proto.Exec) void {
+        const server = client.server;
+        const hello = &(client.hello orelse return client.fail(.protocol, "exec before hello"));
+        if (client.upstream != null or client.query != null or client.exec != null) return client.fail(.protocol, "second command");
+
+        var arena_state: std.heap.ArenaAllocator = .init(server.gpa);
+        defer arena_state.deinit();
+        const environ = server.clientEnviron(arena_state.allocator(), hello) catch return client.fail(.spawn, "out of memory");
+        const e = Exec.start(server.gpa, server.loop, client.conn, .{
+            .shell = server.options.shell,
+            .command = m.command,
+            .environ = &environ,
+            .cwd = server.options.cwd,
+            .handler = .{ .client = client, .exited = onExecExited, .server = server, .freed = onExecFreed },
+        }) catch |err| {
+            log.warn("{f} can't run a command: {t}", .{ client.conn.remote, err });
+            return client.fail(.spawn, "can't run the command");
+        };
+        server.execs.append(server.gpa, e) catch {
+            e.detach();
+            return client.fail(.spawn, "out of memory");
+        };
+        client.exec = e;
+        log.info("{f} runs a command", .{client.conn.remote});
+    }
+
+    fn onExecExited(context: *anyopaque, exit: proto.Exit) void {
+        const client: *Client = @ptrCast(@alignCast(context));
+        client.send(.{ .exit = exit });
+    }
+
+    fn onExecFreed(context: *anyopaque, client_context: ?*anyopaque, e: *Exec) void {
+        const server: *Server = @ptrCast(@alignCast(context));
+        for (server.execs.items, 0..) |item, i| if (item == e) {
+            _ = server.execs.swapRemove(i);
+            break;
+        };
+        if (client_context) |c| {
+            const client: *Client = @ptrCast(@alignCast(c));
+            client.exec = null;
+        }
     }
 
     fn onAttach(client: *Client, m: proto.Attach) void {

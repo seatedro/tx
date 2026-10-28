@@ -23,6 +23,12 @@
 //! that takes longer than `Options.notice_delay_ms`, a notice is drawn
 //! over the session, and the resume asks for a repaint, which clears it.
 //!
+//! `Command.exec` runs a command instead (see `proto.Exec`): stdin goes to
+//! the server as it is read, and the command's stdout and stderr to
+//! `Options.out_fd` and `err_fd`, with no terminal mode. It's done once the
+//! exit status has come and both output streams have ended. A lost
+//! connection ends it.
+//!
 //! The connection is given up once nothing has come from the server for
 //! `Options.silence_timeout_ns`. The server answers the keep-alives sent
 //! every `Options.keep_alive_ns`, so the timeout can be short. Suspended
@@ -79,6 +85,8 @@ pub const Options = struct {
     /// The user's terminal.
     in_fd: posix.fd_t = posix.STDIN_FILENO,
     out_fd: posix.fd_t = posix.STDOUT_FILENO,
+    /// A command's stderr, for `Command.exec`.
+    err_fd: posix.fd_t = posix.STDERR_FILENO,
     term: []const u8,
     colorterm: ?[]const u8 = null,
     /// See `proto.Hello.locale`.
@@ -106,6 +114,8 @@ pub const Command = union(enum) {
     list,
     /// Ends a session. The terminal isn't used.
     kill: u64,
+    /// Runs a command with the user's shell, with stdin from `in_fd`.
+    exec: []const u8,
 };
 
 pub const Identity = struct {
@@ -143,6 +153,10 @@ pub const Outcome = union(enum) {
     listed: []Listed,
     /// For `Command.kill`.
     killed: u64,
+    /// For `Command.exec`: a terminating signal, or a failed write to
+    /// `out_fd` or `err_fd`, ended tx before the command did. The command
+    /// sees its streams end.
+    ended,
 
     pub const Listed = struct {
         session_id: u64,
@@ -193,6 +207,12 @@ const writer_options = .{
 /// Less than `writer_options.capacity - high_water`, so that output already
 /// in flight when the queue crosses its high-water mark still fits.
 const stream_window = 2 << 20;
+
+/// The most stdin read and not yet sent. Past it, the reader waits.
+const max_pending_stdin = 256 << 10;
+
+/// Stdin bytes on their stream unacknowledged past which more waits.
+const stdin_high_water = 1 << 20;
 
 /// The largest message body accepted from the server.
 const max_message = 1 << 20;
@@ -285,6 +305,8 @@ const Run = struct {
     attached: bool = false,
     /// The sessions received for `Command.list`.
     listing: std.ArrayList(Outcome.Listed) = .empty,
+    /// For `Command.exec`.
+    exec: Exec = .{},
     /// Input typed before the first attach, or while reconnecting.
     held_input: std.ArrayList(u8) = .empty,
     /// The last input sent, up to `max_sent_input` bytes, and the offset of
@@ -308,6 +330,36 @@ const Run = struct {
     outcome: ?Outcome = null,
     /// An error `run` returns, for a failure with no outcome of its own.
     failure: ?anyerror = null,
+
+    /// A command's streams and exit status. Its stream IDs are the ones
+    /// the server opens first of each kind, in `proto.Exec`'s order.
+    const Exec = struct {
+        /// The writers and the stdin reader run.
+        started: bool = false,
+        stdout: Output = .{},
+        stderr: Output = .{},
+        /// The client's side of the server's first bidirectional stream.
+        stdin: ?*Stream = null,
+        /// The reader reached the end of stdin.
+        input_ended: bool = false,
+        /// stdin's stream is finished.
+        stdin_done: bool = false,
+        exit: ?Outcome.Exit = null,
+
+        const stdout_id = 3;
+        const stderr_id = 7;
+        const stdin_id = 1;
+
+        const Output = struct {
+            writer: tty.Writer = undefined,
+            /// Set by its first data. Null once freed.
+            stream: ?*Stream = null,
+            /// Credit held while the writer is above its high-water mark.
+            held: usize = 0,
+            /// The stream ended.
+            fin: bool = false,
+        };
+    };
 
     const Reconnect = struct {
         /// Set from losing the connection until attached again.
@@ -347,6 +399,14 @@ const Run = struct {
         input_ended: bool = false,
         below_low_water: bool = false,
         output_failed: bool = false,
+        /// For `Command.exec`: which writer went below its low-water mark.
+        stdout_low: bool = false,
+        stderr_low: bool = false,
+        /// Signaled when the loop takes stdin. The reader waits on it while
+        /// `input` holds `max_pending_stdin` bytes.
+        room: Io.Condition = .init,
+        /// Set before the reader stops, so that it doesn't wait.
+        closed: bool = false,
         /// The signature blob, owned, or why there is none.
         signature: ?(SignError![]u8) = null,
     };
@@ -401,6 +461,8 @@ const Run = struct {
                 .ctx = r,
                 .connected = onConnected,
                 .data = onData,
+                .acked = onAcked,
+                .streamClosed = onStreamClosed,
                 .closed = onClosed,
             },
         }) catch |err| {
@@ -436,6 +498,18 @@ const Run = struct {
         if (r.terminal) r.reader.stop();
         r.signals.stop();
         if (r.terminal) r.writer.stop(.drain);
+        if (r.exec.started) {
+            // A reader waiting for room would wait forever.
+            {
+                r.inbox.mutex.lockUncancelable(r.io);
+                defer r.inbox.mutex.unlock(r.io);
+                r.inbox.closed = true;
+                r.inbox.room.broadcast(r.io);
+            }
+            r.reader.stop();
+            r.exec.stdout.writer.stop(.drain);
+            r.exec.stderr.writer.stop(.drain);
+        }
 
         // Ends a signature the user hasn't approved, or a passphrase they
         // haven't typed.
@@ -697,7 +771,43 @@ const Run = struct {
             .attach => .{ .attach = .{ .session_id = r.options.session_id, .reuse = r.options.reuse_detached } },
             .list => .{ .list = .{} },
             .kill => |id| .{ .kill = .{ .session_id = id } },
+            .exec => |command| .{ .exec = .{ .command = command } },
         });
+
+        // Output may arrive before `AuthOk`. Reading stdin waits until now,
+        // so that it takes no keys meant for a passphrase prompt.
+        if (r.options.command == .exec) r.startExec() catch |err| {
+            r.failure = err;
+            r.finish(.{ .disconnected = .failed });
+        };
+    }
+
+    /// Starts the command's writers and its stdin reader.
+    fn startExec(r: *Run) !void {
+        const outputs = [_]struct { *Exec.Output, posix.fd_t, *const fn (?*anyopaque, tty.Writer.Event) void }{
+            .{ &r.exec.stdout, r.options.out_fd, onStdoutEvent },
+            .{ &r.exec.stderr, r.options.err_fd, onStderrEvent },
+        };
+        for (outputs, 0..) |entry, i| {
+            const output, const fd, const callback = entry;
+            output.writer.start(r.gpa, r.io, .{
+                .fd = fd,
+                .capacity = writer_options.capacity,
+                .high_water = writer_options.high_water,
+                .low_water = writer_options.low_water,
+                .context = r,
+                .callback = callback,
+            }) catch |err| {
+                if (i == 1) r.exec.stdout.writer.stop(.discard);
+                return err;
+            };
+        }
+        r.reader.start(.{ .fd = r.options.in_fd, .context = r, .callback = onReaderEvent }) catch |err| {
+            r.exec.stdout.writer.stop(.discard);
+            r.exec.stderr.writer.stop(.discard);
+            return err;
+        };
+        r.exec.started = true;
     }
 
     fn onAuthOk(r: *Run) void {
@@ -720,6 +830,7 @@ const Run = struct {
 
     fn onData(ctx: ?*anyopaque, stream: *Stream, bytes: []const u8, fin: bool) void {
         const r = fromCtx(ctx);
+        if (stream != r.stream) return r.onExecData(stream, bytes, fin);
 
         r.decoder.feed(bytes);
         while (r.outcome == null) {
@@ -733,6 +844,89 @@ const Run = struct {
 
         // The server finishes the stream only after Exit or Error.
         if (fin) r.finish(.{ .disconnected = .{ .peer = .{ .application = 0 } } });
+    }
+
+    /// Data on one of the streams of `Command.exec`.
+    fn onExecData(r: *Run, stream: *Stream, bytes: []const u8, fin: bool) void {
+        if (r.options.command != .exec or !r.exec.started) {
+            stream.consume(bytes.len);
+            return r.refuse("the server opened a stream unasked");
+        }
+        const output = switch (stream.id) {
+            Exec.stdout_id => &r.exec.stdout,
+            Exec.stderr_id => &r.exec.stderr,
+            Exec.stdin_id => {
+                // The server's side carries nothing.
+                stream.consume(bytes.len);
+                if (r.exec.stdin == null) {
+                    r.exec.stdin = stream;
+                    r.pumpStdin();
+                }
+                return;
+            },
+            else => {
+                stream.consume(bytes.len);
+                return r.refuse("the server opened a stream unasked");
+            },
+        };
+
+        output.stream = stream;
+        output.writer.write(bytes) catch |err| switch (err) {
+            error.Failed => return r.finish(.ended),
+            // The credit held above high water keeps the queue from
+            // filling.
+            error.QueueFull => unreachable,
+        };
+        if (output.writer.aboveHighWater()) output.held += bytes.len else stream.consume(bytes.len);
+        if (fin) {
+            output.fin = true;
+            r.finishExecIfDone();
+        }
+    }
+
+    /// The command is done once its exit status has come and both output
+    /// streams have ended. Their writers drain in `deinit`.
+    fn finishExecIfDone(r: *Run) void {
+        const exit = r.exec.exit orelse return;
+        if (!r.exec.stdout.fin or !r.exec.stderr.fin) return;
+        r.finish(.{ .exited = exit });
+    }
+
+    /// Moves stdin from the inbox to its stream while the stream has room,
+    /// and finishes the stream after the end of stdin.
+    fn pumpStdin(r: *Run) void {
+        const stream = r.exec.stdin orelse return;
+        while (!r.exec.stdin_done and stream.buffered() < stdin_high_water) {
+            var chunk: std.ArrayList(u8) = .empty;
+            defer chunk.deinit(r.gpa);
+            {
+                r.inbox.mutex.lockUncancelable(r.io);
+                defer r.inbox.mutex.unlock(r.io);
+                chunk = r.inbox.input;
+                r.inbox.input = .empty;
+                r.inbox.room.broadcast(r.io);
+            }
+            if (chunk.items.len == 0) {
+                if (r.exec.input_ended) {
+                    stream.finish();
+                    r.exec.stdin_done = true;
+                }
+                return;
+            }
+            stream.write(chunk.items) catch return r.finish(.{ .disconnected = .failed });
+        }
+    }
+
+    fn onAcked(ctx: ?*anyopaque, stream: *Stream) void {
+        const r = fromCtx(ctx);
+        if (stream == r.exec.stdin) r.pumpStdin();
+    }
+
+    fn onStreamClosed(ctx: ?*anyopaque, stream: *Stream) void {
+        const r = fromCtx(ctx);
+        for ([_]*?*Stream{ &r.exec.stdout.stream, &r.exec.stderr.stream, &r.exec.stdin }) |s| {
+            if (s.* == stream) s.* = null;
+        }
     }
 
     fn handle(r: *Run, message: proto.Message) void {
@@ -794,10 +988,15 @@ const Run = struct {
                 r.finish(.{ .listed = listed });
             },
             .killed => |m| r.finish(.{ .killed = m.session_id }),
-            .exit => |m| r.finish(.{ .exited = .{
-                .status = m.status,
-                .signal = if (m.signal) |s| .init(s) else null,
-            } }),
+            .exit => |m| {
+                const exit: Outcome.Exit = .{
+                    .status = m.status,
+                    .signal = if (m.signal) |s| .init(s) else null,
+                };
+                if (r.options.command != .exec) return r.finish(.{ .exited = exit });
+                r.exec.exit = exit;
+                r.finishExecIfDone();
+            },
             .@"error" => |m| {
                 // The server doesn't tell a client that isn't logged in which
                 // of the two it was.
@@ -961,7 +1160,13 @@ const Run = struct {
             r.inbox.mutex.lockUncancelable(r.io);
             defer r.inbox.mutex.unlock(r.io);
             switch (event) {
-                .data => |bytes| r.inbox.input.appendSlice(r.gpa, bytes) catch {},
+                .data => |bytes| {
+                    // A command's stdin waits for its stream to take it.
+                    while (r.options.command == .exec and r.inbox.input.items.len >= max_pending_stdin and !r.inbox.closed) {
+                        r.inbox.room.waitUncancelable(r.io, &r.inbox.mutex);
+                    }
+                    r.inbox.input.appendSlice(r.gpa, bytes) catch {};
+                },
                 .end_of_file, .failed => r.inbox.input_ended = true,
             }
         }
@@ -977,6 +1182,32 @@ const Run = struct {
             switch (event) {
                 .above_high_water => {},
                 .below_low_water => r.inbox.below_low_water = true,
+                .failed => r.inbox.output_failed = true,
+            }
+        }
+        r.wake.notify() catch {};
+    }
+
+    /// As `onWriterEvent`, for a command's writers.
+    fn onStdoutEvent(ctx: ?*anyopaque, event: tty.Writer.Event) void {
+        onExecWriterEvent(ctx, event, .stdout);
+    }
+
+    fn onStderrEvent(ctx: ?*anyopaque, event: tty.Writer.Event) void {
+        onExecWriterEvent(ctx, event, .stderr);
+    }
+
+    fn onExecWriterEvent(ctx: ?*anyopaque, event: tty.Writer.Event, which: enum { stdout, stderr }) void {
+        const r = fromCtx(ctx);
+        {
+            r.inbox.mutex.lockUncancelable(r.io);
+            defer r.inbox.mutex.unlock(r.io);
+            switch (event) {
+                .above_high_water => {},
+                .below_low_water => switch (which) {
+                    .stdout => r.inbox.stdout_low = true,
+                    .stderr => r.inbox.stderr_low = true,
+                },
                 .failed => r.inbox.output_failed = true,
             }
         }
@@ -1005,12 +1236,16 @@ const Run = struct {
         var input: std.ArrayList(u8) = .empty;
         defer input.deinit(r.gpa);
         var signature: ?(SignError![]u8) = null;
-        const resize, const terminate, const input_ended, const below_low_water, const output_failed = taken: {
+        const exec = r.options.command == .exec;
+        const resize, const terminate, const input_ended, const below_low_water, const output_failed, const stdout_low, const stderr_low = taken: {
             r.inbox.mutex.lockUncancelable(r.io);
             defer r.inbox.mutex.unlock(r.io);
             const box = &r.inbox;
-            input = box.input;
-            box.input = .empty;
+            // A command's stdin moves in `pumpStdin`, as its stream has room.
+            if (!exec) {
+                input = box.input;
+                box.input = .empty;
+            }
             signature = box.signature;
             box.signature = null;
             defer {
@@ -1019,9 +1254,32 @@ const Run = struct {
                 box.input_ended = false;
                 box.below_low_water = false;
                 box.output_failed = false;
+                box.stdout_low = false;
+                box.stderr_low = false;
             }
-            break :taken .{ box.resize, box.terminate, box.input_ended, box.below_low_water, box.output_failed };
+            break :taken .{ box.resize, box.terminate, box.input_ended, box.below_low_water, box.output_failed, box.stdout_low, box.stderr_low };
         };
+
+        if (exec) {
+            if (signature) |sig| r.onSignature(sig);
+            if (input_ended) r.exec.input_ended = true;
+            r.pumpStdin();
+
+            // A writer caught up: return the credit held back in
+            // `onExecData`.
+            for ([_]struct { bool, *Exec.Output }{
+                .{ stdout_low, &r.exec.stdout },
+                .{ stderr_low, &r.exec.stderr },
+            }) |entry| {
+                const low, const output = entry;
+                if (!low or output.held == 0) continue;
+                if (output.stream) |stream| stream.consume(output.held);
+                output.held = 0;
+            }
+
+            if (terminate or output_failed) r.finish(.ended);
+            return if (r.outcome == null) .rearm else .disarm;
+        }
 
         if (signature) |sig| r.onSignature(sig);
 

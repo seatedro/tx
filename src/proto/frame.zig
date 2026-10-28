@@ -204,7 +204,7 @@ const samples = [_]Message{
     .{ .ack = .{ .seq = 1 } },
     .{ .input = .{ .bytes = "\x1b[A" } },
     .{ .resize = .{ .cols = 100, .rows = 30, .cell_width_px = 9, .cell_height_px = 18 } },
-    .{ .unknown = .{ .type_id = messages.Killed.type_id + 1, .body = "" } },
+    .{ .unknown = .{ .type_id = messages.Exec.type_id + 1, .body = "" } },
     .{ .detach = .{} },
     .{ .exit = .{ .signal = "HUP" } },
     .{ .@"error" = .{ .code = 1, .message = "bye" } },
