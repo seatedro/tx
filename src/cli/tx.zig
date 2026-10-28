@@ -30,6 +30,8 @@
 //! A host with no key there, or one whose key changed, doesn't answer,
 //! and the install over ssh brings the key.
 //!
+//! A new session gets the client's `TERM`, `COLORTERM`, `LANG` and `LC_*`.
+//!
 //! The login uses the SSH agent's Ed25519 and RSA keys, then
 //! `~/.ssh/id_ed25519`.
 //!
@@ -202,6 +204,7 @@ pub fn main(init: std.process.Init) !u8 {
         .show_session_id = true,
         .term = environ.get("TERM") orelse "xterm-256color",
         .colorterm = environ.get("COLORTERM"),
+        .locale = try localeVariables(init.arena.allocator(), environ),
         .handshake_timeout_ns = no_answer_timeout_ns,
     };
     var install = trusted.install;
@@ -258,6 +261,35 @@ pub fn main(init: std.process.Init) !u8 {
             return 0;
         },
     }
+}
+
+/// The environment's `LANG` and `LC_*` variables, as `proto.Hello.locale`
+/// carries them. Empty ones are left out. Null if there are none.
+fn localeVariables(arena: Allocator, environ: *const std.process.Environ.Map) !?[]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var it = environ.iterator();
+    while (it.next()) |entry| {
+        if (!proto.isLocaleName(entry.key_ptr.*) or entry.value_ptr.len == 0) continue;
+        try out.print(arena, "{s}={s}\x00", .{ entry.key_ptr.*, entry.value_ptr.* });
+    }
+    return if (out.items.len == 0) null else out.items;
+}
+
+test localeVariables {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var environ: std.process.Environ.Map = .init(std.testing.allocator);
+    defer environ.deinit();
+    try std.testing.expectEqual(null, try localeVariables(arena.allocator(), &environ));
+
+    try environ.put("LANG", "en_US.UTF-8");
+    try environ.put("LC_TIME", "en_GB.UTF-8");
+    try environ.put("LC_ALL", "");
+    try environ.put("PATH", "/bin");
+    const items = (try localeVariables(arena.allocator(), &environ)).?;
+    try std.testing.expectEqual(2, std.mem.count(u8, items, "\x00"));
+    try std.testing.expect(std.mem.indexOf(u8, items, "LANG=en_US.UTF-8\x00") != null);
+    try std.testing.expect(std.mem.indexOf(u8, items, "LC_TIME=en_GB.UTF-8\x00") != null);
 }
 
 /// One line per session, under a header.

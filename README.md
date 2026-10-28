@@ -16,7 +16,8 @@ tx is early and changes often. Don't rely on it yet.
     tx --kill ID HOST       # end session ID
     tx --uninstall HOST     # end the sessions, and remove txd from HOST
 
-`~.` detaches.
+`~.` detaches. A new session gets the client's `TERM`, `COLORTERM`, `LANG`
+and `LC_*`.
 
 tx logs in with the same keys as ssh: the SSH agent's Ed25519 and RSA keys,
 then `~/.ssh/id_ed25519`. txd accepts the keys in `~/.ssh/authorized_keys`.

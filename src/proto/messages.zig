@@ -26,6 +26,9 @@ pub const Hello = struct {
     /// Null if the client's terminal doesn't report it.
     cell_width_px: ?u32 = null,
     cell_height_px: ?u32 = null,
+    /// The client's `LANG` and `LC_*` variables (see `isLocaleName`), as
+    /// `NAME=value` items that each end in NUL. Null if it has none.
+    locale: ?[]const u8 = null,
 
     pub const type_id = 1;
     pub const tags = .{
@@ -36,6 +39,7 @@ pub const Hello = struct {
         .rows = 5,
         .cell_width_px = 6,
         .cell_height_px = 7,
+        .locale = 8,
     };
 
     pub fn encodedLen(m: Hello) usize {
@@ -50,6 +54,15 @@ pub const Hello = struct {
         return decodeBody(Hello, bytes);
     }
 };
+
+/// Whether `name` is a variable `Hello.locale` carries: `LANG`, or `LC_`
+/// followed by capital letters and underscores, such as `LC_CTYPE`.
+pub fn isLocaleName(name: []const u8) bool {
+    if (std.mem.eql(u8, name, "LANG")) return true;
+    if (!std.mem.startsWith(u8, name, "LC_") or name.len == "LC_".len) return false;
+    for (name["LC_".len..]) |c| if (!std.ascii.isUpper(c) and c != '_') return false;
+    return true;
+}
 
 /// The server's answer to `Hello`.
 pub const HelloReply = struct {
@@ -936,6 +949,7 @@ test "every message round trips" {
             .rows = 24,
             .cell_width_px = 10,
             .cell_height_px = 20,
+            .locale = "LANG=en_US.UTF-8\x00LC_TIME=en_GB.UTF-8\x00",
         } },
         .{ .hello_reply = .{ .revision = 7 } },
         .{ .attach = .{ .session_id = std.math.maxInt(u64) } },
@@ -997,6 +1011,7 @@ test "absent optional fields decode to their defaults" {
     try testing.expectEqual(null, hello.hello.colorterm);
     try testing.expectEqual(null, hello.hello.cell_width_px);
     try testing.expectEqual(null, hello.hello.cell_height_px);
+    try testing.expectEqual(null, hello.hello.locale);
 
     try testing.expectEqual(null, (try Attach.decode("")).session_id);
     const exit = try Exit.decode("");
@@ -1042,6 +1057,11 @@ test "decoded bytes point into the input" {
     const output = try Output.decode(&body);
     try testing.expectEqual(5, output.seq);
     try testing.expectEqual(@as([*]const u8, &body) + 5, output.bytes.ptr);
+}
+
+test isLocaleName {
+    for ([_][]const u8{ "LANG", "LC_ALL", "LC_CTYPE", "LC_MEASUREMENT" }) |name| try testing.expect(isLocaleName(name));
+    for ([_][]const u8{ "", "LANGUAGE", "LC_", "LC_ctype", "LC_CTYPE=", "XLC_ALL", "PATH" }) |name| try testing.expect(!isLocaleName(name));
 }
 
 test "Hello encoding is stable" {
