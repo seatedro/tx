@@ -2,6 +2,7 @@
 //!
 //! Usage: txd [--listen ADDRESS:PORT] [--key PATH] [--open]
 //!            [--print-host-key] [--print-spa-key] [--install]
+//!        txd [--listen ADDRESS:PORT] --uninstall
 //!        txd --version
 //!        txd --session --fd N
 //!
@@ -23,7 +24,8 @@
 //! `--install` sets up a service that keeps txd running with the
 //! given `--listen`, `--key` and `--open`, starts it if it isn't running,
 //! and exits; see `install.zig`. With `--print-host-key` or
-//! `--print-spa-key`, those are printed first.
+//! `--print-spa-key`, those are printed first. `--uninstall` stops txd,
+//! ends its sessions, and removes the service and txd's files.
 //!
 //! `--session` runs one session, on the socket txd passes as fd N. txd
 //! starts it; see `session.process`.
@@ -64,6 +66,7 @@ pub fn main(init: std.process.Init) !u8 {
     var print_spa_key = false;
     var open = false;
     var install_service = false;
+    var uninstall = false;
     // `--listen` and `--key` as given, for the service.
     var listen_arg: ?[]const u8 = null;
     var i: usize = 1;
@@ -84,10 +87,27 @@ pub fn main(init: std.process.Init) !u8 {
             open = true;
         } else if (std.mem.eql(u8, arg, "--install")) {
             install_service = true;
+        } else if (std.mem.eql(u8, arg, "--uninstall")) {
+            uninstall = true;
         } else if (std.mem.eql(u8, arg, "--version")) {
             Io.File.stdout().writeStreamingAll(io, "txd " ++ build_options.version ++ "\n") catch return 1;
             return 0;
         } else return usage("unknown argument");
+    }
+
+    const user = paths.userName(init.environ_map) orelse {
+        std.debug.print("txd: can't tell the user name\n", .{});
+        return 1;
+    };
+
+    // Before the keys, which it removes.
+    if (uninstall) {
+        if (install_service or print_host_key or print_spa_key) return usage("--uninstall goes with --listen only");
+        install.uninstall(gpa, io, init.environ_map, user, listen) catch |err| {
+            std.debug.print("txd: --uninstall failed: {t}\n", .{err});
+            return 1;
+        };
+        return 0;
     }
 
     transport.crypto.init(io);
@@ -115,11 +135,6 @@ pub fn main(init: std.process.Init) !u8 {
         try w.interface.flush();
         if (!install_service) return 0;
     }
-
-    const user = paths.userName(init.environ_map) orelse {
-        std.debug.print("txd: can't tell the user name\n", .{});
-        return 1;
-    };
 
     if (install_service) {
         const arena = init.arena.allocator();
@@ -212,7 +227,7 @@ pub fn main(init: std.process.Init) !u8 {
 }
 
 fn usage(reason: []const u8) u8 {
-    std.debug.print("txd: {s}\nusage: txd [--listen ADDRESS:PORT] [--key PATH] [--open] [--print-host-key] [--print-spa-key] [--install]\n       txd --version\n       txd --session --fd N\n", .{reason});
+    std.debug.print("txd: {s}\nusage: txd [--listen ADDRESS:PORT] [--key PATH] [--open] [--print-host-key] [--print-spa-key] [--install]\n       txd [--listen ADDRESS:PORT] --uninstall\n       txd --version\n       txd --session --fd N\n", .{reason});
     return 2;
 }
 

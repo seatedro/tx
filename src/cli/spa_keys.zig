@@ -27,9 +27,21 @@ pub fn find(gpa: Allocator, io: Io, path: []const u8, name: []const u8) !?spa.Ke
 
 /// Records `key` for `name`, in place of the line it had.
 pub fn store(gpa: Allocator, io: Io, path: []const u8, name: []const u8, key: spa.Key) !void {
+    return rewrite(gpa, io, path, name, key);
+}
+
+/// Removes the line for `name`.
+pub fn remove(gpa: Allocator, io: Io, path: []const u8, name: []const u8) !void {
+    return rewrite(gpa, io, path, name, null);
+}
+
+/// Writes the file with every line but `name`'s, then `name`'s new key, if
+/// it has one.
+fn rewrite(gpa: Allocator, io: Io, path: []const u8, name: []const u8, key: ?spa.Key) !void {
     const dir = Io.Dir.cwd();
     const old = dir.readFileAlloc(io, path, gpa, .limited(1 << 20)) catch |err| switch (err) {
-        error.FileNotFound => try gpa.dupe(u8, ""),
+        // Nothing to remove.
+        error.FileNotFound => if (key == null) return else try gpa.dupe(u8, ""),
         else => |e| return e,
     };
     defer gpa.free(old);
@@ -44,8 +56,10 @@ pub fn store(gpa: Allocator, io: Io, path: []const u8, name: []const u8, key: sp
         if (parseLine(line)) |entry| if (std.mem.eql(u8, entry.name, name)) continue;
         try w.print("{s}\n", .{line});
     }
-    var text: [base64.Encoder.calcSize(32)]u8 = undefined;
-    try w.print("{s} {s}\n", .{ name, base64.Encoder.encode(&text, &key) });
+    if (key) |k| {
+        var text: [base64.Encoder.calcSize(32)]u8 = undefined;
+        try w.print("{s} {s}\n", .{ name, base64.Encoder.encode(&text, &k) });
+    }
 
     // Written whole, then renamed, so the file never holds part of one.
     // Mode 0600, as the key is a secret.
@@ -121,6 +135,10 @@ test "a host's key replaces its line, and the others stay" {
     const text = try tmp.dir.readFileAlloc(testing.io, "tx/spa_keys", testing.allocator, .limited(4096));
     defer testing.allocator.free(text);
     try testing.expectEqual(2, std.mem.count(u8, text, "\n"));
+
+    try remove(testing.allocator, testing.io, path, "a");
+    try testing.expectEqual(null, try find(testing.allocator, testing.io, path, "a"));
+    try testing.expectEqual(@as(spa.Key, @splat(2)), (try find(testing.allocator, testing.io, path, "[b]:9000")).?);
 }
 
 test "txd's SPA key line is found among its output" {

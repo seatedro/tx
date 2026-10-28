@@ -1,7 +1,8 @@
 //! tx: a session on a txd server.
 //!
 //! Usage: tx [-p PORT] [-l USER] [--attach ID | --new | --list | --kill ID]
-//!           [--server COMMAND] [--ssh PATH] [USER@]HOST
+//!           [--yes] [--server COMMAND] [--ssh PATH] [USER@]HOST
+//!        tx [-p PORT] [-l USER] [--ssh PATH] --uninstall [USER@]HOST
 //!        tx --version
 //!
 //! With none of `--attach`, `--new`, `--list` and `--kill`, tx attaches to
@@ -17,7 +18,12 @@
 //! The same ssh command runs `txd --install`, which sets up a service that
 //! keeps txd running on the host and starts it. tx runs the install over
 //! ssh again when nothing answers on the server's port. On a host with no
-//! txd, tx copies one there first; see `remote.zig`.
+//! txd, tx copies one there first; see `remote.zig`. Before the first copy
+//! to a host, tx asks, unless it is given `--yes`.
+//!
+//! `--uninstall` runs `txd --uninstall` over ssh, which ends the host's
+//! sessions and removes txd, its service and its files. tx then forgets the
+//! host's keys, since a txd installed later has new ones.
 //!
 //! txd answers only clients that hold its SPA key. Each ssh command
 //! reads it, and tx keeps it in `~/.config/tx/spa_keys` (see `spa_keys.zig`).
@@ -44,7 +50,11 @@ const spa_keys = @import("spa_keys.zig");
 
 const default_port = remote.default_port;
 
-const usage_text = "usage: tx [-p PORT] [-l USER] [--attach ID | --new | --list | --kill ID] [--server COMMAND] [--ssh PATH] [USER@]HOST\n       tx --version";
+const usage_text =
+    \\usage: tx [-p PORT] [-l USER] [--attach ID | --new | --list | --kill ID] [--yes] [--server COMMAND] [--ssh PATH] [USER@]HOST
+    \\       tx [-p PORT] [-l USER] [--ssh PATH] --uninstall [USER@]HOST
+    \\       tx --version
+;
 
 /// How long tx waits for an answer from the server's port before it
 /// starts txd over ssh, and after.
@@ -70,8 +80,11 @@ pub fn main(init: std.process.Init) !u8 {
     var session_id: ?u64 = null;
     var command: client.session.Command = .attach;
     var new = false;
-    // `--attach`, `--new`, `--list` and `--kill` exclude each other.
+    var uninstall = false;
+    // `--attach`, `--new`, `--list`, `--kill` and `--uninstall` exclude
+    // each other.
     var modes: usize = 0;
+    var first_install: remote.FirstInstall = .ask;
     var server_command: ?[]const u8 = null;
     var ssh_path: []const u8 = "ssh";
     var destination: ?[]const u8 = null;
@@ -98,6 +111,11 @@ pub fn main(init: std.process.Init) !u8 {
             i += 1;
             command = .{ .kill = std.fmt.parseInt(u64, args[i], 10) catch return usage("invalid session id") };
             modes += 1;
+        } else if (std.mem.eql(u8, arg, "--uninstall")) {
+            uninstall = true;
+            modes += 1;
+        } else if (std.mem.eql(u8, arg, "--yes")) {
+            first_install = .yes;
         } else if (std.mem.eql(u8, arg, "--server") and i + 1 < args.len) {
             i += 1;
             server_command = args[i];
@@ -112,7 +130,7 @@ pub fn main(init: std.process.Init) !u8 {
         } else return usage("unknown argument");
     }
 
-    if (modes > 1) return usage("--attach, --new, --list and --kill don't go together");
+    if (modes > 1) return usage("--attach, --new, --list, --kill and --uninstall don't go together");
 
     // `user@host`. A `-l` user wins, as in ssh.
     var host = destination orelse return usage("no host");
@@ -120,6 +138,30 @@ pub fn main(init: std.process.Init) !u8 {
         if (user == null) user = host[0..at];
         host = host[at + 1 ..];
     }
+
+    // ssh logs in to the same account, unless its config says otherwise.
+    var ssh_buf: [512]u8 = undefined;
+    const ssh_destination = if (user) |u| std.fmt.bufPrint(&ssh_buf, "{s}@{s}", .{ u, host }) catch host else host;
+    const ssh: remote.Source = .{
+        .ssh = ssh_path,
+        .destination = ssh_destination,
+        .server_command = server_command,
+        .port = port,
+        .signal_mask = signal_mask,
+        .environ = environ,
+        .first_install = first_install,
+    };
+
+    // The host's name in tx's files, and the files.
+    var name_buf: [512]u8 = undefined;
+    const known_name = auth.known_hosts.hostName(&name_buf, host, port, default_port) catch return fail("host name too long", .{});
+    const tx_known_hosts = try paths.config(gpa, environ, "known_hosts");
+    defer gpa.free(tx_known_hosts);
+    const tx_spa_keys = try paths.config(gpa, environ, "spa_keys");
+    defer gpa.free(tx_spa_keys);
+
+    if (uninstall) return uninstallOverSsh(gpa, io, ssh, tx_known_hosts, tx_spa_keys, known_name);
+
     const login_user = user orelse paths.userName(environ) orelse return fail("can't tell the local user name; use -l", .{});
     if (login_user.len == 0 or login_user.len > auth.login.max_user_len) return fail("invalid user name", .{});
 
@@ -133,26 +175,8 @@ pub fn main(init: std.process.Init) !u8 {
     defer identities.deinit(gpa);
     if (identities.list.items.len == 0) return fail("no keys to log in with: the SSH agent has no Ed25519 or RSA keys, and there is no ~/.ssh/id_ed25519", .{});
 
-    // ssh logs in to the same account, unless its config says otherwise.
-    var ssh_buf: [512]u8 = undefined;
-    const ssh_destination = if (user) |u| std.fmt.bufPrint(&ssh_buf, "{s}@{s}", .{ u, host }) catch host else host;
-
     // The keys known_hosts lists for the host, or the one the user accepts.
-    var name_buf: [512]u8 = undefined;
-    const known_name = auth.known_hosts.hostName(&name_buf, host, port, default_port) catch return fail("host name too long", .{});
-    const tx_known_hosts = try paths.config(gpa, environ, "known_hosts");
-    defer gpa.free(tx_known_hosts);
-    const tx_spa_keys = try paths.config(gpa, environ, "spa_keys");
-    defer gpa.free(tx_spa_keys);
     const ssh_spa_key: SshSpaKey = .{ .path = tx_spa_keys, .name = known_name, .host = host };
-    const ssh: remote.Source = .{
-        .ssh = ssh_path,
-        .destination = ssh_destination,
-        .server_command = server_command,
-        .port = port,
-        .signal_mask = signal_mask,
-        .environ = environ,
-    };
     const trusted = trustedKeys(gpa, io, environ, tx_known_hosts, known_name, addresses, ssh, ssh_spa_key) catch |err| switch (err) {
         error.Declined => return 255,
         else => return fail("checking the host key failed: {t}", .{err}),
@@ -188,6 +212,7 @@ pub fn main(init: std.process.Init) !u8 {
     if (outcome == .no_connection and install == .not_run) {
         std.debug.print("tx: nothing answers on {s} port {d}; starting txd over ssh\n", .{ host, port });
         install = installOverSsh(gpa, io, ssh, ssh_spa_key, &options.spa_key);
+        if (install == .declined) return 255;
         if (install == .done) outcome = client.session.run(gpa, io, options) catch |err| return fail("{t}", .{err});
     }
 
@@ -400,7 +425,13 @@ fn keyFilePublicKey(gpa: Allocator, io: Io, path: []const u8) !auth.ssh.PublicKe
 }
 
 /// Whether tx ran `txd --install` over ssh, and how it went.
-const Install = enum { not_run, failed, done };
+const Install = enum {
+    not_run,
+    /// The user said no to installing txd on the host.
+    declined,
+    failed,
+    done,
+};
 
 /// Where an SPA key read over ssh is recorded.
 const SshSpaKey = struct {
@@ -430,13 +461,42 @@ const SshSpaKey = struct {
 /// Starts txd on the host, and sets up its service. Sets `spa_key` to the
 /// SPA key txd printed.
 fn installOverSsh(gpa: Allocator, io: Io, source: remote.Source, ssh_spa_key: SshSpaKey, spa_key: *?transport.spa.Key) Install {
-    const result = remote.runTxd(gpa, io, source, &.{ "--print-spa-key", "--install" }) catch |err| {
-        if (err != error.NoTxd) std.debug.print("tx: can't run txd over ssh: {t}\n", .{err});
-        return .failed;
+    const result = remote.runTxd(gpa, io, source, &.{ "--print-spa-key", "--install" }) catch |err| switch (err) {
+        error.Declined => return .declined,
+        error.NoTxd => return .failed,
+        else => {
+            std.debug.print("tx: can't run txd over ssh: {t}\n", .{err});
+            return .failed;
+        },
     };
     defer gpa.free(result.stdout);
     if (ssh_spa_key.take(gpa, io, result.stdout)) |key| spa_key.* = key;
     return if (result.ok) .done else .failed;
+}
+
+/// Runs `txd --uninstall` on the host, then removes the host's lines from
+/// tx's known_hosts and SPA keys. A host where tx never put txd is left
+/// alone.
+fn uninstallOverSsh(gpa: Allocator, io: Io, source: remote.Source, tx_known_hosts: []const u8, tx_spa_keys: []const u8, name: []const u8) u8 {
+    var s = source;
+    s.first_install = .no;
+    const result = remote.runTxd(gpa, io, s, &.{"--uninstall"}) catch |err| switch (err) {
+        error.NotInstalled => return fail("{s} has no txd from tx", .{source.destination}),
+        error.NoTxd => return 255,
+        else => return fail("can't run txd over ssh: {t}", .{err}),
+    };
+    gpa.free(result.stdout);
+    if (!result.ok) return fail("txd --uninstall failed on {s}", .{source.destination});
+
+    // A txd installed later has new keys.
+    auth.known_hosts.remove(gpa, io, tx_known_hosts, name) catch |err| {
+        return fail("can't remove {s} from {s}: {t}", .{ name, tx_known_hosts, err });
+    };
+    spa_keys.remove(gpa, io, tx_spa_keys, name) catch |err| {
+        return fail("can't remove {s} from {s}: {t}", .{ name, tx_spa_keys, err });
+    };
+    std.debug.print("tx: removed {s} from {s} and {s}\n", .{ name, tx_known_hosts, tx_spa_keys });
+    return 0;
 }
 
 /// What txd printed over ssh on first contact.
@@ -511,8 +571,9 @@ fn trustedKeys(
         const keys = try gpa.alloc(auth.Key, 1);
         keys[0] = key;
         return .{ .keys = keys, .install = install, .spa_key = read.spa_key };
-    } else |err| {
-        std.debug.print("tx: can't read the host key over ssh: {t}\n", .{err});
+    } else |err| switch (err) {
+        error.Declined => return error.Declined,
+        else => std.debug.print("tx: can't read the host key over ssh: {t}\n", .{err}),
     }
 
     // Otherwise the server's own word, checked by the user.

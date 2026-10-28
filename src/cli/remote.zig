@@ -19,6 +19,10 @@
 //! 3. tx downloads the tarball, keeps its txd in `~/.cache/tx/VERSION/`,
 //!    and sends that.
 //!
+//! Before it puts txd on a host that has never had one from tx, tx asks
+//! (see `FirstInstall`). A host with a txd from another version of tx is
+//! upgraded without asking.
+//!
 //! A development build has no release to download, and only does 2.
 //! Development builds share a version, so DIR adds the first 12 hex digits
 //! of that txd's SHA-256, and a rebuilt txd is sent again.
@@ -70,6 +74,17 @@ pub const Source = struct {
     /// handle. ssh starts with it, since a child inherits the mask.
     signal_mask: std.posix.sigset_t,
     environ: *const std.process.Environ.Map,
+    first_install: FirstInstall = .ask,
+};
+
+/// What tx does on a host that has never had a txd from tx.
+pub const FirstInstall = enum {
+    /// Asks on the terminal, and fails with `error.Declined` on a no.
+    ask,
+    /// Installs txd without asking.
+    yes,
+    /// Fails with `error.NotInstalled`.
+    no,
 };
 
 /// The statuses `remote.sh` exits with.
@@ -102,11 +117,15 @@ pub fn runTxd(gpa: Allocator, io: Io, source: Source, args: []const []const u8) 
     const found = try runStep(gpa, io, source, .{ .step = "run", .dir = local.dir }, txd_args.items, null);
     const need = needed(found) orelse return found;
     defer gpa.free(found.stdout);
+    if (need.first and source.first_install == .no) return error.NotInstalled;
 
     const platform = Platform.fromUname(need.system, need.machine) orelse {
         std.debug.print("tx: {s} has no txd, and tx has no build for {s} {s}\n", .{ source.destination, need.system, need.machine });
         return error.NoTxd;
     };
+
+    // The user's yes, before tx puts anything on a host for the first time.
+    if (need.first and source.first_install == .ask and !try askToInstall(io, source, platform)) return error.Declined;
 
     // A release build's tarball for the platform, which the host can
     // download.
@@ -179,7 +198,12 @@ fn writeWord(w: *Io.Writer, word: []const u8) !void {
     try w.writeByte('\'');
 }
 
-const Need = struct { system: []const u8, machine: []const u8 };
+const Need = struct {
+    system: []const u8,
+    machine: []const u8,
+    /// No other version of tx has put txd on the host.
+    first: bool,
+};
 
 /// The host's platform, when the remote command reported it has no txd.
 fn needed(result: Result) ?Need {
@@ -188,7 +212,46 @@ fn needed(result: Result) ?Need {
     if (!std.mem.eql(u8, fields.next() orelse return null, "need")) return null;
     const system = fields.next() orelse return null;
     const machine = fields.next() orelse return null;
-    return .{ .system = system, .machine = machine };
+    const previous = fields.next() orelse "first";
+    return .{ .system = system, .machine = machine, .first = !std.mem.eql(u8, previous, "upgrade") };
+}
+
+/// Asks on the controlling terminal whether to install txd on a host that
+/// has never had it. An empty answer is yes.
+fn askToInstall(io: Io, source: Source, platform: Platform) !bool {
+    const destination = source.destination;
+    const tty = Io.Dir.openFileAbsolute(io, "/dev/tty", .{ .mode = .read_write }) catch {
+        std.debug.print("tx: {s} has no txd, and there's no terminal to ask on. With --yes, tx installs it without asking.\n", .{destination});
+        return false;
+    };
+    defer tty.close(io);
+
+    // The uninstall command names the port as this one did.
+    var port_buf: [16]u8 = undefined;
+    const port_arg = if (source.port == default_port) "" else std.fmt.bufPrint(&port_buf, "-p {d} ", .{source.port}) catch unreachable;
+
+    var write_buf: [1024]u8 = undefined;
+    var tw = tty.writerStreaming(io, &write_buf);
+    const w = &tw.interface;
+    try w.print(
+        \\{s} has no txd. tx can install txd {s} for {s}-{s} in ~/.local/share/tx
+        \\there, and keep it running as a user service. `tx {s}--uninstall {s}` removes it.
+        \\
+    , .{ destination, build_options.version, platform.os, platform.arch, port_arg, destination });
+    try w.writeAll("Install txd? [Y/n] ");
+
+    var read_buf: [256]u8 = undefined;
+    var tr = tty.readerStreaming(io, &read_buf);
+    while (true) {
+        try w.flush();
+
+        // End of input declines.
+        const line = (tr.interface.takeDelimiter('\n') catch return false) orelse return false;
+        const answer = std.mem.trim(u8, line, " \t\r");
+        if (answer.len == 0 or std.ascii.eqlIgnoreCase(answer, "y") or std.ascii.eqlIgnoreCase(answer, "yes")) return true;
+        if (std.ascii.eqlIgnoreCase(answer, "n") or std.ascii.eqlIgnoreCase(answer, "no")) return false;
+        try w.writeAll("Please type 'y' or 'n': ");
+    }
 }
 
 pub const Result = struct {
@@ -470,9 +533,13 @@ test writeWord {
 }
 
 test needed {
-    var stdout = "need Linux aarch64\n".*;
-    const need = needed(.{ .ok = false, .status = need_status, .stdout = &stdout }).?;
+    var first = "need Linux aarch64 first\n".*;
+    const need = needed(.{ .ok = false, .status = need_status, .stdout = &first }).?;
     try testing.expectEqualStrings("Linux", need.system);
     try testing.expectEqualStrings("aarch64", need.machine);
-    try testing.expect(needed(.{ .ok = false, .status = 1, .stdout = &stdout }) == null);
+    try testing.expect(need.first);
+    try testing.expect(needed(.{ .ok = false, .status = 1, .stdout = &first }) == null);
+
+    var upgrade = "need Darwin arm64 upgrade\n".*;
+    try testing.expect(!needed(.{ .ok = false, .status = need_status, .stdout = &upgrade }).?.first);
 }
