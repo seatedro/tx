@@ -167,7 +167,8 @@ pub fn main(init: std.process.Init) !u8 {
 
     // Sessions get a small environment, like the one sshd gives: the
     // allowlist, the locale, and TX_SESSION. Each session adds TERM and
-    // COLORTERM from its client.
+    // COLORTERM from its client, and the client's LANG and LC_* in place of
+    // txd's.
     var environ: std.process.Environ.Map = .init(gpa);
     defer environ.deinit();
     for (inherited) |name| if (init.environ_map.get(name)) |value| try environ.put(name, value);

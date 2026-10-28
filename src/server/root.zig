@@ -34,6 +34,7 @@
 //! Listening on a wildcard address binds each address it covers, and
 //! follows addresses as they come and go (see `addresses`).
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const IpAddress = Io.net.IpAddress;
@@ -72,7 +73,7 @@ pub const Options = struct {
     /// Where the session processes log. Null is txd's stderr.
     session_log: ?posix.fd_t = null,
     /// The environment of new sessions. `TERM` and `COLORTERM` come from the
-    /// client.
+    /// client, and so do the `LANG` and `LC_*` variables it sends.
     environ: *const std.process.Environ.Map,
     /// argv of the program new sessions run. See `session.pty.Options`.
     argv: []const []const u8,
@@ -480,6 +481,17 @@ pub const Server = struct {
         if (hello.colorterm.items.len > 0) try environ.put("COLORTERM", hello.colorterm.items);
         try environ.put("TX_SESSION_ID", try std.fmt.allocPrint(arena, "{d}", .{id}));
 
+        // The client's locale variables, in place of the server's. Items
+        // that aren't one are left out.
+        var items = std.mem.splitScalar(u8, hello.locale.items, 0);
+        while (items.next()) |item| {
+            const eq = std.mem.indexOfScalar(u8, item, '=') orelse continue;
+            const name = item[0..eq];
+            const value = item[eq + 1 ..];
+            if (!proto.isLocaleName(name) or value.len == 0) continue;
+            try environ.put(name, localeValue(value));
+        }
+
         // Lists of NUL-terminated items.
         var environ_list: std.ArrayList(u8) = .empty;
         var it = environ.iterator();
@@ -522,15 +534,31 @@ pub const Server = struct {
     }
 };
 
+/// macOS's Terminal sets `LC_CTYPE=UTF-8`, which names no locale on Linux.
+/// There, it is `C.UTF-8`.
+fn localeValue(value: []const u8) []const u8 {
+    if (builtin.os.tag == .linux and std.mem.eql(u8, value, "UTF-8")) return "C.UTF-8";
+    return value;
+}
+
 /// What a client said in `Hello`, copied out of the decoder's buffer.
 const Hello = struct {
     term: std.ArrayList(u8) = .empty,
     colorterm: std.ArrayList(u8) = .empty,
+    /// See `proto.Hello.locale`.
+    locale: std.ArrayList(u8) = .empty,
     size: term.log.Resize = undefined,
+
+    fn copy(h: *Hello, gpa: Allocator, m: proto.Hello) Allocator.Error!void {
+        try h.term.appendSlice(gpa, m.term);
+        try h.colorterm.appendSlice(gpa, m.colorterm orelse "");
+        try h.locale.appendSlice(gpa, m.locale orelse "");
+    }
 
     fn deinit(h: *Hello, gpa: Allocator) void {
         h.term.deinit(gpa);
         h.colorterm.deinit(gpa);
+        h.locale.deinit(gpa);
     }
 };
 
@@ -606,8 +634,10 @@ const Client = struct {
         const gpa = client.server.gpa;
         var hello: Hello = .{ .size = boundedSize(m.cols, m.rows, cellSize(m.cell_width_px, m.cell_height_px)) orelse
             .{ .cols = 80, .rows = 24 } };
-        hello.term.appendSlice(gpa, m.term) catch return client.fail(.protocol, "out of memory");
-        hello.colorterm.appendSlice(gpa, m.colorterm orelse "") catch return client.fail(.protocol, "out of memory");
+        hello.copy(gpa, m) catch {
+            hello.deinit(gpa);
+            return client.fail(.protocol, "out of memory");
+        };
         client.hello = hello;
         client.send(.{ .hello_reply = .{ .revision = proto.revision } });
     }

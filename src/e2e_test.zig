@@ -1264,6 +1264,35 @@ test "attaching before login is refused" {
 
 const raw_hello: proto.Hello = .{ .revision = proto.revision, .term = "xterm-256color", .cols = 80, .rows = 24 };
 
+test "a new session gets the client's locale variables in place of the server's" {
+    transport.crypto.init(testing.io);
+    var environ = try testEnviron();
+    defer environ.deinit();
+    try environ.put("LANG", "C");
+    try environ.put("LC_TIME", "C");
+    var login: Login = undefined;
+    try login.init(null);
+    defer login.deinit();
+    var st: ServerThread = undefined;
+    try st.init(try login.serverOptions(&environ, &.{
+        "/bin/sh", "-c",
+        \\printf 'lang=%s ctype=%s time=%s other=%s.\r\n' "$LANG" "$LC_CTYPE" "$LC_TIME" "${OTHER-unset}"
+        \\sleep 10
+    }));
+    defer st.deinit();
+
+    // Items that aren't locale variables, or have no value, are left out.
+    var hello = raw_hello;
+    hello.locale = "LANG=en_US.UTF-8\x00LC_CTYPE=UTF-8\x00OTHER=x\x00LC_time=y\x00LC_TIME=\x00LC_ALL\x00";
+    var rc: RawClient = undefined;
+    try rc.init(&st, login.key, hello);
+    defer rc.deinit();
+
+    // On Linux, macOS's `UTF-8` is `C.UTF-8`.
+    const ctype = if (builtin.os.tag == .linux) "C.UTF-8" else "UTF-8";
+    try rc.waitOutput("lang=en_US.UTF-8 ctype=" ++ ctype ++ " time=C other=unset.");
+}
+
 test "a client that sends more after the server's error is closed when its stream ends" {
     transport.crypto.init(testing.io);
     var environ: std.process.Environ.Map = .init(gpa);
@@ -1369,6 +1398,7 @@ fn writeFuzzLogin(in: fuzz.Input, w: *Io.Writer, key_blob: []const u8) !void {
                 .rows = in.any(u16),
                 .cell_width_px = if (in.any(bool)) in.any(u32) else null,
                 .cell_height_px = if (in.any(bool)) in.any(u32) else null,
+                .locale = if (in.any(bool)) in.bytes(a[64..256]) else null,
             } },
             1 => .{ .auth_probe = .{ .user = user, .key = key } },
             2 => .{ .auth_signature = .{ .user = user, .key = key, .signature = in.bytes(&b) } },

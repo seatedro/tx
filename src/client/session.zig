@@ -81,6 +81,8 @@ pub const Options = struct {
     out_fd: posix.fd_t = posix.STDOUT_FILENO,
     term: []const u8,
     colorterm: ?[]const u8 = null,
+    /// See `proto.Hello.locale`.
+    locale: ?[]const u8 = null,
     /// Null disables `~.`.
     escape_char: ?u8 = '~',
     idle_timeout_ns: u64 = 30 * std.time.ns_per_s,
@@ -536,6 +538,7 @@ const Run = struct {
             .rows = r.size.rows,
             .cell_width_px = cell_w,
             .cell_height_px = cell_h,
+            .locale = r.options.locale,
         } });
         if (r.resume_key) |*key| r.sendResume(conn, key) else r.probe();
     }
