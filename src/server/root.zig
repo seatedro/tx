@@ -358,6 +358,14 @@ pub const Server = struct {
             client.held += bytes.len;
         } else stream.consume(bytes.len);
 
+        // Once the server has sent `Error` or `Exit` and finished its side,
+        // what the client sends is dropped, with what was left of the
+        // chunk then.
+        if (stream.fin) {
+            if (fin) stream.conn.close(0);
+            return;
+        }
+
         client.decoder.feed(bytes);
         while (true) {
             const message = client.decoder.next() catch return client.fail(.protocol, "malformed message");

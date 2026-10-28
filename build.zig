@@ -31,6 +31,10 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     const test_network_step = b.step("test-network", "Run unit tests, including ones that need the internet");
 
+    // For the fuzz tests. One module, since a test build may reach it
+    // through more than one of its modules.
+    const fuzz = b.createModule(.{ .root_source_file = b.path("src/fuzz.zig") });
+
     const crypto_tests = b.addTest(.{
         .name = "crypto-test",
         .root_module = cryptoModule(b, target, optimize, transport_libs.picotls),
@@ -46,6 +50,7 @@ pub fn build(b: *std.Build) void {
         .name = "transport-test",
         .root_module = transportModule(b, target, optimize, transport_libs),
     });
+    transport_tests.root_module.addImport("fuzz", fuzz);
     addTestRuns(b, transport_tests, test_step, test_network_step);
 
     const term_tests = b.addTest(.{
@@ -70,13 +75,33 @@ pub fn build(b: *std.Build) void {
         .name = "proto-test",
         .root_module = protoModule(b, target, optimize),
     });
+    proto_tests.root_module.addImport("fuzz", fuzz);
     addTestRuns(b, proto_tests, test_step, test_network_step);
 
     const auth_tests = b.addTest(.{
         .name = "auth-test",
         .root_module = authModule(b, target, optimize),
     });
+    auth_tests.root_module.addImport("fuzz", fuzz);
     addTestRuns(b, auth_tests, test_step, test_network_step);
+
+    // The tests with fuzz tests that `--fuzz` can build. Under it, C code
+    // doesn't link and ghostty-vt's build makes a Unicode table that
+    // doesn't compile. So the SPA guard's tests build alone, and the
+    // end-to-end tests are left out.
+    const spa_tests = b.addTest(.{
+        .name = "spa-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/transport/spa.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    spa_tests.root_module.addImport("fuzz", fuzz);
+    const fuzz_step = b.step("fuzz", "Run the fuzz tests of what a client reaches before login; with --fuzz, fuzz them");
+    for ([_]*std.Build.Step.Compile{ proto_tests, auth_tests, spa_tests }) |tests| {
+        fuzz_step.dependOn(&b.addRunArtifact(tests).step);
+    }
 
     const app = appModules(b, target, optimize, libs);
     const term = app.term;
@@ -145,6 +170,7 @@ pub fn build(b: *std.Build) void {
     e2e.addImport("term", term);
     e2e.addImport("proto", proto);
     e2e.addImport("auth", auth);
+    e2e.addImport("fuzz", fuzz);
     const e2e_options = b.addOptions();
     e2e_options.addOptionPath("txd_exe", txd_bin.getEmittedBin());
     e2e.addImport("build_options", e2e_options.createModule());

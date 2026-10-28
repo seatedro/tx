@@ -364,65 +364,113 @@ test "a stream that ends inside a message yields nothing more" {
     try testing.expect(d.pending.items.len > 0);
 }
 
-/// Feeds `stream` in random chunks until it is used up or `next` fails.
-fn fuzzOne(random: std.Random, stream: []const u8) !void {
-    var d: Decoder = .init(testing.allocator, 512);
-    defer d.deinit();
+const fuzz = @import("fuzz");
+
+test "fuzz: a stream decodes the same whole and in chunks, and its messages encode back" {
+    try fuzz.run({}, fuzzStream, .{});
+}
+
+/// One input: a stream from `writeFuzzStream`, given whole to one decoder
+/// and in fuzzed chunks to another. Both must yield the same frames, then
+/// stop the same way: out of input, or with the same error. Each frame
+/// that decodes must decode the same after it is encoded again.
+fn fuzzStream(_: void, in: fuzz.Input) !void {
+    var out: Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try writeFuzzStream(in, &out.writer);
+    const stream = out.written();
+
+    // Whole. Its frames point into `stream`.
+    var whole: Decoder = .init(testing.allocator, fuzz_max_body);
+    defer whole.deinit();
+    var frames: std.ArrayList(Decoder.Raw) = .empty;
+    defer frames.deinit(testing.allocator);
+    whole.feed(stream);
+    const whole_end: Decoder.Error!void = while (true) {
+        const raw = (whole.nextRaw() catch |err| break err) orelse break;
+        try frames.append(testing.allocator, raw);
+        if (raw.decode()) |m| try expectEncodesBack(m) else |_| {}
+    };
+
+    // In chunks of 1 to 64 bytes.
+    var split: Decoder = .init(testing.allocator, fuzz_max_body);
+    defer split.deinit();
+    var n: usize = 0;
     var start: usize = 0;
-    while (start < stream.len) {
-        const end = start + random.uintAtMost(usize, @min(stream.len - start, 64));
-        d.feed(stream[start..end]);
+    const split_end: Decoder.Error!void = chunks: while (start < stream.len) {
+        const end = @min(stream.len, start + in.int(u8, 1, 64));
+        split.feed(stream[start..end]);
         start = end;
-        while (d.next()) |m| {
-            _ = m orelse break;
-        } else |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return,
+        while (true) {
+            const raw = (split.nextRaw() catch |err| break :chunks err) orelse break;
+            try testing.expect(n < frames.items.len);
+            try testing.expectEqual(frames.items[n].type_id, raw.type_id);
+            try testing.expectEqualSlices(u8, frames.items[n].bytes, raw.bytes);
+            n += 1;
         }
+    };
+
+    try testing.expectEqual(frames.items.len, n);
+    try testing.expectEqual(whole_end, split_end);
+}
+
+/// The longest body the fuzz decoders take.
+const fuzz_max_body = 512;
+
+/// The type of every message this revision defines.
+const fuzz_type_ids = ids: {
+    var ids: []const u64 = &.{};
+    for (@typeInfo(Message).@"union".field_types) |T| {
+        if (T != Message.Unknown) ids = ids ++ .{T.type_id};
+    }
+    break :ids ids[0..ids.len].*;
+};
+
+/// Writes up to 32 frames: mostly of defined types, with bodies of fields
+/// with the small tags messages use, and true lengths. The rest of the
+/// types, bodies and lengths are anything.
+fn writeFuzzStream(in: fuzz.Input, w: *Writer) !void {
+    var body_buf: [fuzz_max_body + 64]u8 = undefined;
+    for (0..32) |_| {
+        if (in.done()) break;
+        const type_id = if (in.chance(7, 1))
+            fuzz_type_ids[in.index(fuzz_type_ids.len)]
+        else
+            in.any(u64) & wire.max_varint;
+
+        var body: Writer = .fixed(&body_buf);
+        if (in.chance(7, 1)) {
+            for (0..16) |_| {
+                if (in.done()) break;
+                const tag = in.int(u64, 0, 12);
+                var value_buf: [64]u8 = undefined;
+                (switch (in.index(3)) {
+                    0 => wire.writeUintField(&body, tag, in.int(u64, 0, 300)),
+                    1 => wire.writeUintField(&body, tag, in.any(u64)),
+                    else => wire.writeBytesField(&body, tag, in.bytes(&value_buf)),
+                }) catch break;
+            }
+        } else {
+            body.end = in.bytes(&body_buf).len;
+        }
+
+        const len = if (in.chance(15, 1)) body.end else in.int(u64, 0, fuzz_max_body + 64);
+        try wire.writeVarint(w, type_id);
+        try wire.writeVarint(w, len);
+        try w.writeAll(body.buffered());
     }
 }
 
-test "random and mutated input decodes or fails cleanly" {
-    const valid = try sampleStream(testing.allocator);
-    defer testing.allocator.free(valid);
-    const buf = try testing.allocator.alloc(u8, valid.len + 64);
-    defer testing.allocator.free(buf);
+/// `m` encodes to `encodedLen(m)` bytes, which decode to `m`.
+fn expectEncodesBack(m: Message) !void {
+    var out: Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try encode(&out.writer, m);
+    try testing.expectEqual(encodedLen(m), out.written().len);
 
-    var prng: std.Random.DefaultPrng = .init(0x7478_7072_6f74_6f00);
-    const random = prng.random();
-    for (0..20_000) |_| {
-        var len: usize = undefined;
-        switch (random.uintLessThan(u8, 4)) {
-            0 => {
-                len = random.uintAtMost(usize, buf.len);
-                random.bytes(buf[0..len]);
-            },
-            1 => {
-                // Flip bits.
-                len = valid.len;
-                @memcpy(buf[0..len], valid);
-                for (0..random.uintAtMost(usize, 4)) |_| {
-                    buf[random.uintLessThan(usize, len)] ^= @as(u8, 1) << random.int(u3);
-                }
-            },
-            2 => {
-                // Overwrite a byte with a value likely to be a varint
-                // prefix.
-                len = valid.len;
-                @memcpy(buf[0..len], valid);
-                buf[random.uintLessThan(usize, len)] = random.uintLessThan(u8, 4) << 6 | random.int(u6);
-            },
-            else => {
-                // Splice a slice of the stream into another offset.
-                len = valid.len;
-                @memcpy(buf[0..len], valid);
-                const from = random.uintLessThan(usize, len);
-                const n = random.uintAtMost(usize, @min(len - from, 64));
-                const to = random.uintAtMost(usize, len - n);
-                @memcpy(buf[to..][0..n], valid[from..][0..n]);
-                len = random.uintAtMost(usize, len);
-            },
-        }
-        try fuzzOne(random, buf[0..len]);
-    }
+    var d: Decoder = .init(testing.allocator, out.written().len);
+    defer d.deinit();
+    d.feed(out.written());
+    try testing.expectEqualDeep(m, (try d.next()).?);
+    try testing.expectEqual(null, try d.next());
 }

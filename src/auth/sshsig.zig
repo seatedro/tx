@@ -152,3 +152,87 @@ test "a signature made here verifies" {
     const other = Ed25519.KeyPair.generate(testing.io);
     try testing.expectError(error.BadSignature, verify(&.fromEd25519(other.public_key.toBytes()), &blob, &data));
 }
+
+const fuzz = @import("fuzz");
+
+test "fuzz: no signature verifies against a key made of fuzzed fields" {
+    try fuzz.run({}, fuzzVerify, .{ .count = 300 });
+}
+
+/// One input: a key blob and a signature blob from `writeFuzzKeyBlob` and
+/// `writeFuzzSignatureBlob`, mostly of one shape. A key that parses keeps
+/// its blob, and the signature doesn't verify: making one that does takes
+/// the private key.
+fn fuzzVerify(_: void, in: fuzz.Input) !void {
+    const shape = in.enumValue(FuzzShape);
+    var key_buf: [ssh.max_key_blob_len + 64]u8 = undefined;
+    var key_w: Writer = .fixed(&key_buf);
+    try writeFuzzKeyBlob(in, &key_w, shape);
+    var sig_buf: [1024]u8 = undefined;
+    var sig_w: Writer = .fixed(&sig_buf);
+    try writeFuzzSignatureBlob(in, &sig_w, if (in.chance(7, 1)) shape else in.enumValue(FuzzShape));
+
+    const key = ssh.PublicKey.parse(key_w.buffered()) catch return;
+    try testing.expectEqualSlices(u8, key_w.buffered(), key.blob());
+    if (verify(&key, sig_w.buffered(), &.init("tx-auth-v1@tx", "fuzz"))) {
+        return error.ForgedSignature;
+    } else |_| {}
+}
+
+const FuzzShape = enum { ed25519, rsa, bytes };
+
+/// A key blob of `shape` with fuzzed fields, mostly of the lengths tx
+/// takes. Sometimes with bytes after the last field.
+fn writeFuzzKeyBlob(in: fuzz.Input, w: *Writer, shape: FuzzShape) !void {
+    var buf: [ssh.max_key_blob_len]u8 = undefined;
+    switch (shape) {
+        .ed25519 => {
+            try ssh.writeString(w, ssh.ed25519);
+            if (in.chance(15, 1)) {
+                in.fill(buf[0..32]);
+                try ssh.writeString(w, buf[0..32]);
+            } else try ssh.writeString(w, in.bytes(buf[0..64]));
+        },
+        .rsa => {
+            try ssh.writeString(w, ssh.rsa);
+
+            // Mostly the exponent signers use.
+            try ssh.writeString(w, if (in.chance(3, 1)) "\x01\x00\x01" else in.bytes(buf[0..5]));
+
+            // A modulus length tx takes, give or take a byte, sometimes
+            // with an mpint's leading zero. Mostly odd and with its top
+            // bit set, as a real modulus is.
+            const lens = ssh.rsa_modulus_lens;
+            const len = lens[in.index(lens.len)] + (if (in.chance(3, 1)) 1 else in.int(usize, 0, 2)) - 1;
+            const zero: usize = if (in.chance(1, 3)) 1 else 0;
+            buf[0] = 0;
+            const n = buf[zero .. zero + len];
+            in.fill(n);
+            if (in.chance(7, 1)) {
+                n[0] |= 0x80;
+                n[n.len - 1] |= 1;
+            }
+            try ssh.writeString(w, buf[0 .. zero + len]);
+        },
+        .bytes => try w.writeAll(in.bytes(&buf)),
+    }
+    if (in.chance(1, 15)) try w.writeAll(in.bytes(buf[0..8]));
+}
+
+/// A signature blob of `shape` with fuzzed fields.
+fn writeFuzzSignatureBlob(in: fuzz.Input, w: *Writer, shape: FuzzShape) !void {
+    var buf: [520]u8 = undefined;
+    switch (shape) {
+        .ed25519 => {
+            try ssh.writeString(w, ssh.ed25519);
+            in.fill(buf[0..64]);
+            try ssh.writeString(w, buf[0..64]);
+        },
+        .rsa => {
+            const types = [_][]const u8{ "rsa-sha2-512", "rsa-sha2-256", "ssh-rsa" };
+            try ssh.writeString(w, types[in.index(types.len)]);
+            try ssh.writeString(w, in.bytes(&buf));
+        },
+        .bytes => try w.writeAll(in.bytes(&buf)),
+    }
+}
