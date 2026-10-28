@@ -972,6 +972,21 @@ test "output and exit status are reported" {
     }
 }
 
+test "output of a program that exits at once is read in full" {
+    // macOS discarded it when the slave's last fd closed before the master
+    // read it.
+    var environ = try testEnviron();
+    defer environ.deinit();
+    for (0..200) |_| {
+        var pty = try spawnTest(&environ, &.{ "echo", "bye" });
+        defer pty.deinit();
+        var out: Output = .{};
+        try out.readToEnd(&pty);
+        try testing.expectEqualStrings("bye\r\n", out.bytes());
+        try testing.expectEqual(Term{ .exited = 0 }, try waitTest(&pty));
+    }
+}
+
 test "program sees the initial size and resizes" {
     var environ = try testEnviron();
     defer environ.deinit();
