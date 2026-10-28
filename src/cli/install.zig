@@ -19,6 +19,8 @@
 //! Each session runs in a process of its own (see `session.spawn`), and
 //! the service manager stops only txd: sessions outlive a restart of the
 //! service, and the next txd finds them.
+//!
+//! `txd --uninstall` undoes it all; see `uninstall`.
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
@@ -26,6 +28,9 @@ const Io = std.Io;
 const IpAddress = Io.net.IpAddress;
 const PosixAddress = Io.Threaded.PosixAddress;
 const Environ = std.process.Environ;
+const proto = @import("proto");
+const session = @import("session");
+const runtime_dir = @import("server").runtime_dir;
 const paths = @import("paths.zig");
 
 /// The systemd unit and the launchd label.
@@ -33,6 +38,11 @@ const name = "txd";
 
 /// How long a started server has to bind its port.
 const start_timeout_ms = 5000;
+
+/// In the state directory: the pid of a server started in the background,
+/// and a file that says `install` turned on lingering.
+const pid_file = name ++ ".pid";
+const linger_file = "linger";
 
 pub const Options = struct {
     /// The path of the txd binary the service runs.
@@ -124,6 +134,11 @@ fn systemd(gpa: Allocator, io: Io, environ: *const Environ.Map, options: Options
             return null;
         }
         std.debug.print("txd: turned on lingering for {s}, so the user's services run without a login\n", .{options.user});
+
+        // So that `uninstall` turns it off again.
+        const linger_path = try paths.state(gpa, environ, linger_file);
+        defer gpa.free(linger_path);
+        _ = try writeIfChanged(gpa, io, linger_path, "txd --install turned on lingering.\n");
     }
 
     // The user manager reads ~/.config/systemd/user whatever this
@@ -216,15 +231,215 @@ fn background(gpa: Allocator, io: Io, environ: *const Environ.Map, options: Opti
     @memcpy(argv[1..], options.args);
 
     // Not waited for. It is reparented when this process exits.
-    _ = try std.process.spawn(io, .{
+    const child = try std.process.spawn(io, .{
         .argv = argv,
         .stdin = .ignore,
         .stdout = .{ .file = log_file },
         .stderr = .{ .file = log_file },
         .pgid = 0,
     });
+
+    // For `uninstall`, which has no service to stop it with.
+    const pid_path = try paths.state(gpa, environ, pid_file);
+    defer gpa.free(pid_path);
+    var pid_buf: [16]u8 = undefined;
+    _ = try writeIfChanged(gpa, io, pid_path, std.fmt.bufPrint(&pid_buf, "{d}\n", .{child.id.?}) catch unreachable);
     std.debug.print("txd: the server runs in the background until the machine restarts. Its log is {s}\n", .{log_path});
     return .started;
+}
+
+/// Undoes `install`. Stops txd: its service, or the server it started in
+/// the background. Turns lingering off if `install` turned it on. Ends the
+/// sessions, as `tx --kill` does. Then removes `~/.local/share/tx`, where tx
+/// puts txd, and txd's files in the state directory: the default host key,
+/// the SPA key and the log. A key given with `--key` and
+/// `~/.config/tx/authorized_keys` stay.
+///
+/// `listen` is the address the server was installed with. Something that
+/// still has its port afterwards, such as a txd started by hand, is
+/// reported.
+pub fn uninstall(gpa: Allocator, io: Io, environ: *const Environ.Map, user: []const u8, listen: IpAddress) !void {
+    // The service first, so that nothing starts txd again.
+    switch (builtin.os.tag) {
+        .macos => try removeLaunchd(gpa, io, environ),
+        .linux => try removeSystemd(gpa, io, environ, user),
+        else => {},
+    }
+    try stopBackground(gpa, io, environ);
+    try endSessions(gpa, io, environ);
+
+    // txd's files. The binary running this is among them, and keeps
+    // running.
+    const dir = Io.Dir.cwd();
+    const share = try paths.home(gpa, environ, ".local/share/tx");
+    defer gpa.free(share);
+    if (exists(io, share)) {
+        try dir.deleteTree(io, share);
+        std.debug.print("txd: removed {s}\n", .{share});
+    }
+    for ([_][]const u8{ "host_key", "spa_key", name ++ ".log" }) |file| {
+        const path = try paths.state(gpa, environ, file);
+        defer gpa.free(path);
+        try deleteIfExists(io, path);
+    }
+
+    // The state directory, if nothing else is in it.
+    const state_dir = try paths.state(gpa, environ, "");
+    defer gpa.free(state_dir);
+    dir.deleteDir(io, state_dir) catch {};
+    std.debug.print("txd: removed txd's keys and log\n", .{});
+
+    if (serving(listen)) {
+        std.debug.print("txd: something still has port {d}, such as a txd started by hand\n", .{listen.getPort()});
+    }
+}
+
+/// Stops and removes the user service, and turns lingering off if
+/// `install` turned it on.
+fn removeSystemd(gpa: Allocator, io: Io, environ: *const Environ.Map, user: []const u8) !void {
+    const path = try paths.home(gpa, environ, ".config/systemd/user/" ++ name ++ ".service");
+    defer gpa.free(path);
+    if (exists(io, path)) {
+        // `--now` stops the service too. With `KillMode=process`, its
+        // sessions keep running.
+        _ = try succeeds(gpa, io, &.{ "systemctl", "--user", "--quiet", "disable", "--now", name ++ ".service" }, .show);
+        try Io.Dir.cwd().deleteFile(io, path);
+        _ = try succeeds(gpa, io, &.{ "systemctl", "--user", "daemon-reload" }, .show);
+        _ = try succeeds(gpa, io, &.{ "systemctl", "--user", "reset-failed", name ++ ".service" }, .quiet);
+        std.debug.print("txd: removed {s}\n", .{path});
+    }
+
+    const linger_path = try paths.state(gpa, environ, linger_file);
+    defer gpa.free(linger_path);
+    if (exists(io, linger_path)) {
+        if (try succeeds(gpa, io, &.{ "loginctl", "disable-linger", user }, .show)) {
+            std.debug.print("txd: turned off lingering for {s}\n", .{user});
+        }
+        try Io.Dir.cwd().deleteFile(io, linger_path);
+    }
+}
+
+/// Unloads the LaunchAgent from whichever domain has it, and removes it
+/// and its log.
+fn removeLaunchd(gpa: Allocator, io: Io, environ: *const Environ.Map) !void {
+    const uid = std.c.getuid();
+    for ([_][]const u8{ "gui", "user" }) |domain| {
+        var target_buf: [64]u8 = undefined;
+        const target = std.fmt.bufPrint(&target_buf, "{s}/{d}/" ++ name, .{ domain, uid }) catch unreachable;
+        if (try succeeds(gpa, io, &.{ "launchctl", "print", target }, .quiet)) {
+            _ = try succeeds(gpa, io, &.{ "launchctl", "bootout", target }, .show);
+        }
+    }
+
+    const path = try paths.home(gpa, environ, "Library/LaunchAgents/" ++ name ++ ".plist");
+    defer gpa.free(path);
+    if (exists(io, path)) {
+        try Io.Dir.cwd().deleteFile(io, path);
+        std.debug.print("txd: removed {s}\n", .{path});
+    }
+    const log_path = try paths.home(gpa, environ, "Library/Logs/" ++ name ++ ".log");
+    defer gpa.free(log_path);
+    try deleteIfExists(io, log_path);
+}
+
+/// How long `uninstall` waits for txd and the sessions to exit.
+const stop_timeout_ms = 5000;
+
+/// Stops the server `background` started, if it still runs.
+fn stopBackground(gpa: Allocator, io: Io, environ: *const Environ.Map) !void {
+    const path = try paths.state(gpa, environ, pid_file);
+    defer gpa.free(path);
+    const text = Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64)) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => |e| return e,
+    };
+    defer gpa.free(text);
+    try Io.Dir.cwd().deleteFile(io, path);
+
+    // After a restart the pid may be another program's.
+    const pid = std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, text, " \n"), 10) catch return;
+    if (!try isTxd(gpa, io, pid)) return;
+    if (std.c.kill(pid, .TERM) != 0) return;
+
+    var waited: u64 = 0;
+    while (std.c.kill(pid, @fromBackingInt(@intCast(0))) == 0) : (waited += 50) {
+        if (waited >= stop_timeout_ms) return error.TxdDidntStop;
+        try io.sleep(.fromMilliseconds(50), .awake);
+    }
+    std.debug.print("txd: stopped the server running in the background\n", .{});
+}
+
+/// Whether process `pid` runs a program named txd. ps names it on Linux and
+/// macOS alike.
+fn isTxd(gpa: Allocator, io: Io, pid: std.posix.pid_t) !bool {
+    var pid_buf: [16]u8 = undefined;
+    const pid_text = std.fmt.bufPrint(&pid_buf, "{d}", .{pid}) catch unreachable;
+    const text = try output(gpa, io, &.{ "ps", "-o", "comm=", "-p", pid_text }, .quiet) orelse return false;
+    defer gpa.free(text);
+    return std.mem.eql(u8, std.fs.path.basename(std.mem.trim(u8, text, " \n")), name);
+}
+
+/// Ends every session and waits for their processes to exit, then removes
+/// the runtime directory.
+fn endSessions(gpa: Allocator, io: Io, environ: *const Environ.Map) !void {
+    const dir = try paths.runtime(gpa, environ);
+    defer gpa.free(dir);
+    const ids = runtime_dir.ids(gpa, io, dir) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => |e| return e,
+    };
+    defer gpa.free(ids);
+
+    var ended: usize = 0;
+    for (ids) |id| {
+        if (killSession(dir, id)) {
+            ended += 1;
+        } else |_| {
+            // A socket whose process is gone.
+            runtime_dir.remove(dir, id);
+        }
+    }
+
+    // A session process removes its socket as its session ends.
+    var waited: u64 = 0;
+    while (true) : (waited += 50) {
+        const left = try runtime_dir.ids(gpa, io, dir);
+        defer gpa.free(left);
+        if (left.len == 0) break;
+        if (waited >= stop_timeout_ms) return error.SessionsDidntEnd;
+        try io.sleep(.fromMilliseconds(50), .awake);
+    }
+    if (ended > 0) std.debug.print("txd: ended {d} session{s}\n", .{ ended, if (ended == 1) "" else "s" });
+    Io.Dir.cwd().deleteDir(io, dir) catch {};
+}
+
+/// Sends `Kill` to session `id`'s process.
+fn killSession(dir: []const u8, id: u64) !void {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const fd = try session.unix.connect(try runtime_dir.socketPath(&path_buf, dir, id));
+    defer session.unix.close(fd);
+
+    var buf: [256]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    try proto.encode(&w, .{ .kill = .{ .session_id = id } });
+    var rest = w.buffered();
+    while (rest.len > 0) {
+        const n = std.c.write(fd, rest.ptr, rest.len);
+        if (n <= 0) return error.WriteFailed;
+        rest = rest[@intCast(n)..];
+    }
+}
+
+fn exists(io: Io, path: []const u8) bool {
+    Io.Dir.cwd().access(io, path, .{}) catch return false;
+    return true;
+}
+
+fn deleteIfExists(io: Io, path: []const u8) !void {
+    Io.Dir.cwd().deleteFile(io, path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => |e| return e,
+    };
 }
 
 /// Whether a failing command's stderr is shown. A check that is expected

@@ -327,6 +327,7 @@ fn txdModule(
     mod.addImport("session", app.session);
     mod.addImport("transport", app.transport);
     mod.addImport("auth", app.auth);
+    mod.addImport("proto", app.proto);
     mod.addImport("build_options", info);
     return mod;
 }

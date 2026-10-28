@@ -5,7 +5,9 @@
 # DIR is under ~/.local/share/tx. STEP is one of:
 #
 #   run       Runs DIR/txd, or else txd from PATH. With neither, prints
-#             "need SYSTEM MACHINE" and exits with 3.
+#             "need SYSTEM MACHINE PREVIOUS" and exits with 3. PREVIOUS is
+#             "upgrade" when another DIR under ~/.local/share/tx has a txd,
+#             and "first" otherwise.
 #   download  Downloads the release tarball at URL, takes the file MEMBER
 #             out of it, checks that file's SHA-256, and runs it as
 #             DIR/txd. Exits with 4 when any of that fails.
@@ -43,7 +45,13 @@ run)
     if command -v txd >/dev/null 2>&1; then
         exec txd "$@"
     fi
-    echo "need $(uname -s) $(uname -m)"
+    previous=first
+    for old in "$HOME"/.local/share/tx/*/txd; do
+        if [ -x "$old" ]; then
+            previous=upgrade
+        fi
+    done
+    echo "need $(uname -s) $(uname -m) $previous"
     exit 3
     ;;
 

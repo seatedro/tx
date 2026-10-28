@@ -104,6 +104,40 @@ pub fn append(io: Io, path: []const u8, host: []const u8, key: ssh.Key) !void {
     try file.writePositionalAll(io, line, size);
 }
 
+/// Removes the lines `append` wrote for `host`: those whose hostnames are
+/// exactly `host`. Lines with patterns, hashed names or markers stay. A
+/// missing file has none.
+pub fn remove(gpa: Allocator, io: Io, path: []const u8, host: []const u8) !void {
+    const dir = Io.Dir.cwd();
+    const old = dir.readFileAlloc(io, path, gpa, .limited(max_file_len)) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => |e| return e,
+    };
+    defer gpa.free(old);
+
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var lines = std.mem.splitScalar(u8, old, '\n');
+    var removed = false;
+    while (lines.next()) |line| {
+        var fields: Fields = .{ .rest = std.mem.trim(u8, line, " \t\r") };
+        if (std.mem.eql(u8, fields.next(), host)) {
+            removed = true;
+            continue;
+        }
+        // The split leaves an empty last line after the final newline.
+        if (lines.peek() == null and line.len == 0) break;
+        try out.writer.print("{s}\n", .{line});
+    }
+    if (!removed) return;
+
+    // Written whole, then renamed, so the file never holds part of itself.
+    var part_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const part = std.fmt.bufPrint(&part_buf, "{s}.part", .{path}) catch return error.NameTooLong;
+    try dir.writeFile(io, .{ .sub_path = part, .data = out.written() });
+    try dir.rename(part, dir, path, io);
+}
+
 const Fields = struct {
     rest: []const u8,
 
@@ -191,6 +225,30 @@ fn expectKeys(contents: []const u8, host: []const u8, keys: usize, revoked: usiz
     try find(testing.allocator, contents, host, &known);
     try testing.expectEqual(keys, known.keys.items.len);
     try testing.expectEqual(revoked, known.revoked.items.len);
+}
+
+test remove {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(testing.io, &buf)];
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/known_hosts", .{base});
+
+    const line = " ssh-ed25519 " ++ key_text ++ "\n";
+    try tmp.dir.writeFile(testing.io, .{
+        .sub_path = "known_hosts",
+        .data = "# kept\npulsar" ++ line ++ "[pulsar]:9000" ++ line ++ "pulsar,other" ++ line ++ "@revoked pulsar" ++ line ++ "pulsar" ++ line,
+    });
+    try remove(testing.allocator, testing.io, path, "pulsar");
+
+    const text = try tmp.dir.readFileAlloc(testing.io, "known_hosts", testing.allocator, .limited(4096));
+    defer testing.allocator.free(text);
+    try testing.expectEqualStrings("# kept\n[pulsar]:9000" ++ line ++ "pulsar,other" ++ line ++ "@revoked pulsar" ++ line, text);
+
+    // A missing file, and a host the file doesn't have.
+    try remove(testing.allocator, testing.io, path, "absent");
+    try remove(testing.allocator, testing.io, "/nonexistent/known_hosts", "pulsar");
 }
 
 test "host name patterns" {
