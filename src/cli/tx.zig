@@ -1,7 +1,8 @@
 //! tx: a session on a txd server.
 //!
 //! Usage: tx [-p PORT] [-l USER] [--attach ID | --new | --list | --kill ID]
-//!           [--yes] [--server COMMAND] [--ssh PATH] [USER@]HOST [COMMAND...]
+//!           [-t | -T] [--yes] [--server COMMAND] [--ssh PATH] [USER@]HOST
+//!           [COMMAND...]
 //!        tx [-p PORT] [-l USER] [--yes] [--ssh PATH] --uninstall [USER@]HOST
 //!        tx --version
 //!
@@ -13,6 +14,11 @@
 //! host, joined with spaces, go to the user's shell with `-c`. The
 //! command's stdin, stdout and stderr are tx's, and tx exits with its exit
 //! status.
+//!
+//! With `-t`, the command runs on a terminal: it is a new session's
+//! program, attached as any session is. Unlike with ssh, it keeps running
+//! when tx detaches or loses the connection, and `--attach` reattaches it.
+//! `-T`, no terminal, is the default, and is accepted for ssh's sake.
 //!
 //! The server's key is checked against `~/.config/tx/known_hosts` and
 //! `~/.ssh/known_hosts`. For a host in neither, tx reads the key over ssh
@@ -59,7 +65,7 @@ const spa_keys = @import("spa_keys.zig");
 const default_port = remote.default_port;
 
 const usage_text =
-    \\usage: tx [-p PORT] [-l USER] [--attach ID | --new | --list | --kill ID] [--yes] [--server COMMAND] [--ssh PATH] [USER@]HOST [COMMAND...]
+    \\usage: tx [-p PORT] [-l USER] [--attach ID | --new | --list | --kill ID] [-t | -T] [--yes] [--server COMMAND] [--ssh PATH] [USER@]HOST [COMMAND...]
     \\       tx [-p PORT] [-l USER] [--yes] [--ssh PATH] --uninstall [USER@]HOST
     \\       tx --version
 ;
@@ -94,6 +100,8 @@ pub fn main(init: std.process.Init) !u8 {
     var modes: usize = 0;
     // `--yes`: no questions before installing or uninstalling.
     var yes = false;
+    // `-t`: a command on a terminal.
+    var tty = false;
     var server_command: ?[]const u8 = null;
     var ssh_path: []const u8 = "ssh";
     var destination: ?[]const u8 = null;
@@ -131,6 +139,10 @@ pub fn main(init: std.process.Init) !u8 {
             modes += 1;
         } else if (std.mem.eql(u8, arg, "--yes")) {
             yes = true;
+        } else if (std.mem.eql(u8, arg, "-t")) {
+            tty = true;
+        } else if (std.mem.eql(u8, arg, "-T")) {
+            tty = false;
         } else if (std.mem.eql(u8, arg, "--server") and i + 1 < args.len) {
             i += 1;
             server_command = args[i];
@@ -145,8 +157,11 @@ pub fn main(init: std.process.Init) !u8 {
         } else return usage("unknown argument");
     }
 
+    // A command, in a session of its own with `-t`.
+    var session_command: ?[]const u8 = null;
     if (command_words.len > 0) {
-        command = .{ .exec = try std.mem.join(init.arena.allocator(), " ", command_words) };
+        const joined = try std.mem.join(init.arena.allocator(), " ", command_words);
+        if (tty) session_command = joined else command = .{ .exec = joined };
         modes += 1;
     }
     if (modes > 1) return usage("a command, --attach, --new, --list, --kill and --uninstall don't go together");
@@ -229,8 +244,9 @@ pub fn main(init: std.process.Init) !u8 {
         .identities = identities.list.items,
         .command = command,
         .session_id = session_id,
-        .reuse_detached = session_id == null and !new,
-        .show_session_id = true,
+        .session_command = session_command,
+        .reuse_detached = session_id == null and !new and session_command == null,
+        .show_session_id = session_command == null,
         .term = environ.get("TERM") orelse "xterm-256color",
         .colorterm = environ.get("COLORTERM"),
         .locale = try localeVariables(init.arena.allocator(), environ),

@@ -819,6 +819,21 @@ test "a server that stops ends the commands it runs" {
     _ = try ec.join();
 }
 
+test "a command with a terminal runs as a new session, and its status returns" {
+    var es: ExecServer = undefined;
+    try es.init();
+    defer es.deinit();
+
+    var pty: TestPty = try .open();
+    defer pty.close();
+    var ct: ClientThread = .{ .options = es.login.clientOptions(&es.st, &pty, &.{es.login.key.public_key.toBytes()}) };
+    ct.options.session_command = "if [ -t 0 ]; then echo on-a-terminal; fi; exit 7";
+    try ct.start();
+    const outcome = try ct.join(&pty);
+    try testing.expectEqual(7, outcome.exited.status);
+    try testing.expect(std.mem.indexOf(u8, pty.output.items, "on-a-terminal") != null);
+}
+
 test "a command before the login is refused" {
     var es: ExecServer = undefined;
     try es.init();

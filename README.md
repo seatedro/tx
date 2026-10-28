@@ -16,6 +16,7 @@ tx is early and changes often. Don't rely on it yet.
     tx --kill ID HOST       # end session ID
     tx --uninstall HOST     # end the sessions, and remove txd from HOST
     tx HOST COMMAND...      # run COMMAND, as ssh does
+    tx -t HOST COMMAND...   # run COMMAND on a terminal, as a session
 
 `~.` detaches. A new session gets the client's `TERM`, `COLORTERM`, `LANG`
 and `LC_*`.

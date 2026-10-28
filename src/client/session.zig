@@ -79,6 +79,9 @@ pub const Options = struct {
     command: Command = .attach,
     /// Null starts a new session, unless `reuse_detached` is set.
     session_id: ?u64 = null,
+    /// A new session runs this with the shell's `-c`, in place of the
+    /// shell. Neither `session_id` nor `reuse_detached` may be set.
+    session_command: ?[]const u8 = null,
     /// With no `session_id`, attaches the detached session if there is
     /// exactly one.
     reuse_detached: bool = false,
@@ -768,7 +771,11 @@ const Run = struct {
 
         r.send(.{ .auth_signature = .{ .user = r.options.user, .key = identity.key.blob(), .signature = sig } });
         r.send(switch (r.options.command) {
-            .attach => .{ .attach = .{ .session_id = r.options.session_id, .reuse = r.options.reuse_detached } },
+            .attach => .{ .attach = .{
+                .session_id = r.options.session_id,
+                .reuse = r.options.reuse_detached,
+                .command = r.options.session_command,
+            } },
             .list => .{ .list = .{} },
             .kill => |id| .{ .kill = .{ .session_id = id } },
             .exec => |command| .{ .exec = .{ .command = command } },
