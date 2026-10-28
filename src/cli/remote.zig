@@ -219,36 +219,42 @@ fn needed(result: Result) ?Need {
 /// Asks on the controlling terminal whether to install txd on a host that
 /// has never had it. An empty answer is yes.
 fn askToInstall(io: Io, source: Source, platform: Platform) !bool {
-    const destination = source.destination;
-    const tty = Io.Dir.openFileAbsolute(io, "/dev/tty", .{ .mode = .read_write }) catch {
-        std.debug.print("tx: {s} has no txd, and there's no terminal to ask on. With --yes, tx installs it without asking.\n", .{destination});
-        return false;
-    };
-    defer tty.close(io);
-
     // The uninstall command names the port as this one did.
     var port_buf: [16]u8 = undefined;
     const port_arg = if (source.port == default_port) "" else std.fmt.bufPrint(&port_buf, "-p {d} ", .{source.port}) catch unreachable;
 
+    var buf: [1024]u8 = undefined;
+    const question = try std.fmt.bufPrint(&buf,
+        \\{s} has no txd. tx can install txd {s} for {s}-{s} in ~/.local/share/tx
+        \\there, and keep it running as a user service. `tx {s}--uninstall {s}` removes it.
+        \\Install txd?
+    , .{ source.destination, build_options.version, platform.os, platform.arch, port_arg, source.destination });
+    return try ask(io, question, true) orelse {
+        std.debug.print("tx: {s} has no txd, and there's no terminal to ask on. With --yes, tx installs it without asking.\n", .{source.destination});
+        return false;
+    };
+}
+
+/// Asks `question` on the controlling terminal, and reads yes or no. An
+/// empty answer is `default`, and the end of input is no. Null when there
+/// is no terminal.
+pub fn ask(io: Io, question: []const u8, default: bool) !?bool {
+    const tty = Io.Dir.openFileAbsolute(io, "/dev/tty", .{ .mode = .read_write }) catch return null;
+    defer tty.close(io);
+
     var write_buf: [1024]u8 = undefined;
     var tw = tty.writerStreaming(io, &write_buf);
     const w = &tw.interface;
-    try w.print(
-        \\{s} has no txd. tx can install txd {s} for {s}-{s} in ~/.local/share/tx
-        \\there, and keep it running as a user service. `tx {s}--uninstall {s}` removes it.
-        \\
-    , .{ destination, build_options.version, platform.os, platform.arch, port_arg, destination });
-    try w.writeAll("Install txd? [Y/n] ");
+    try w.print("{s} {s} ", .{ question, if (default) "[Y/n]" else "[y/N]" });
 
     var read_buf: [256]u8 = undefined;
     var tr = tty.readerStreaming(io, &read_buf);
     while (true) {
         try w.flush();
-
-        // End of input declines.
         const line = (tr.interface.takeDelimiter('\n') catch return false) orelse return false;
         const answer = std.mem.trim(u8, line, " \t\r");
-        if (answer.len == 0 or std.ascii.eqlIgnoreCase(answer, "y") or std.ascii.eqlIgnoreCase(answer, "yes")) return true;
+        if (answer.len == 0) return default;
+        if (std.ascii.eqlIgnoreCase(answer, "y") or std.ascii.eqlIgnoreCase(answer, "yes")) return true;
         if (std.ascii.eqlIgnoreCase(answer, "n") or std.ascii.eqlIgnoreCase(answer, "no")) return false;
         try w.writeAll("Please type 'y' or 'n': ");
     }
