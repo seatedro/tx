@@ -88,18 +88,22 @@ pub fn build(b: *std.Build) void {
     // The tests with fuzz tests that `--fuzz` can build. Under it, C code
     // doesn't link and ghostty-vt's build makes a Unicode table that
     // doesn't compile. So the SPA guard's tests build alone, and the
-    // end-to-end tests are left out.
-    const spa_tests = b.addTest(.{
-        .name = "spa-test",
-        .root_module = b.createModule(.{
+    // end-to-end tests are left out. They build with LLVM, which adds the
+    // fuzzer's instrumentation; the x86_64 backend Debug builds use
+    // doesn't.
+    const fuzz_step = b.step("fuzz", "Run the fuzz tests of what a client reaches before login; with --fuzz, fuzz them");
+    for ([_]struct { []const u8, *std.Build.Module }{
+        .{ "proto-fuzz", protoModule(b, target, optimize) },
+        .{ "auth-fuzz", authModule(b, target, optimize) },
+        .{ "spa-fuzz", b.createModule(.{
             .root_source_file = b.path("src/transport/spa.zig"),
             .target = target,
             .optimize = optimize,
-        }),
-    });
-    spa_tests.root_module.addImport("fuzz", fuzz);
-    const fuzz_step = b.step("fuzz", "Run the fuzz tests of what a client reaches before login; with --fuzz, fuzz them");
-    for ([_]*std.Build.Step.Compile{ proto_tests, auth_tests, spa_tests }) |tests| {
+        }) },
+    }) |entry| {
+        const name, const module = entry;
+        module.addImport("fuzz", fuzz);
+        const tests = b.addTest(.{ .name = name, .root_module = module, .use_llvm = true });
         fuzz_step.dependOn(&b.addRunArtifact(tests).step);
     }
 
