@@ -36,7 +36,8 @@
 //!
 //! On Linux, with `Options.wayland_socket`, the server also runs the
 //! clipboard server there (see `wayland`), and sessions find it through
-//! `WAYLAND_DISPLAY`.
+//! `WAYLAND_DISPLAY`. Attached clients offer their clipboard to it with
+//! `ClipboardOffer` and answer its reads (see `clipboard`).
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
@@ -55,6 +56,7 @@ const addresses = @import("addresses.zig");
 pub const runtime_dir = @import("runtime_dir.zig");
 pub const exec = @import("exec.zig");
 pub const terminfo = @import("terminfo.zig");
+pub const clipboard = @import("clipboard.zig");
 
 const Endpoint = transport.endpoint.Endpoint;
 const Exec = exec.Exec;
@@ -104,8 +106,10 @@ pub const Options = struct {
     wayland_socket: ?[]const u8 = null,
 };
 
-/// The clipboard server, which only Linux has.
-const Clipboard = if (builtin.os.tag == .linux) *wayland.Listener else noreturn;
+/// The clipboard server, which only Linux has. Code that uses it is behind
+/// `has_clipboard`, so that it isn't compiled elsewhere.
+const has_clipboard = builtin.os.tag == .linux;
+const Clipboard = if (has_clipboard) clipboard.Clipboard else void;
 
 /// What sessions get with the clipboard server, besides `WAYLAND_DISPLAY`.
 /// A program that finds a Wayland server takes it for a display, and these
@@ -170,7 +174,7 @@ pub const Server = struct {
     /// No session started by this server has an ID below it.
     next_id: u64 = 1,
     /// Running at `Options.wayland_socket`. It frees itself once stopped.
-    clipboard: ?Clipboard = null,
+    clipboard: ?*Clipboard = null,
 
     const Rescan = struct {
         /// `Options.listen`, with the port the first bind got if it asked
@@ -219,29 +223,16 @@ pub const Server = struct {
         self.startClipboard();
     }
 
-    /// Last in `init`, since nothing frees the listener but the loop.
-    /// Sessions do without a clipboard if it doesn't start.
+    /// Last in `init`, since nothing frees the clipboard but the loop.
+    /// Sessions do without one if it doesn't start.
     fn startClipboard(self: *Server) void {
-        if (builtin.os.tag != .linux) return;
+        if (!has_clipboard) return;
         const path = self.options.wayland_socket orelse return;
-        self.clipboard = wayland.Listener.create(self.gpa, self.loop, path, .{
-            .context = self,
-            .fetch = clipboardFetch,
-            .copied = clipboardCopied,
-        }) catch |err| {
+        self.clipboard = Clipboard.create(self.gpa, self.io, self.loop, path) catch |err| {
             log.warn("no clipboard server at {s}: {t}", .{ path, err });
             return;
         };
     }
-
-    /// A program reads the user's clipboard. Clients don't offer theirs
-    /// yet, so it's empty.
-    fn clipboardFetch(_: ?*anyopaque, _: []const u8, fd: posix.fd_t) void {
-        _ = std.c.close(fd);
-    }
-
-    /// A program copied. It stays among the session's programs for now.
-    fn clipboardCopied(_: ?*anyopaque, _: wayland.Selection, _: ?[]const []const u8) void {}
 
     /// The first bound address, with the port the kernel picked.
     pub fn address(self: *const Server) IpAddress {
@@ -256,7 +247,7 @@ pub const Server = struct {
         // own, and the loop runs until they do.
         for (self.execs.items) |e| e.kill();
         for (self.endpoints.items) |e| e.stop();
-        if (self.clipboard) |l| l.close();
+        if (has_clipboard) if (self.clipboard) |cb| cb.close();
         self.clipboard = null;
         if (self.rescan) |*r| if (r.c.state() == .active) {
             r.cancel_c = .{ .op = .{ .cancel = .{ .c = &r.c } } };
@@ -411,17 +402,38 @@ pub const Server = struct {
         conn.context = client;
     }
 
-    /// A client uses one stream. Others are refused.
+    /// A client's first stream carries its messages. An attached client's
+    /// unidirectional streams after it answer clipboard reads. Others are
+    /// refused.
     fn onStreamOpened(_: ?*anyopaque, stream: *Stream) void {
         const client = Client.of(stream.conn) orelse return stream.reset(0);
-        if (client.stream != null) return stream.reset(0);
-        client.stream = stream;
-        stream.context = client;
+        if (client.stream == null) {
+            client.stream = stream;
+            stream.context = client;
+            return;
+        }
+        if (has_clipboard and isUni(stream) and client.upstream != null and client.server.clipboard != null) {
+            const answer = client.server.gpa.create(ClipboardAnswer) catch return stream.reset(0);
+            answer.* = .{ .stream = stream };
+            client.answers.append(client.server.gpa, answer) catch {
+                client.server.gpa.destroy(answer);
+                return stream.reset(0);
+            };
+            stream.context = answer;
+            return;
+        }
+        stream.reset(0);
+    }
+
+    /// Stream IDs have the stream's direction in bit 1.
+    fn isUni(stream: *const Stream) bool {
+        return stream.id & 0x2 != 0;
     }
 
     fn onData(_: ?*anyopaque, stream: *Stream, bytes: []const u8, fin: bool) void {
         const client = Client.of(stream.conn) orelse return stream.consume(bytes.len);
         if (client.exec) |e| if (e.owns(stream)) return e.received(stream, bytes, fin);
+        if (has_clipboard) if (client.answerOn(stream)) |answer| return client.onAnswerData(answer, bytes, fin);
         if (client.stream != stream) return stream.consume(bytes.len);
 
         // Credit is returned at once while the session's channel keeps up,
@@ -464,6 +476,7 @@ pub const Server = struct {
         const client = Client.of(stream.conn) orelse return;
         if (client.exec) |e| e.streamClosed(stream);
         if (client.stream == stream) client.stream = null;
+        if (has_clipboard) if (client.answerOn(stream)) |answer| client.endAnswer(answer, null);
     }
 
     /// The session, if any, keeps running detached.
@@ -703,6 +716,22 @@ const Hello = struct {
 };
 
 /// One connection's state.
+/// A client's answer to a clipboard read, as it arrives: `ClipboardData`,
+/// then the data.
+const ClipboardAnswer = struct {
+    stream: *Stream,
+    /// The header and the data so far.
+    bytes: std.ArrayList(u8) = .empty,
+    /// From the header, once it's whole.
+    id: ?u64 = null,
+    refused: bool = false,
+    /// Where the data starts in `bytes`.
+    data_start: usize = 0,
+};
+
+/// The longest `ClipboardData` header.
+const max_answer_header = 64;
+
 const Client = struct {
     server: *Server,
     conn: *Conn,
@@ -732,6 +761,10 @@ const Client = struct {
     held: usize = 0,
     /// The highest seq the client reported written to its terminal.
     acked: ?u64 = null,
+    /// The client, as the clipboard sees it.
+    peer: clipboard.Peer = .{ .request = sendClipboardRequest, .copy = sendClipboardCopy },
+    /// Clipboard answers arriving on the client's streams.
+    answers: std.ArrayList(*ClipboardAnswer) = .empty,
 
     fn of(conn: *Conn) ?*Client {
         return @ptrCast(@alignCast(conn.context orelse return null));
@@ -753,6 +786,16 @@ const Client = struct {
         if (client.query) |q| q.abandon();
         // The command keeps running, without its streams.
         if (client.exec) |e| e.detach();
+        if (has_clipboard) {
+            if (client.server.clipboard) |cb| cb.gone(&client.peer);
+            // Left if the clipboard stopped first.
+            client.peer.dropOffer(gpa);
+            for (client.answers.items) |answer| {
+                answer.bytes.deinit(gpa);
+                gpa.destroy(answer);
+            }
+        }
+        client.answers.deinit(gpa);
         client.terminfo.deinit(gpa);
         client.decoder.deinit();
         if (client.hello) |*h| h.deinit(gpa);
@@ -778,12 +821,126 @@ const Client = struct {
             .list => client.startQuery(.list),
             .kill => |m| client.onKill(m),
             .exec => |m| client.onExec(m),
-            .input, .resize => if (client.upstream) |u| u.send(message),
+            .input, .resize => if (client.upstream) |u| {
+                u.send(message);
+                if (has_clipboard and message == .input) if (client.server.clipboard) |cb| cb.input(&client.peer);
+            },
+            .clipboard_offer => |m| client.onClipboardOffer(m),
             .ack => |m| client.acked = m.seq,
             .detach => client.conn.close(0),
             .unknown => {},
             else => client.fail(.protocol, "unexpected message"),
         }
+    }
+
+    /// An attached client's clipboard changed.
+    fn onClipboardOffer(client: *Client, m: proto.ClipboardOffer) void {
+        if (!has_clipboard) return;
+        const cb = client.server.clipboard orelse return;
+        if (client.upstream == null) return;
+
+        // The types are NUL-terminated, at most `max_mimes` of them.
+        var mimes: [wayland.server.max_mimes][]const u8 = undefined;
+        var count: usize = 0;
+        var it = std.mem.splitScalar(u8, m.mimes, 0);
+        while (it.next()) |mime| {
+            if (mime.len == 0 or count == mimes.len) continue;
+            mimes[count] = mime;
+            count += 1;
+        }
+        cb.offer(&client.peer, m.change, mimes[0..count]);
+    }
+
+    fn fromPeer(peer: *clipboard.Peer) *Client {
+        return @fieldParentPtr("peer", peer);
+    }
+
+    fn sendClipboardRequest(peer: *clipboard.Peer, m: proto.ClipboardRequest) void {
+        fromPeer(peer).send(.{ .clipboard_request = m });
+    }
+
+    /// A program's copy, on a stream of its own, so that it doesn't hold up
+    /// the session's output.
+    fn sendClipboardCopy(peer: *clipboard.Peer, mimes: []const []const u8, data: []const *wayland.pipe.Blob) void {
+        const client = fromPeer(peer);
+        const gpa = client.server.gpa;
+        var names: std.ArrayList(u8) = .empty;
+        defer names.deinit(gpa);
+        var lens: std.ArrayList(u8) = .empty;
+        defer lens.deinit(gpa);
+        for (mimes, data) |mime, blob| {
+            names.appendSlice(gpa, mime) catch return;
+            names.append(gpa, 0) catch return;
+            var len: [8]u8 = undefined;
+            std.mem.writeInt(u64, &len, blob.bytes.len, .big);
+            lens.appendSlice(gpa, &len) catch return;
+        }
+
+        const header: proto.Message = .{ .clipboard_copy = .{ .mimes = names.items, .lens = lens.items } };
+        const buf = gpa.alloc(u8, proto.encodedLen(header)) catch return;
+        defer gpa.free(buf);
+        var w: Io.Writer = .fixed(buf);
+        proto.encode(&w, header) catch unreachable;
+
+        const stream = client.conn.openStream(.uni) catch |err| return log.warn("can't send a copy to {f}: {t}", .{ client.conn.remote, err });
+        stream.write(buf) catch return stream.reset(0);
+        for (data) |blob| stream.write(blob.bytes) catch return stream.reset(0);
+        stream.finish();
+    }
+
+    fn answerOn(client: *Client, stream: *Stream) ?*ClipboardAnswer {
+        for (client.answers.items) |answer| if (answer.stream == stream) return answer;
+        return null;
+    }
+
+    fn onAnswerData(client: *Client, answer: *ClipboardAnswer, bytes: []const u8, fin: bool) void {
+        const gpa = client.server.gpa;
+        const cb = client.server.clipboard orelse return client.endAnswer(answer, null);
+        answer.stream.consume(bytes.len);
+        if (answer.bytes.items.len + bytes.len > clipboard.max_copy_len + max_answer_header) {
+            answer.stream.reset(0);
+            return client.endAnswer(answer, null);
+        }
+        answer.bytes.appendSlice(gpa, bytes) catch {
+            answer.stream.reset(0);
+            return client.endAnswer(answer, null);
+        };
+
+        // The header first. It says which read this answers.
+        if (answer.id == null) {
+            const m, const len = (proto.frame.firstMessage(answer.bytes.items, max_answer_header) catch {
+                answer.stream.reset(0);
+                return client.endAnswer(answer, null);
+            }) orelse {
+                if (fin) client.endAnswer(answer, null);
+                return;
+            };
+            if (m != .clipboard_data) {
+                answer.stream.reset(0);
+                return client.endAnswer(answer, null);
+            }
+            answer.id = m.clipboard_data.id;
+            answer.refused = m.clipboard_data.refused;
+            answer.data_start = len;
+            cb.answerStarted(&client.peer, m.clipboard_data.id);
+        }
+        if (!fin) return;
+
+        const data: ?[]u8 = if (answer.refused) null else gpa.dupe(u8, answer.bytes.items[answer.data_start..]) catch null;
+        client.endAnswer(answer, data);
+    }
+
+    /// The answer is done, with its data, which this takes, or none. Every
+    /// answer ends here once, at its end, a failure or its stream closing.
+    fn endAnswer(client: *Client, answer: *ClipboardAnswer, data: ?[]u8) void {
+        const gpa = client.server.gpa;
+        const index = std.mem.indexOfScalar(*ClipboardAnswer, client.answers.items, answer) orelse return;
+        _ = client.answers.swapRemove(index);
+        if (answer.id) |id| {
+            if (client.server.clipboard) |cb| cb.answer(&client.peer, id, data) else if (data) |d| gpa.free(d);
+        } else if (data) |d| gpa.free(d);
+        answer.bytes.deinit(gpa);
+        gpa.destroy(answer);
     }
 
     fn onHello(client: *Client, m: proto.Hello) void {

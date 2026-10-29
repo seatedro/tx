@@ -6,6 +6,7 @@ pub const scan = @import("scan.zig");
 pub const connect = @import("connect.zig");
 pub const passphrase = @import("passphrase.zig");
 pub const report = @import("report.zig");
+pub const clipboard = @import("clipboard.zig");
 
 pub const RawMode = tty.RawMode;
 pub const Reader = tty.Reader;
@@ -21,6 +22,7 @@ test {
     _ = connect;
     _ = passphrase;
     _ = report;
+    _ = clipboard;
     // Analyzes the transport and crypto modules, whose exports the linked
     // C code needs.
     _ = &session.run;

@@ -606,6 +606,106 @@ pub const Exec = struct {
     }
 };
 
+/// What the user's clipboard holds, from a client that's attached: its
+/// MIME types, and a number that changes whenever the clipboard does.
+/// Sent after `Attached` and at each change. An empty `mimes` is an empty
+/// clipboard.
+///
+/// Programs on the host read the clipboard of the attached client that
+/// sent input last. The server asks it for data with `ClipboardRequest`.
+pub const ClipboardOffer = struct {
+    change: u64,
+    /// The MIME types, each followed by NUL.
+    mimes: []const u8,
+
+    pub const type_id = 24;
+    pub const tags = .{ .change = 1, .mimes = 2 };
+
+    pub fn encodedLen(m: ClipboardOffer) usize {
+        return bodyLen(ClipboardOffer, m);
+    }
+
+    pub fn encode(m: ClipboardOffer, w: *Writer) Writer.Error!void {
+        return encodeBody(ClipboardOffer, m, w);
+    }
+
+    pub fn decode(bytes: []const u8) DecodeError!ClipboardOffer {
+        return decodeBody(ClipboardOffer, bytes);
+    }
+};
+
+/// A program reads the clipboard the client offered as `change`. The client
+/// answers on a unidirectional stream of its own: `ClipboardData`, then the
+/// data, then the stream's end.
+pub const ClipboardRequest = struct {
+    id: u64,
+    change: u64,
+    mime: []const u8,
+
+    pub const type_id = 25;
+    pub const tags = .{ .id = 1, .change = 2, .mime = 3 };
+
+    pub fn encodedLen(m: ClipboardRequest) usize {
+        return bodyLen(ClipboardRequest, m);
+    }
+
+    pub fn encode(m: ClipboardRequest, w: *Writer) Writer.Error!void {
+        return encodeBody(ClipboardRequest, m, w);
+    }
+
+    pub fn decode(bytes: []const u8) DecodeError!ClipboardRequest {
+        return decodeBody(ClipboardRequest, bytes);
+    }
+};
+
+/// The start of a client's answer to `ClipboardRequest` `id`. A refused
+/// answer, because the user didn't paste or the clipboard changed, ends
+/// with it.
+pub const ClipboardData = struct {
+    id: u64,
+    refused: bool = false,
+
+    pub const type_id = 26;
+    pub const tags = .{ .id = 1, .refused = 2 };
+
+    pub fn encodedLen(m: ClipboardData) usize {
+        return bodyLen(ClipboardData, m);
+    }
+
+    pub fn encode(m: ClipboardData, w: *Writer) Writer.Error!void {
+        return encodeBody(ClipboardData, m, w);
+    }
+
+    pub fn decode(bytes: []const u8) DecodeError!ClipboardData {
+        return decodeBody(ClipboardData, bytes);
+    }
+};
+
+/// A program on the host copied, for the user's clipboard. The start of a
+/// unidirectional stream the server opens. The data follows: each type's
+/// bytes in `mimes`' order, `lens` long, then the stream's end.
+pub const ClipboardCopy = struct {
+    /// The MIME types, each followed by NUL.
+    mimes: []const u8,
+    /// Each type's length, as 8 bytes, big-endian.
+    lens: []const u8,
+
+    pub const type_id = 27;
+    pub const tags = .{ .mimes = 1, .lens = 2 };
+
+    pub fn encodedLen(m: ClipboardCopy) usize {
+        return bodyLen(ClipboardCopy, m);
+    }
+
+    pub fn encode(m: ClipboardCopy, w: *Writer) Writer.Error!void {
+        return encodeBody(ClipboardCopy, m, w);
+    }
+
+    pub fn decode(bytes: []const u8) DecodeError!ClipboardCopy {
+        return decodeBody(ClipboardCopy, bytes);
+    }
+};
+
 /// The revision of the messages between txd and its session processes,
 /// from `Connect` on. A session process refuses `Start` and `Connect` from
 /// another revision. `List` and `Kill` stay as they are, so that any txd
@@ -808,6 +908,10 @@ pub const Message = union(enum) {
     kill: Kill,
     killed: Killed,
     exec: Exec,
+    clipboard_offer: ClipboardOffer,
+    clipboard_request: ClipboardRequest,
+    clipboard_data: ClipboardData,
+    clipboard_copy: ClipboardCopy,
     connect: Connect,
     start: Start,
     started: Started,
@@ -1041,6 +1145,12 @@ test "every message round trips" {
         .{ .kill = .{ .session_id = 2 } },
         .{ .killed = .{ .session_id = 2 } },
         .{ .exec = .{ .command = "git-upload-pack 'repo'" } },
+        .{ .clipboard_offer = .{ .change = 7, .mimes = "image/png\x00text/plain\x00" } },
+        .{ .clipboard_offer = .{ .change = 8, .mimes = "" } },
+        .{ .clipboard_request = .{ .id = 1, .change = 7, .mime = "image/png" } },
+        .{ .clipboard_data = .{ .id = 1 } },
+        .{ .clipboard_data = .{ .id = 2, .refused = true } },
+        .{ .clipboard_copy = .{ .mimes = "text/plain\x00", .lens = "\x00\x00\x00\x00\x00\x00\x00\x05" } },
         .{ .connect = .{ .remote = "[::1]:5000", .cols = 80, .rows = 24, .cell_width_px = 9, .cell_height_px = 18, .resume_exporter = "exporter" } },
         .{ .connect = .{ .remote = "", .cols = 1, .rows = 1 } },
         .{ .start = .{

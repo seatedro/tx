@@ -46,6 +46,19 @@ fn readHeader(bytes: []const u8, max_body_len: usize) DecodeError!Header {
     };
 }
 
+/// The first message in `bytes`, whole, and the bytes it takes. Null if
+/// `bytes` ends inside it. For a stream that starts with a message and
+/// goes on with raw bytes.
+pub fn firstMessage(bytes: []const u8, max_body_len: usize) DecodeError!?struct { Message, usize } {
+    const header = readHeader(bytes, max_body_len) catch |err| switch (err) {
+        error.Truncated => return null,
+        else => return err,
+    };
+    const len = header.len + header.body_len;
+    if (bytes.len < len) return null;
+    return .{ try Message.decode(header.type_id, bytes[header.len..len]), len };
+}
+
 /// Splits a byte stream into messages. Feed it chunks of any size with
 /// `feed`, then call `next` until it returns null.
 ///
@@ -204,7 +217,7 @@ const samples = [_]Message{
     .{ .ack = .{ .seq = 1 } },
     .{ .input = .{ .bytes = "\x1b[A" } },
     .{ .resize = .{ .cols = 100, .rows = 30, .cell_width_px = 9, .cell_height_px = 18 } },
-    .{ .unknown = .{ .type_id = messages.Exec.type_id + 1, .body = "" } },
+    .{ .unknown = .{ .type_id = messages.ClipboardCopy.type_id + 1, .body = "" } },
     .{ .detach = .{} },
     .{ .exit = .{ .signal = "HUP" } },
     .{ .@"error" = .{ .code = 1, .message = "bye" } },
@@ -235,6 +248,20 @@ fn expectSamples(stream: []const u8, splits: []const usize) !void {
         }
     }
     try testing.expectEqual(samples.len, i);
+}
+
+test firstMessage {
+    var buf: [64]u8 = undefined;
+    var w: Writer = .fixed(&buf);
+    try encode(&w, .{ .clipboard_data = .{ .id = 3 } });
+    const len = w.buffered().len;
+    try w.writeAll("raw bytes");
+
+    try testing.expectEqual(null, try firstMessage(w.buffered()[0 .. len - 1], 64));
+    const m, const used = (try firstMessage(w.buffered(), 64)).?;
+    try testing.expectEqual(len, used);
+    try testing.expectEqual(3, m.clipboard_data.id);
+    try testing.expectError(error.Oversize, firstMessage(w.buffered(), 1));
 }
 
 test "encodedLen matches the encoding" {
