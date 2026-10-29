@@ -22,10 +22,13 @@
       pkgs = nixpkgs.legacyPackages.${system};
     in {
       devShells.default = pkgs.mkShell {
-        packages = [
-          zig.packages.${system}."0.17.0"
-          pkgs.clang-tools # clang-format for src/**/*.{c,h}
-        ];
+        packages =
+          [
+            zig.packages.${system}."0.17.0"
+            pkgs.clang-tools # clang-format for src/**/*.{c,h}
+          ]
+          # wl-copy and wl-paste, which the clipboard server's tests run.
+          ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [pkgs.wl-clipboard];
       };
     });
 }

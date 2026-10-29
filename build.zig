@@ -87,7 +87,7 @@ pub fn build(b: *std.Build) void {
 
     const wayland_tests = b.addTest(.{
         .name = "wayland-test",
-        .root_module = waylandModule(b, target, optimize),
+        .root_module = waylandModule(b, target, optimize, xev),
     });
     wayland_tests.root_module.addImport("fuzz", fuzz);
     addTestRuns(b, wayland_tests, test_step, test_network_step);
@@ -102,7 +102,7 @@ pub fn build(b: *std.Build) void {
     for ([_]struct { []const u8, *std.Build.Module }{
         .{ "proto-fuzz", protoModule(b, target, optimize) },
         .{ "auth-fuzz", authModule(b, target, optimize) },
-        .{ "wayland-fuzz", waylandModule(b, target, optimize) },
+        .{ "wayland-fuzz", waylandModule(b, target, optimize, xev) },
         .{ "spa-fuzz", b.createModule(.{
             .root_source_file = b.path("src/transport/spa.zig"),
             .target = target,
@@ -438,12 +438,16 @@ fn waylandModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    xev: *std.Build.Module,
 ) *std.Build.Module {
-    return b.createModule(.{
+    const mod = b.createModule(.{
         .root_source_file = b.path("src/wayland/root.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
+    mod.addImport("xev", xev);
+    return mod;
 }
 
 fn clientModule(
