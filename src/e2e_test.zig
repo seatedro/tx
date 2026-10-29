@@ -969,6 +969,34 @@ test "rsync copies a directory with tx as its shell" {
     try testing.expectEqualStrings("small\n", small);
 }
 
+test "tx reaches the host, as the user, that ssh's config gives the destination" {
+    var es: ExecServer = undefined;
+    try es.init();
+    defer es.deinit();
+    var t: Tools = undefined;
+    try t.init(&es);
+    defer t.deinit();
+    try t.run(&.{ "ssh", "-V" });
+
+    // An alias only this config knows, read by an ssh that's given it.
+    try t.tmp.dir.writeFile(testing.io, .{
+        .sub_path = "ssh_config",
+        .data = "Host txtest\n  HostName 127.0.0.1\n  User " ++ test_user ++ "\n",
+    });
+    var script_buf: [std.fs.max_path_bytes + 64]u8 = undefined;
+    const script = try std.fmt.bufPrint(&script_buf, "#!/bin/sh\nexec ssh -F {s}/ssh_config \"$@\"\n", .{t.dir});
+    {
+        const file = try t.tmp.dir.createFile(testing.io, "ssh-with-config", .{ .permissions = .fromMode(0o755) });
+        defer file.close(testing.io);
+        try file.writeStreamingAll(testing.io, script);
+    }
+
+    var ssh_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var port_buf: [8]u8 = undefined;
+    const port = try std.fmt.bufPrint(&port_buf, "{d}", .{t.port});
+    try t.run(&.{ t.environ.get("GIT_SSH_COMMAND").?, "--ssh", try t.path(&ssh_buf, "ssh-with-config"), "-p", port, "txtest", "true" });
+}
+
 test "a new session finds the terminfo entry its client sent, or a common one" {
     var es: ExecServer = undefined;
     try es.init();

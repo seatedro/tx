@@ -6,7 +6,9 @@
 //!        tx --version
 //!
 //! tx takes ssh's options, as ssh reads them, so that tools that run ssh
-//! can run tx (see `args.zig`). `-p` is txd's port.
+//! can run tx (see `args.zig`). `-p` is txd's port. It connects to the
+//! host, and logs in as the user, that ssh's config gives the destination
+//! (see `ssh_config.zig`).
 //!
 //! Run as `ssh`, from a link named ssh ahead of ssh in PATH, tx takes ssh's
 //! place (see `Shim`): `-p` is sshd's port, the ssh tx runs gets the same
@@ -74,6 +76,7 @@ const transport = @import("transport");
 const paths = @import("paths.zig");
 const remote = @import("remote.zig");
 const spa_keys = @import("spa_keys.zig");
+const ssh_config = @import("ssh_config.zig");
 const args_pkg = @import("args.zig");
 
 const default_port = remote.default_port;
@@ -128,11 +131,16 @@ pub fn main(init: std.process.Init) !u8 {
     }
     for (args.ignored) |letter| std.debug.print("tx: ignoring -{c}, which tx doesn't support yet\n", .{letter});
 
-    const host = args.host;
-    const user = args.user;
+    // The host and user from ssh's config, as `tx pulsar` should reach
+    // what `ssh pulsar` does. A user given to tx wins, as it does in ssh.
+    const ssh_path = if (shim) |sh| sh.ssh else args.ssh_path;
+    const ssh_options = if (shim != null) args.ssh_options else &.{};
+    const configured = ssh_config.resolve(arena, io, ssh_path, ssh_options, args.user, args.host);
+    const host = configured.hostname orelse args.host;
+    const user = args.user orelse configured.user;
     // As ssh, `-p` is sshd's.
     const port = if (shim != null) default_port else args.port orelse default_port;
-    if (args.print_config) return printConfig(io, environ, args);
+    if (args.print_config) return printConfig(io, environ, user, host, args.port);
 
     // What to do once logged in. A command runs in a session of its own
     // with a terminal.
@@ -150,12 +158,13 @@ pub fn main(init: std.process.Init) !u8 {
     }
     const yes = args.yes;
 
-    // ssh logs in to the same account, unless its config says otherwise.
+    // ssh gets the destination as given, so that its config applies to it
+    // in full.
     var ssh_buf: [512]u8 = undefined;
-    const ssh_destination = if (user) |u| std.fmt.bufPrint(&ssh_buf, "{s}@{s}", .{ u, host }) catch host else host;
+    const ssh_destination = if (args.user) |u| std.fmt.bufPrint(&ssh_buf, "{s}@{s}", .{ u, args.host }) catch args.host else args.host;
     const ssh: remote.Source = .{
-        .ssh = if (shim) |sh| sh.ssh else args.ssh_path,
-        .ssh_options = if (shim != null) args.ssh_options else &.{},
+        .ssh = ssh_path,
+        .ssh_options = ssh_options,
         .destination = ssh_destination,
         .server_command = args.server_command,
         .port = port,
@@ -204,7 +213,7 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     // The keys known_hosts lists for the host, or the one the user accepts.
-    const ssh_spa_key: SshSpaKey = .{ .path = tx_spa_keys, .name = known_name, .host = host };
+    const ssh_spa_key: SshSpaKey = .{ .path = tx_spa_keys, .name = known_name, .host = args.host };
     const trusted = trustedKeys(gpa, io, environ, tx_known_hosts, known_name, addresses, ssh, ssh_spa_key) catch |err| {
         if (shim) |sh| return sh.run(io, if (err == error.Declined) "txd isn't installed there" else "can't check txd's host key");
         return switch (err) {
@@ -568,13 +577,13 @@ fn keyFilePath(gpa: Allocator, environ: *const std.process.Environ.Map, file: []
 
 /// `-G`: the configuration, as OpenSSH prints it. git runs `-G` to tell
 /// OpenSSH from other ssh programs, and passes a port only to OpenSSH.
-fn printConfig(io: Io, environ: *const std.process.Environ.Map, args: args_pkg.Args) u8 {
+fn printConfig(io: Io, environ: *const std.process.Environ.Map, user: ?[]const u8, host: []const u8, port: ?u16) u8 {
     var buf: [1024]u8 = undefined;
     var w = Io.File.stdout().writerStreaming(io, &buf);
     w.interface.print("user {s}\nhostname {s}\nport {d}\n", .{
-        args.user orelse paths.userName(environ) orelse "",
-        args.host,
-        args.port orelse default_port,
+        user orelse paths.userName(environ) orelse "",
+        host,
+        port orelse default_port,
     }) catch return 255;
     w.interface.flush() catch return 255;
     return 0;
@@ -922,4 +931,5 @@ test {
     _ = @import("getopt.zig");
     _ = remote;
     _ = spa_keys;
+    _ = ssh_config;
 }
