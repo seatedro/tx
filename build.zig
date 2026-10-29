@@ -133,6 +133,7 @@ pub fn build(b: *std.Build) void {
             .auth = auth,
             .session = session,
             .term = term,
+            .wayland = app.wayland,
         }),
     });
     addTestRuns(b, server_tests, test_step, test_network_step);
@@ -298,6 +299,7 @@ const AppModules = struct {
     session: *std.Build.Module,
     client: *std.Build.Module,
     server: *std.Build.Module,
+    wayland: *std.Build.Module,
 };
 
 fn appModules(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, libs: Libraries) AppModules {
@@ -307,6 +309,7 @@ fn appModules(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     const proto = protoModule(b, target, optimize);
     const auth = authModule(b, target, optimize);
     const session = sessionModule(b, target, optimize, .{ .term = term, .wake = libs.wake, .xev = xev, .proto = proto, .auth = auth });
+    const wayland = waylandModule(b, target, optimize, xev);
     return .{
         .xev = xev,
         .term = term,
@@ -322,7 +325,9 @@ fn appModules(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
             .auth = auth,
             .session = session,
             .term = term,
+            .wayland = wayland,
         }),
+        .wayland = wayland,
     };
 }
 
@@ -379,6 +384,7 @@ const ServerDeps = struct {
     auth: *std.Build.Module,
     session: *std.Build.Module,
     term: *std.Build.Module,
+    wayland: *std.Build.Module,
 };
 
 fn serverModule(
@@ -399,6 +405,7 @@ fn serverModule(
     mod.addImport("auth", deps.auth);
     mod.addImport("session", deps.session);
     mod.addImport("term", deps.term);
+    mod.addImport("wayland", deps.wayland);
     return mod;
 }
 

@@ -33,6 +33,10 @@
 //!
 //! Listening on a wildcard address binds each address it covers, and
 //! follows addresses as they come and go (see `addresses`).
+//!
+//! On Linux, with `Options.wayland_socket`, the server also runs the
+//! clipboard server there (see `wayland`), and sessions find it through
+//! `WAYLAND_DISPLAY`.
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
@@ -46,6 +50,7 @@ const proto = @import("proto");
 const session = @import("session");
 const term = @import("term");
 const auth = @import("auth");
+const wayland = @import("wayland");
 const addresses = @import("addresses.zig");
 pub const runtime_dir = @import("runtime_dir.zig");
 pub const exec = @import("exec.zig");
@@ -95,6 +100,25 @@ pub const Options = struct {
     /// Only clients with this key get an answer. Null answers any client.
     /// See `transport.spa`.
     spa_key: ?transport.spa.Key = null,
+    /// Where the clipboard server listens, on Linux. Null runs none.
+    wayland_socket: ?[]const u8 = null,
+};
+
+/// The clipboard server, which only Linux has.
+const Clipboard = if (builtin.os.tag == .linux) *wayland.Listener else noreturn;
+
+/// What sessions get with the clipboard server, besides `WAYLAND_DISPLAY`.
+/// A program that finds a Wayland server takes it for a display, and these
+/// keep the ones that would draw on it to what they do on a server with
+/// none. A shell profile can still set them. `XDG_SESSION_TYPE` is left
+/// unset, since `wayland` there would send Qt 5, SDL and Chromium to it.
+const display_defaults = [_]struct { []const u8, []const u8 }{
+    // matplotlib draws to files, as without a display.
+    .{ "MPLBACKEND", "Agg" },
+    // SDL 2 and 3, and Qt, look for X11 instead, and find none.
+    .{ "SDL_VIDEODRIVER", "x11" },
+    .{ "SDL_VIDEO_DRIVER", "x11" },
+    .{ "QT_QPA_PLATFORM", "xcb" },
 };
 
 pub const ErrorCode = proto.ErrorCode;
@@ -145,6 +169,8 @@ pub const Server = struct {
     stopping: bool = false,
     /// No session started by this server has an ID below it.
     next_id: u64 = 1,
+    /// Running at `Options.wayland_socket`. It frees itself once stopped.
+    clipboard: ?Clipboard = null,
 
     const Rescan = struct {
         /// `Options.listen`, with the port the first bind got if it asked
@@ -176,6 +202,7 @@ pub const Server = struct {
 
         if (!addresses.isWildcard(options.listen)) {
             _ = try self.listen(options.listen);
+            self.startClipboard();
             return;
         }
 
@@ -189,7 +216,32 @@ pub const Server = struct {
         // With every address taken, another server likely has the port.
         if (self.endpoints.items.len == 0) return if (in_use > 0) error.AddressInUse else error.NoAddresses;
         self.rescan.?.timer.run(loop, &self.rescan.?.c, rescan_ms, Server, self, onRescan);
+        self.startClipboard();
     }
+
+    /// Last in `init`, since nothing frees the listener but the loop.
+    /// Sessions do without a clipboard if it doesn't start.
+    fn startClipboard(self: *Server) void {
+        if (builtin.os.tag != .linux) return;
+        const path = self.options.wayland_socket orelse return;
+        self.clipboard = wayland.Listener.create(self.gpa, self.loop, path, .{
+            .context = self,
+            .fetch = clipboardFetch,
+            .copied = clipboardCopied,
+        }) catch |err| {
+            log.warn("no clipboard server at {s}: {t}", .{ path, err });
+            return;
+        };
+    }
+
+    /// A program reads the user's clipboard. Clients don't offer theirs
+    /// yet, so it's empty.
+    fn clipboardFetch(_: ?*anyopaque, _: []const u8, fd: posix.fd_t) void {
+        _ = std.c.close(fd);
+    }
+
+    /// A program copied. It stays among the session's programs for now.
+    fn clipboardCopied(_: ?*anyopaque, _: wayland.Selection, _: ?[]const []const u8) void {}
 
     /// The first bound address, with the port the kernel picked.
     pub fn address(self: *const Server) IpAddress {
@@ -204,6 +256,8 @@ pub const Server = struct {
         // own, and the loop runs until they do.
         for (self.execs.items) |e| e.kill();
         for (self.endpoints.items) |e| e.stop();
+        if (self.clipboard) |l| l.close();
+        self.clipboard = null;
         if (self.rescan) |*r| if (r.c.state() == .active) {
             r.cancel_c = .{ .op = .{ .cancel = .{ .c = &r.c } } };
             self.loop.add(&r.cancel_c);
@@ -488,9 +542,18 @@ pub const Server = struct {
     }
 
     /// The server's environment, with the client's locale variables in
-    /// place of the server's. Items that aren't one are left out.
+    /// place of the server's, and the clipboard server. Items that aren't
+    /// a locale variable are left out.
     fn clientEnviron(self: *Server, arena: Allocator, hello: *const Hello) !std.process.Environ.Map {
         var environ = try self.options.environ.clone(arena);
+        if (self.clipboard != null) {
+            // An absolute WAYLAND_DISPLAY is the socket's path.
+            try environ.put("WAYLAND_DISPLAY", self.options.wayland_socket.?);
+            for (display_defaults) |entry| {
+                const name, const value = entry;
+                if (!environ.contains(name)) try environ.put(name, value);
+            }
+        }
         var items = std.mem.splitScalar(u8, hello.locale.items, 0);
         while (items.next()) |item| {
             const eq = std.mem.indexOfScalar(u8, item, '=') orelse continue;

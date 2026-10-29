@@ -189,6 +189,10 @@ pub fn main(init: std.process.Init) !u8 {
 
     const runtime_dir = try paths.runtime(gpa, init.environ_map);
     defer gpa.free(runtime_dir);
+    // The clipboard server's, beside the sessions'. Never `wayland-0`, the
+    // name a desktop's compositor takes in the directory above.
+    const wayland_socket = try std.fs.path.join(gpa, &.{ runtime_dir, "wayland-1" });
+    defer gpa.free(wayland_socket);
     // On Linux, the binary this process runs even once it has been
     // replaced, so that the sessions it starts speak its revision.
     const session_exe = if (builtin.os.tag == .linux)
@@ -215,6 +219,7 @@ pub fn main(init: std.process.Init) !u8 {
         .terminfo_dir = terminfo_dir,
         .cwd = if (init.environ_map.get("HOME")) |home| .{ .path = home } else .inherit,
         .spa_key = if (open) null else spa_key,
+        .wayland_socket = wayland_socket,
     }) catch |err| switch (err) {
         error.AddressInUse => {
             std.debug.print("txd: port {d} is in use, by another txd or another program\n", .{listen.getPort()});
