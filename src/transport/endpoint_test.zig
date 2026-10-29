@@ -367,3 +367,58 @@ test "an idle connection times out on both ends" {
     try testing.expectEqual(CloseReason.idle_timeout, echo.last_reason.?);
     try h.finish(&.{ &client, &server });
 }
+
+/// Counts the unidirectional streams that end.
+const UniCounter = struct {
+    ended: usize = 0,
+
+    fn handler(u: *UniCounter) endpoint.Handler {
+        return .{ .ctx = u, .data = onData };
+    }
+
+    fn onData(ctx: ?*anyopaque, stream: *Stream, bytes: []const u8, fin: bool) void {
+        const u: *UniCounter = @ptrCast(@alignCast(ctx.?));
+        stream.consume(bytes.len);
+        if (fin) u.ended += 1;
+    }
+};
+
+test "a peer keeps opening streams as its earlier ones close" {
+    var keys: Keys = try .init(false);
+    defer keys.deinit();
+    var h: Harness = undefined;
+    try h.init();
+
+    var counter: UniCounter = .{};
+    var server: Endpoint = undefined;
+    try server.init(gpa, testing.io, &h.loop, .{ .local = try loopback(), .role = .{ .server = &keys.server }, .handler = counter.handler() });
+    var sender: Sender = .{ .payload = "" };
+    defer sender.deinit();
+    var client: Endpoint = undefined;
+    try client.init(gpa, testing.io, &h.loop, .{ .local = try loopback(), .role = .{ .client = &keys.client }, .handler = sender.handler() });
+    _ = try client.connect(server.local);
+    try h.runUntil(&sender, Sender.isConnected);
+
+    // More than the 100 the transport parameters allow at once. Each waits
+    // for the server to give back the place of one that closed.
+    for (0..250) |i| {
+        const deadline = nowMs() + timeout_ms;
+        const stream = while (true) {
+            if (sender.conn.?.openStream(.uni)) |s| break s else |err| switch (err) {
+                error.StreamLimit => {},
+                else => return err,
+            }
+            if (nowMs() > deadline) return error.Timeout;
+            try h.loop.run(.once);
+        };
+        try stream.write("x");
+        stream.finish();
+        const Ended = struct {
+            fn f(c: struct { *UniCounter, usize }) bool {
+                return c[0].ended > c[1];
+            }
+        };
+        try h.runUntil(.{ &counter, i }, Ended.f);
+    }
+    try h.finish(&.{ &client, &server });
+}
