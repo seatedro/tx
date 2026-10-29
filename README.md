@@ -59,7 +59,7 @@ Needs Zig 0.17.0, or `nix develop`.
 
     zig build               # zig-out/bin/tx and zig-out/bin/txd
     zig build test
-    zig build fuzz --fuzz   # fuzz what a client reaches before it logs in
+    zig build fuzz --fuzz   # fuzz what a client reaches before it logs in, and Wayland's wire format
     zig build release       # static Linux and macOS builds in zig-out/release
 
 ## License
