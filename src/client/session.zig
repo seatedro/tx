@@ -1243,7 +1243,9 @@ const Run = struct {
 
         const data: ?[]u8 = if (pasted and current) provider.read(provider.context, r.gpa, m.mime) catch null else null;
         defer if (data) |d| r.gpa.free(d);
-        if (!pasted) log.info("refused a read of the clipboard: no paste in the last {d} s", .{clipboard.paste_window_ms / 1000});
+        // Not at info, which would write over the session's screen: Neovim,
+        // for one, reads the clipboard at each put.
+        if (!pasted) log.debug("refused a read of the clipboard: no paste in the last {d} s", .{clipboard.paste_window_ms / 1000});
 
         // On a stream of its own, so that a large image doesn't hold up
         // input.
