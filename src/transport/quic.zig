@@ -727,7 +727,7 @@ fn streamOpen(_: ?*c.ngtcp2_conn, stream_id: i64, user_data: ?*anyopaque) callco
 }
 
 fn streamClose(
-    _: ?*c.ngtcp2_conn,
+    conn: ?*c.ngtcp2_conn,
     _: u32,
     stream_id: i64,
     _: u64,
@@ -735,6 +735,15 @@ fn streamClose(
     _: ?*anyopaque,
 ) callconv(.c) c_int {
     const self = fromUserData(user_data);
+
+    // A stream the peer opened gives its place back, so that the peer can
+    // keep opening streams over a long connection. ngtcp2 leaves this to
+    // the application.
+    if (c.ngtcp2_conn_is_local_stream2(conn, stream_id) == 0) {
+        // Bit 1 of a stream's ID is set for a unidirectional stream.
+        if (stream_id & 0x2 != 0) c.ngtcp2_conn_extend_max_streams_uni(conn, 1) else c.ngtcp2_conn_extend_max_streams_bidi(conn, 1);
+    }
+
     if (self.handler.streamClosed) |f| f(self.handler.ctx, self, stream_id);
     return 0;
 }
