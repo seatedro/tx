@@ -21,6 +21,9 @@ tx is early and changes often. Don't rely on it yet.
 tx takes ssh's options, read as ssh reads them, so tools that run ssh can
 run tx: `GIT_SSH_COMMAND=tx git clone ssh://host/repo`, `rsync -e tx`. `-p`
 is txd's port. Options for features tx lacks, such as `-L`, are refused.
+tx connects to the `HostName`, as the `User`, that ssh's config gives the
+host, as `ssh -G` prints them, so `tx pulsar` reaches what `ssh pulsar`
+does.
 
 Linked as `ssh` in a directory ahead of ssh in `PATH`, tx takes ssh's
 place: `-p` is then sshd's port, and txd keeps its own, 8739. The ssh that
