@@ -510,6 +510,12 @@ pub const Session = struct {
 
     /// The `wake` callback frees the session.
     fn end(s: *Session, exit: proto.Exit) void {
+        if (exit.signal) |name| {
+            log.info("session {d}: its program was killed by SIG{s}", .{ s.id, name });
+        } else {
+            log.info("session {d}: its program exited with status {d}", .{ s.id, exit.status });
+        }
+
         if (s.link) |link| {
             link.send(.{ .exit = exit });
             link.vtable.finish(link.context);
