@@ -37,6 +37,19 @@ with the host's `tic`; without it, the session's `TERM` is `xterm-256color`.
 tx logs in with the same keys as ssh: the SSH agent's Ed25519 and RSA keys,
 then `~/.ssh/id_ed25519`. txd accepts the keys in `~/.ssh/authorized_keys`.
 
+### Clipboard
+
+On a Linux host, programs share the clipboard of the Mac you run tx on,
+text and images: txd runs a Wayland server that does only the clipboard,
+and sessions get `WAYLAND_DISPLAY`. Ctrl-V of a screenshot in Claude Code or
+Codex works as it does locally. Claude Code needs wl-clipboard on the host.
+
+Programs read the clipboard only within 5 seconds of a paste: Ctrl-V, or
+any paste into the terminal. Other reads, such as Neovim's `"+p`, get
+nothing. Copies on the host, such as Neovim's `"+y`, go to the Mac's
+clipboard. Nothing is shared while the pasteboard holds what a password
+manager marked as concealed.
+
 ## Server
 
 tx copies txd to a host that has none, and sets it up as a user service:

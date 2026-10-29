@@ -60,6 +60,7 @@
 //! Exits with the program's exit status, or 255 for tx's own failures, as
 //! ssh does.
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const IpAddress = Io.net.IpAddress;
@@ -226,6 +227,9 @@ pub fn main(init: std.process.Init) !u8 {
         try client.report.ask(std.posix.STDIN_FILENO, &typed, arena)
     else
         .{};
+    // The macOS pasteboard, for programs on the host. Elsewhere there's
+    // none yet.
+    var pasteboard: ?client.pasteboard.Pasteboard = if (builtin.os.tag.isDarwin() and command == .attach) client.pasteboard.Pasteboard.general() else null;
     var options: client.session.Options = .{
         .servers = addresses,
         .host_keys = trusted.keys,
@@ -247,6 +251,7 @@ pub fn main(init: std.process.Init) !u8 {
         .escape_char = args.escape_char,
         .in_fd = if (args.no_stdin) try openNull() else std.posix.STDIN_FILENO,
         .handshake_timeout_ns = no_answer_timeout_ns,
+        .clipboard = if (pasteboard) |*p| p.provider() else null,
     };
     var install = trusted.install;
     var outcome = client.session.run(gpa, io, options) catch |err| return fail("{t}", .{err});
