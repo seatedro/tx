@@ -29,10 +29,12 @@
 //! and is accepted for ssh's sake.
 //!
 //! The server's key is checked against `~/.config/tx/known_hosts` and
-//! `~/.ssh/known_hosts`. For a host in neither, tx reads the key over ssh
-//! with `txd --print-host-key`, so ssh's own host check vouches for
-//! it. If that fails, tx asks, as ssh does. The key is added to the first
-//! file.
+//! `~/.ssh/known_hosts`. For a host the first doesn't list, tx reads the
+//! key over ssh with `txd --print-host-key`, so ssh's own host check
+//! vouches for it, and adds it to the first file. The second isn't enough
+//! alone: it lists sshd's keys, and a txd that runs as the user has a key
+//! of its own. If ssh fails, tx trusts the keys the second lists, or else
+//! asks, as ssh does.
 //!
 //! The same ssh command runs `txd --install`, which sets up a service that
 //! keeps txd running on the host and starts it. tx runs the install over
@@ -286,6 +288,14 @@ pub fn main(init: std.process.Init) !u8 {
         },
         .disconnected => |reason| return fail("connection closed: {t}", .{reason}),
         .host_key_refused => |key| {
+            if (trusted.sshd_keys) {
+                std.debug.print(
+                    \\tx: the host key for {s} isn't one ~/.ssh/known_hosts lists.
+                    \\tx: it presented {s}. A txd that runs as you has a key of its own, which tx reads over ssh.
+                    \\
+                , .{ known_name, auth.Fingerprint.init(key).slice() });
+                return 255;
+            }
             std.debug.print(
                 \\tx: the host key for {s} has changed, or someone is impersonating the host.
                 \\tx: it presented {s}
@@ -709,11 +719,14 @@ const Trusted = struct {
     install: Install = .not_run,
     /// The SPA key, when the host key was read over ssh.
     spa_key: ?transport.spa.Key = null,
+    /// The keys are the ones `~/.ssh/known_hosts` lists, since ssh failed.
+    sshd_keys: bool = false,
 };
 
-/// When no file lists a key for the host, reads the host's key over ssh,
-/// or else learns it and asks the user, and records it in
-/// `tx_known_hosts`.
+/// When tx's known_hosts lists no key for the host, reads the host's key
+/// over ssh, or else trusts the keys ssh's known_hosts lists, or else
+/// learns it and asks the user. A key that's read or learned is recorded
+/// in `tx_known_hosts`.
 fn trustedKeys(
     gpa: Allocator,
     io: Io,
@@ -727,16 +740,21 @@ fn trustedKeys(
     var known: auth.known_hosts.Known = .{};
     defer known.deinit(gpa);
     try auth.known_hosts.readFile(io, gpa, tx_known_hosts, name, &known);
+    const recorded = known.keys.items.len > 0;
     if (paths.home(gpa, environ, ".ssh/known_hosts")) |ssh_known_hosts| {
         defer gpa.free(ssh_known_hosts);
         try auth.known_hosts.readFile(io, gpa, ssh_known_hosts, name, &known);
     } else |_| {}
 
-    const trusted = try known.trusted(gpa);
-    if (trusted.len > 0) return .{ .keys = trusted };
-    gpa.free(trusted);
+    if (recorded) {
+        const trusted = try known.trusted(gpa);
+        if (trusted.len > 0) return .{ .keys = trusted };
+        gpa.free(trusted);
+    }
 
-    // First contact, over ssh if it can log in.
+    // First contact, over ssh if it can log in. That's so even for a host
+    // in ssh's known_hosts, which lists sshd's keys: a txd that runs as
+    // the user can't read them, and has a key of its own.
     var install: Install = .not_run;
     if (hostKeyOverSsh(gpa, io, ssh, ssh_spa_key, &install)) |read| {
         const key = read.host_key;
@@ -754,6 +772,11 @@ fn trustedKeys(
         error.Declined => return error.Declined,
         else => std.debug.print("tx: can't read the host key over ssh: {t}\n", .{err}),
     }
+
+    // Without ssh, the keys ssh knows, for a txd that uses sshd's key.
+    const sshd_keys = try known.trusted(gpa);
+    if (sshd_keys.len > 0) return .{ .keys = sshd_keys, .install = install, .sshd_keys = true };
+    gpa.free(sshd_keys);
 
     // Otherwise the server's own word, checked by the user.
     const found = switch (try client.scan.hostKey(gpa, io, addresses, 10 * std.time.ns_per_s)) {
@@ -779,6 +802,71 @@ fn trustedKeys(
     const keys = try gpa.alloc(auth.Key, 1);
     keys[0] = key;
     return .{ .keys = keys, .install = install };
+}
+
+test "a host only ssh's known_hosts lists has its key read over ssh, or without ssh, trusts sshd's" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // sshd's key, in ssh's known_hosts, and txd's own, which the stand-in
+    // for ssh prints as `txd --print-host-key` does.
+    const sshd_key: auth.Key = @splat(1);
+    const txd_key: auth.Key = @splat(2);
+    try tmp.dir.createDirPath(io, ".ssh");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".ssh/known_hosts",
+        .data = try std.fmt.allocPrint(a, "pulsar ssh-ed25519 {s}\n", .{auth.ssh.KeyText.init(sshd_key).slice()}),
+    });
+    const scripts = [_]struct { name: []const u8, text: []const u8 }{
+        .{ .name = "ssh", .text = try std.fmt.allocPrint(a, "#!/bin/sh\necho ssh-ed25519 {s}\n", .{auth.ssh.KeyText.init(txd_key).slice()}) },
+        .{ .name = "failing-ssh", .text = "#!/bin/sh\nexit 255\n" },
+    };
+    for (scripts) |s| {
+        const file = try tmp.dir.createFile(io, s.name, .{ .permissions = .fromMode(0o755) });
+        defer file.close(io);
+        try file.writeStreamingAll(io, s.text);
+    }
+
+    var environ: std.process.Environ.Map = .init(gpa);
+    defer environ.deinit();
+    try environ.put("HOME", dir);
+    const tx_known_hosts = try std.fs.path.join(a, &.{ dir, "known_hosts" });
+    var source: remote.Source = .{
+        .ssh = try std.fs.path.join(a, &.{ dir, "ssh" }),
+        .destination = "pulsar",
+        .server_command = "txd",
+        .port = default_port,
+        .signal_mask = std.posix.sigemptyset(),
+        .environ = &environ,
+        .first_install = .no,
+    };
+    const spa_key: SshSpaKey = .{ .path = try std.fs.path.join(a, &.{ dir, "spa_keys" }), .name = "pulsar", .host = "pulsar" };
+
+    // Over ssh, txd's key, which tx records.
+    const read = try trustedKeys(gpa, io, &environ, tx_known_hosts, "pulsar", &.{}, source, spa_key);
+    defer gpa.free(read.keys);
+    try std.testing.expectEqualSlices(auth.Key, &.{txd_key}, read.keys);
+    try std.testing.expect(!read.sshd_keys);
+
+    // Once recorded, it's trusted without ssh.
+    source.ssh = try std.fs.path.join(a, &.{ dir, "failing-ssh" });
+    const recorded = try trustedKeys(gpa, io, &environ, tx_known_hosts, "pulsar", &.{}, source, spa_key);
+    defer gpa.free(recorded.keys);
+    try std.testing.expectEqualSlices(auth.Key, &.{ txd_key, sshd_key }, recorded.keys);
+
+    // Without ssh or a recorded key, sshd's.
+    try tmp.dir.deleteFile(io, "known_hosts");
+    const sshd = try trustedKeys(gpa, io, &environ, tx_known_hosts, "pulsar", &.{}, source, spa_key);
+    defer gpa.free(sshd.keys);
+    try std.testing.expectEqualSlices(auth.Key, &.{sshd_key}, sshd.keys);
+    try std.testing.expect(sshd.sshd_keys);
 }
 
 /// Asks on the controlling terminal whether to trust `key`, as ssh does.
