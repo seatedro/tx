@@ -1765,6 +1765,44 @@ test "a new session gets the client's locale variables in place of the server's"
     try rc.waitOutput("lang=en_US.UTF-8 ctype=" ++ ctype ++ " time=C other=unset.");
 }
 
+test "a session's programs copy and paste through the clipboard server, which a new txd takes over" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    transport.crypto.init(testing.io);
+    var environ = try testEnviron();
+    defer environ.deinit();
+    var login: Login = undefined;
+    try login.init(null);
+    defer login.deinit();
+    var options = try login.serverOptions(&environ, &.{ "/bin/sh", "-c", "sleep 10" });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    options.wayland_socket = try std.fmt.bufPrint(&path_buf, "{s}/wayland-1", .{login.runtime_dir});
+    var st: ServerThread = undefined;
+    try st.init(options);
+    defer st.deinit();
+
+    // wl-copy serves the copy from a process it leaves in the background,
+    // which would keep the command's output open.
+    const command =
+        \\command -v wl-copy >/dev/null || exit 77
+        \\wl-copy "$1" </dev/null >/dev/null 2>&1
+        \\wl-paste --no-newline
+        \\printf ' %s %s' "$MPLBACKEND" "${DISPLAY-unset}"
+    ;
+    inline for (.{ "first", "second" }) |text| {
+        var ec: ExecClient = undefined;
+        defer ec.deinit();
+        try ec.start(&login, &st, "set -- " ++ text ++ "\n" ++ command);
+        ec.closeStdin();
+        const outcome = try ec.join();
+        if (outcome.exited.status == 77) return error.SkipZigTest;
+        try testing.expectEqual(0, outcome.exited.status);
+        try testing.expectEqualStrings(text ++ " Agg unset", ec.out.items);
+
+        // The next txd finds the socket the last one left, and replaces it.
+        try st.restart();
+    }
+}
+
 test "a client that sends more after the server's error is closed when its stream ends" {
     transport.crypto.init(testing.io);
     var environ: std.process.Environ.Map = .init(gpa);
