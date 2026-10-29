@@ -1170,9 +1170,11 @@ test "getAttrs doesn't overrun termios and IUTF8 is set" {
 test "program is a session leader with the pty as controlling terminal" {
     var environ = try testEnviron();
     defer environ.deinit();
+    // The newline is printf's: on Ubuntu 26.04, `tty` printed the name
+    // with none after it.
     var pty = try spawnTest(&environ, &.{
         "/bin/sh", "-c",
-        \\tty
+        \\printf '%s\n' "$(tty)"
         \\echo ok >/dev/tty
         \\read line
     });
