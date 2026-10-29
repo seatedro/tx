@@ -63,10 +63,12 @@ pub const Listener = struct {
     }
 
     /// Closes every program's connection and the socket. The listener is
-    /// freed once the loop has run their last callbacks.
+    /// freed once the loop has run their last callbacks, and calls the
+    /// backend no more.
     pub fn close(l: *Listener) void {
         if (l.closing) return;
         l.closing = true;
+        l.server.backend = .{ .fetch = closeFetch, .copied = ignoreCopy };
         _ = linux.shutdown(l.fd, linux.SHUT.RDWR);
         for (l.clients.items) |client| client.close();
         l.freeIfDone();
@@ -149,6 +151,12 @@ pub const Listener = struct {
         l.gpa.destroy(l);
     }
 };
+
+fn closeFetch(_: ?*anyopaque, _: []const u8, fd: fd_t) void {
+    closeFd(fd);
+}
+
+fn ignoreCopy(_: ?*anyopaque, _: Selection, _: ?[]const []const u8) void {}
 
 /// A program's connection.
 const Client = struct {

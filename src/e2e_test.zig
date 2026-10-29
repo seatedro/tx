@@ -1803,6 +1803,139 @@ test "a session's programs copy and paste through the clipboard server, which a 
     }
 }
 
+/// The user's clipboard, in memory: one type at a time. The client's loop
+/// thread uses it, and the test thread looks.
+const TestClipboard = struct {
+    mutex: std.Io.Mutex = .init,
+    change: u64 = 1,
+    mime: []const u8 = "text/plain",
+    data: std.ArrayList(u8) = .empty,
+    /// What a program's copy wrote, as `MIME=data` lines.
+    written: std.ArrayList(u8) = .empty,
+
+    fn provider(t: *TestClipboard) client.clipboard.Provider {
+        return .{ .context = t, .change = change_, .types = types, .read = read, .write = write };
+    }
+
+    fn deinit(t: *TestClipboard) void {
+        t.data.deinit(gpa);
+        t.written.deinit(gpa);
+    }
+
+    fn of(context: ?*anyopaque) *TestClipboard {
+        return @ptrCast(@alignCast(context.?));
+    }
+
+    fn change_(context: ?*anyopaque) u64 {
+        const t = of(context);
+        t.mutex.lockUncancelable(testing.io);
+        defer t.mutex.unlock(testing.io);
+        return t.change;
+    }
+
+    fn types(context: ?*anyopaque, a: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
+        const t = of(context);
+        t.mutex.lockUncancelable(testing.io);
+        defer t.mutex.unlock(testing.io);
+        return std.mem.concat(a, u8, &.{ t.mime, "\x00" });
+    }
+
+    fn read(context: ?*anyopaque, a: std.mem.Allocator, mime: []const u8) std.mem.Allocator.Error!?[]u8 {
+        const t = of(context);
+        t.mutex.lockUncancelable(testing.io);
+        defer t.mutex.unlock(testing.io);
+        if (!std.mem.eql(u8, mime, t.mime)) return null;
+        return try a.dupe(u8, t.data.items);
+    }
+
+    fn write(context: ?*anyopaque, items: []const client.clipboard.Item) u64 {
+        const t = of(context);
+        t.mutex.lockUncancelable(testing.io);
+        defer t.mutex.unlock(testing.io);
+        for (items) |item| t.written.print(gpa, "{s}={s}\n", .{ item.mime, item.data }) catch {};
+        t.change += 1;
+        return t.change;
+    }
+
+    /// Waits for a program's copy to write a line.
+    fn waitWritten(t: *TestClipboard, line: []const u8) !void {
+        const deadline = nowMs() + timeout_ms;
+        while (true) {
+            {
+                t.mutex.lockUncancelable(testing.io);
+                defer t.mutex.unlock(testing.io);
+                if (std.mem.indexOf(u8, t.written.items, line) != null) return;
+            }
+            if (nowMs() > deadline) return error.Timeout;
+            testing.io.sleep(.fromMilliseconds(10), .awake) catch {};
+        }
+    }
+};
+
+test "programs read the client's clipboard just after a paste, and their copies reach it" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    transport.crypto.init(testing.io);
+    var environ = try testEnviron();
+    defer environ.deinit();
+    // The programs: wl-clipboard's.
+    const check = std.process.run(gpa, testing.io, .{ .argv = &.{ "wl-paste", "--version" }, .environ_map = &environ }) catch |err| switch (err) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    gpa.free(check.stdout);
+    gpa.free(check.stderr);
+
+    var login: Login = undefined;
+    try login.init(null);
+    defer login.deinit();
+    const keys = [_]auth.Key{login.key.public_key.toBytes()};
+    var options = try login.serverOptions(&environ, &.{
+        "/bin/sh", "-c",
+        \\printf 'ready\r\n'
+        \\read -r a
+        \\printf '[%s]\r\n' "$(wl-paste --no-newline --type text/plain)"
+        \\read -r b
+        \\printf '[%s]\r\n' "$(wl-paste --no-newline --type text/plain)"
+        \\wl-copy "from the host" </dev/null >/dev/null 2>&1
+        \\read -r c
+        \\printf '[%s]\r\n' "$(wl-paste --no-newline)"
+        \\read -r d
+    });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    options.wayland_socket = try std.fmt.bufPrint(&path_buf, "{s}/wayland-1", .{login.runtime_dir});
+    var st: ServerThread = undefined;
+    try st.init(options);
+    defer st.deinit();
+
+    var clip: TestClipboard = .{};
+    defer clip.deinit();
+    try clip.data.appendSlice(gpa, "from the laptop");
+
+    var pty: TestPty = try .open();
+    defer pty.close();
+    var ct: ClientThread = .{ .options = login.clientOptions(&st, &pty, &keys) };
+    ct.options.clipboard = clip.provider();
+    try ct.start();
+    try pty.readUntil("ready");
+
+    // Typing isn't a paste: the read gets nothing.
+    try pty.type_("x\r");
+    try pty.readUntil("[]");
+
+    // A bracketed paste is.
+    try pty.type_("\x1b[200~y\x1b[201~\r");
+    try pty.readUntil("[from the laptop]");
+
+    // The program's copy reaches the user's clipboard, and txd serves it
+    // to the next program itself.
+    try clip.waitWritten("text/plain=from the host\n");
+    try pty.type_("z\r");
+    try pty.readUntil("[from the host]");
+
+    try pty.type_("~.");
+    _ = try ct.join(&pty);
+}
+
 test "a client that sends more after the server's error is closed when its stream ends" {
     transport.crypto.init(testing.io);
     var environ: std.process.Environ.Map = .init(gpa);

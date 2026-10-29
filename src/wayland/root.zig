@@ -3,13 +3,15 @@
 //!
 //! `wire` reads and writes messages, `protocol` has the interfaces'
 //! opcodes, `server` is the protocol's state, and `socket` puts it on a
-//! Unix socket on the loop, on Linux.
+//! Unix socket on the loop, on Linux. `pipe` moves clipboard data through
+//! the pipes programs pass.
 const builtin = @import("builtin");
 
 pub const wire = @import("wire.zig");
 pub const protocol = @import("protocol.zig");
 pub const server = @import("server.zig");
 pub const socket = @import("socket.zig");
+pub const pipe = @import("pipe.zig");
 
 pub const Server = server.Server;
 pub const Connection = server.Connection;
@@ -21,5 +23,8 @@ test {
     _ = wire;
     _ = protocol;
     _ = server;
-    if (builtin.os.tag == .linux) _ = socket;
+    if (builtin.os.tag == .linux) {
+        _ = socket;
+        _ = pipe;
+    }
 }

@@ -29,6 +29,9 @@
 //! exit status has come and both output streams have ended. A lost
 //! connection ends it.
 //!
+//! With `Options.clipboard`, an attached client offers the user's clipboard
+//! to programs on the host, and takes their copies (see `clipboard`).
+//!
 //! The connection is given up once nothing has come from the server for
 //! `Options.silence_timeout_ns`. The server answers the keep-alives sent
 //! every `Options.keep_alive_ns`, so the timeout can be short. Suspended
@@ -48,6 +51,7 @@ const escape = @import("escape.zig");
 const report = @import("report.zig");
 const passphrase = @import("passphrase.zig");
 const connect = @import("connect.zig");
+const clipboard = @import("clipboard.zig");
 
 const Endpoint = transport.endpoint.Endpoint;
 const Conn = transport.endpoint.Conn;
@@ -116,6 +120,8 @@ pub const Options = struct {
     silence_timeout_ns: u64 = 6 * std.time.ns_per_s,
     /// How long a reconnect goes before a notice is drawn over the session.
     notice_delay_ms: u64 = 3000,
+    /// The user's clipboard, for programs on the host. Null offers none.
+    clipboard: ?clipboard.Provider = null,
 };
 
 pub const Command = union(enum) {
@@ -246,6 +252,13 @@ const max_sent_input = 64 << 10;
 /// silent.
 const silence_check_ms = 500;
 
+/// The longest `ClipboardCopy` header: its types and their lengths.
+const max_copy_header = 16 << 10;
+
+fn nowMs(io: Io) i64 {
+    return Io.Clock.awake.now(io).toMilliseconds();
+}
+
 /// Runs one session until it exits or detaches. The user's terminal is in
 /// raw mode from the login on.
 pub fn run(gpa: Allocator, io: Io, options: Options) !Outcome {
@@ -334,6 +347,10 @@ const Run = struct {
     silence_timer: xev.Timer,
     silence_c: xev.Completion = .{},
     silence_cancel_c: xev.Completion = .{},
+    clip: Clip = .{},
+    clip_timer: xev.Timer,
+    clip_c: xev.Completion = .{},
+    clip_cancel_c: xev.Completion = .{},
     /// The identity in `options.identities` being probed or signed with.
     key_index: usize = 0,
     /// Set while a signature is being made.
@@ -369,6 +386,25 @@ const Run = struct {
             held: usize = 0,
             /// The stream ended.
             fin: bool = false,
+        };
+    };
+
+    /// The user's clipboard, while attached.
+    const Clip = struct {
+        /// The change offered on this connection.
+        offered: ?u64 = null,
+        /// The change the client made, writing a program's copy. It isn't
+        /// offered: the program's copy is on the host already.
+        written: ?u64 = null,
+        /// When the user last pasted.
+        pasted_ms: ?i64 = null,
+        /// Copies arriving on the server's streams.
+        copies: std.ArrayList(*Copy) = .empty,
+
+        /// `ClipboardCopy`, then the data.
+        const Copy = struct {
+            stream: *Stream,
+            bytes: std.ArrayList(u8) = .empty,
         };
     };
 
@@ -439,7 +475,9 @@ const Run = struct {
             .retry_timer = try .init(),
             .notice_timer = try .init(),
             .silence_timer = try .init(),
+            .clip_timer = try .init(),
         };
+        errdefer r.clip_timer.deinit();
         errdefer r.wake.deinit();
         errdefer r.retry_timer.deinit();
         errdefer r.notice_timer.deinit();
@@ -540,6 +578,7 @@ const Run = struct {
         cancelTimer(r.loop, &r.retry_c, &r.retry_cancel_c);
         cancelTimer(r.loop, &r.notice_c, &r.notice_cancel_c);
         cancelTimer(r.loop, &r.silence_c, &r.silence_cancel_c);
+        cancelTimer(r.loop, &r.clip_c, &r.clip_cancel_c);
         // `onWake` disarms once the outcome is set. Cancelling the wait would
         // end it with an ECANCELED that libxev's poll doesn't map.
         if (r.wake_c.state() == .active) r.wake.notify() catch {};
@@ -550,6 +589,9 @@ const Run = struct {
         r.retry_timer.deinit();
         r.notice_timer.deinit();
         r.silence_timer.deinit();
+        r.clip_timer.deinit();
+        r.dropCopies();
+        r.clip.copies.deinit(r.gpa);
         r.wake.deinit();
         r.decoder.deinit();
         r.inbox.input.deinit(r.gpa);
@@ -858,7 +900,10 @@ const Run = struct {
 
     fn onData(ctx: ?*anyopaque, stream: *Stream, bytes: []const u8, fin: bool) void {
         const r = fromCtx(ctx);
-        if (stream != r.stream) return r.onExecData(stream, bytes, fin);
+        if (stream != r.stream) {
+            if (r.options.command == .attach) return r.onCopyData(stream, bytes, fin);
+            return r.onExecData(stream, bytes, fin);
+        }
 
         r.decoder.feed(bytes);
         while (r.outcome == null) {
@@ -955,6 +1000,12 @@ const Run = struct {
         for ([_]*?*Stream{ &r.exec.stdout.stream, &r.exec.stderr.stream, &r.exec.stdin }) |s| {
             if (s.* == stream) s.* = null;
         }
+        for (r.clip.copies.items, 0..) |copy, i| if (copy.stream == stream) {
+            _ = r.clip.copies.swapRemove(i);
+            copy.bytes.deinit(r.gpa);
+            r.gpa.destroy(copy);
+            break;
+        };
     }
 
     fn handle(r: *Run, message: proto.Message) void {
@@ -986,6 +1037,10 @@ const Run = struct {
                 }
                 if (r.held_input.items.len > 0) r.sendInput(r.held_input.items);
                 r.held_input.clearAndFree(r.gpa);
+
+                // A new connection is a new client to the server.
+                r.clip.offered = null;
+                r.offerClipboard();
             },
             .rebuild => |m| {
                 if (!r.terminal) return r.refuse("the server sent a rebuild before the login");
@@ -1016,6 +1071,7 @@ const Run = struct {
                 r.finish(.{ .listed = listed });
             },
             .killed => |m| r.finish(.{ .killed = m.session_id }),
+            .clipboard_request => |m| if (r.attached) r.answerClipboard(m),
             .exit => |m| {
                 const exit: Outcome.Exit = .{
                     .status = m.status,
@@ -1059,6 +1115,7 @@ const Run = struct {
             r.stream = null;
             r.attached = false;
             r.held = 0;
+            r.dropCopies();
         }
         if (r.outcome != null) return;
 
@@ -1148,6 +1205,121 @@ const Run = struct {
         r.writeTerminal(notice) catch return .disarm;
         r.reconnect.notice_shown = true;
         return .disarm;
+    }
+
+    /// Offers the clipboard if it changed since the last offer, and checks
+    /// again after `clipboard.poll_ms`.
+    fn offerClipboard(r: *Run) void {
+        const provider = r.options.clipboard orelse return;
+        if (!r.attached) return;
+        if (r.clip_c.state() != .active) r.clip_timer.run(r.loop, &r.clip_c, clipboard.poll_ms, Run, r, onClipTimer);
+
+        const change = provider.change(provider.context);
+        if (r.clip.offered == change) return;
+        r.clip.offered = change;
+        if (r.clip.written == change) return;
+
+        const mimes = provider.types(provider.context, r.gpa) catch return;
+        defer r.gpa.free(mimes);
+        r.send(.{ .clipboard_offer = .{ .change = change, .mimes = mimes } });
+    }
+
+    fn onClipTimer(r_: ?*Run, _: *xev.Loop, _: *xev.Completion, result: xev.Timer.RunError!void) xev.CallbackAction {
+        const r = r_.?;
+        result catch return .disarm;
+        if (r.outcome != null or !r.attached) return .disarm;
+        r.offerClipboard();
+        return .disarm;
+    }
+
+    /// A program on the host reads the clipboard. It gets the data only
+    /// just after the user pasted, and while the clipboard holds what was
+    /// offered.
+    fn answerClipboard(r: *Run, m: proto.ClipboardRequest) void {
+        const conn = r.conn orelse return;
+        const provider = r.options.clipboard orelse return;
+        const pasted = if (r.clip.pasted_ms) |t| nowMs(r.io) - t <= clipboard.paste_window_ms else false;
+        const current = provider.change(provider.context) == m.change;
+
+        const data: ?[]u8 = if (pasted and current) provider.read(provider.context, r.gpa, m.mime) catch null else null;
+        defer if (data) |d| r.gpa.free(d);
+        if (!pasted) log.info("refused a read of the clipboard: no paste in the last {d} s", .{clipboard.paste_window_ms / 1000});
+
+        // On a stream of its own, so that a large image doesn't hold up
+        // input.
+        const refused = data == null or data.?.len > clipboard.max_data_len;
+        const header: proto.Message = .{ .clipboard_data = .{ .id = m.id, .refused = refused } };
+        var buf: [64]u8 = undefined;
+        var w: Io.Writer = .fixed(&buf);
+        proto.encode(&w, header) catch unreachable;
+        const stream = conn.openStream(.uni) catch return;
+        stream.write(w.buffered()) catch return stream.reset(0);
+        if (!refused) stream.write(data.?) catch return stream.reset(0);
+        stream.finish();
+    }
+
+    /// A program's copy, on a stream the server opened. It replaces the
+    /// clipboard once whole.
+    fn onCopyData(r: *Run, stream: *Stream, bytes: []const u8, fin: bool) void {
+        stream.consume(bytes.len);
+        const copy = for (r.clip.copies.items) |copy| {
+            if (copy.stream == stream) break copy;
+        } else new: {
+            const copy = r.gpa.create(Clip.Copy) catch return stream.reset(0);
+            copy.* = .{ .stream = stream };
+            r.clip.copies.append(r.gpa, copy) catch {
+                r.gpa.destroy(copy);
+                return stream.reset(0);
+            };
+            break :new copy;
+        };
+
+        if (copy.bytes.items.len + bytes.len > clipboard.max_data_len + max_copy_header) return stream.reset(0);
+        copy.bytes.appendSlice(r.gpa, bytes) catch return stream.reset(0);
+        if (!fin) return;
+        defer r.endCopy(copy);
+        r.writeCopy(copy.bytes.items) catch log.warn("a copy from the host was malformed", .{});
+    }
+
+    /// `ClipboardCopy`, then each type's data, as `lens` gives.
+    fn writeCopy(r: *Run, bytes: []const u8) !void {
+        const provider = r.options.clipboard orelse return;
+        const m, const header_len = (try proto.frame.firstMessage(bytes, max_copy_header)) orelse return error.Truncated;
+        if (m != .clipboard_copy) return error.WrongType;
+        const copy = m.clipboard_copy;
+
+        var items: [16]clipboard.Item = undefined;
+        var count: usize = 0;
+        var data = bytes[header_len..];
+        var mimes = std.mem.splitScalar(u8, copy.mimes, 0);
+        var lens = copy.lens;
+        while (lens.len >= 8) : (lens = lens[8..]) {
+            const mime = mimes.next() orelse return error.WrongType;
+            const len = std.mem.readInt(u64, lens[0..8], .big);
+            if (len > data.len or count == items.len) return error.WrongType;
+            items[count] = .{ .mime = mime, .data = data[0..len] };
+            count += 1;
+            data = data[len..];
+        }
+        if (data.len != 0 or count == 0) return error.WrongType;
+
+        r.clip.written = provider.write(provider.context, items[0..count]);
+        r.clip.offered = r.clip.written;
+    }
+
+    fn endCopy(r: *Run, copy: *Clip.Copy) void {
+        const index = std.mem.indexOfScalar(*Clip.Copy, r.clip.copies.items, copy) orelse return;
+        _ = r.clip.copies.swapRemove(index);
+        copy.bytes.deinit(r.gpa);
+        r.gpa.destroy(copy);
+    }
+
+    fn dropCopies(r: *Run) void {
+        for (r.clip.copies.items) |copy| {
+            copy.bytes.deinit(r.gpa);
+            r.gpa.destroy(copy);
+        }
+        r.clip.copies.clearRetainingCapacity();
     }
 
     /// Sends input, and keeps the last of it for `resendInput`.
@@ -1333,6 +1505,8 @@ const Run = struct {
     /// Runs input through the escape handler and sends it, or holds it
     /// until the attach completes.
     fn forwardInput(r: *Run, input: []const u8) void {
+        if (clipboard.hasPaste(input)) r.clip.pasted_ms = nowMs(r.io);
+
         // `Escape.feed` can add one byte to its input.
         var out: [4097]u8 = undefined;
         var rest = input;
