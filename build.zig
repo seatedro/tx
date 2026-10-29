@@ -85,16 +85,24 @@ pub fn build(b: *std.Build) void {
     auth_tests.root_module.addImport("fuzz", fuzz);
     addTestRuns(b, auth_tests, test_step, test_network_step);
 
+    const wayland_tests = b.addTest(.{
+        .name = "wayland-test",
+        .root_module = waylandModule(b, target, optimize),
+    });
+    wayland_tests.root_module.addImport("fuzz", fuzz);
+    addTestRuns(b, wayland_tests, test_step, test_network_step);
+
     // The tests with fuzz tests that `--fuzz` can build. Under it, C code
     // doesn't link and ghostty-vt's build makes a Unicode table that
     // doesn't compile. So the SPA guard's tests build alone, and the
     // end-to-end tests are left out. They build with LLVM, which adds the
     // fuzzer's instrumentation; the x86_64 backend Debug builds use
     // doesn't.
-    const fuzz_step = b.step("fuzz", "Run the fuzz tests of what a client reaches before login; with --fuzz, fuzz them");
+    const fuzz_step = b.step("fuzz", "Run the fuzz tests of what a client reaches before login and of the Wayland wire format; with --fuzz, fuzz them");
     for ([_]struct { []const u8, *std.Build.Module }{
         .{ "proto-fuzz", protoModule(b, target, optimize) },
         .{ "auth-fuzz", authModule(b, target, optimize) },
+        .{ "wayland-fuzz", waylandModule(b, target, optimize) },
         .{ "spa-fuzz", b.createModule(.{
             .root_source_file = b.path("src/transport/spa.zig"),
             .target = target,
@@ -421,6 +429,18 @@ fn authModule(
 ) *std.Build.Module {
     return b.createModule(.{
         .root_source_file = b.path("src/auth/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+}
+
+fn waylandModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Module {
+    return b.createModule(.{
+        .root_source_file = b.path("src/wayland/root.zig"),
         .target = target,
         .optimize = optimize,
     });
