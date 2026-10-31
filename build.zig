@@ -3,7 +3,7 @@ const ngtcp2_build = @import("src/build/ngtcp2.zig");
 const picotls_build = @import("src/build/picotls.zig");
 
 /// The version in build.zig.zon. Builds other than `zig build release`
-/// add `-dev`.
+/// add `-dev`. A nightly release gives its own with `-Dversion`.
 const version = @import("build.zig.zon").version;
 
 /// The platforms `zig build release` builds for. `os` and `arch` are the
@@ -196,7 +196,8 @@ pub fn build(b: *std.Build) void {
     // and the README in a directory of the same name. Each tx carries the
     // SHA-256 of every txd.
     const release_step = b.step("release", "Build tx and txd for every release platform");
-    const release_info = buildInfo(b, version);
+    const release_version = b.option([]const u8, "version", "The version of a release build, such as 0.0.0-nightly.20261031") orelse version;
+    const release_info = buildInfo(b, release_version);
     const release_builds = b.addRunArtifact(txd_builds_tool);
     const release_builds_module = b.createModule(.{ .root_source_file = release_builds.addOutputFileArg("txd_builds.zig") });
     const tarball_tool = b.addExecutable(.{
@@ -221,7 +222,7 @@ pub fn build(b: *std.Build) void {
         const tx_exe = b.addExecutable(.{ .name = "tx", .root_module = txModule(b, rt_target, .ReleaseSafe, rt_app, release_info, release_builds_module) });
         tx_exe.root_module.strip = true;
 
-        const name = b.fmt("tx-{s}-{s}-{s}", .{ version, rt.os, rt.arch });
+        const name = b.fmt("tx-{s}-{s}-{s}", .{ release_version, rt.os, rt.arch });
         const tarball = b.addRunArtifact(tarball_tool);
         const out = tarball.addOutputFileArg(b.fmt("{s}.tar.gz", .{name}));
         tarball.addArg(name);

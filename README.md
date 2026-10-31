@@ -7,6 +7,19 @@ reattached from anywhere.
 
 tx is early and changes often. Don't rely on it yet.
 
+## Install
+
+Each night that main changes, it is published as a release,
+`0.0.0-nightly.YYYYMMDD`. To install tx and txd from the latest in
+`~/.local/bin`, on Linux or macOS:
+
+    curl -fsSL https://github.com/seatedro/tx/releases/latest/download/install.sh | sh
+
+On a machine that tx connects to, add `--txd`, which keeps txd running as a
+service for your user. Run it again to upgrade; sessions keep running.
+
+    curl -fsSL https://github.com/seatedro/tx/releases/latest/download/install.sh | sh -s -- --txd
+
 ## Use
 
     tx [USER@]HOST          # attach the detached session, or start one
