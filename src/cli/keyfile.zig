@@ -1,5 +1,5 @@
-//! The server's secrets, each 32 bytes in a file readable only by its
-//! owner: the Ed25519 identity, stored as its seed, and the SPA key.
+//! The server's Ed25519 identity, stored as its 32-byte seed in a file
+//! readable only by its owner.
 const std = @import("std");
 const Io = std.Io;
 const Ed25519 = std.crypto.sign.Ed25519;
@@ -25,20 +25,6 @@ pub fn loadOrCreate(io: Io, path: []const u8) !Ed25519.KeyPair {
         },
         else => |e| return e,
     };
-}
-
-/// The random secret at `path`, created with its directory if the file
-/// doesn't exist.
-pub fn loadOrCreateSecret(io: Io, path: []const u8) ![32]u8 {
-    var secret: [32]u8 = undefined;
-    read(io, path, &secret) catch |err| switch (err) {
-        error.FileNotFound => {
-            try io.randomSecure(&secret);
-            try create(io, path, &secret);
-        },
-        else => |e| return e,
-    };
-    return secret;
 }
 
 fn read(io: Io, path: []const u8, out: *[32]u8) !void {

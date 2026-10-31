@@ -144,21 +144,8 @@ pub fn build(b: *std.Build) void {
     });
     addTestRuns(b, client_tests, test_step, test_network_step);
 
-    // Writes the list of txd builds that tx carries.
-    const txd_builds_tool = b.addExecutable(.{
-        .name = "txd_builds",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/build/txd_builds.zig"),
-            .target = b.graph.host,
-        }),
-    });
-
-    // A development build lists no txd builds.
     const dev_info = buildInfo(b, version ++ "-dev");
-    const dev_builds = b.addRunArtifact(txd_builds_tool);
-    const dev_builds_module = b.createModule(.{ .root_source_file = dev_builds.addOutputFileArg("txd_builds.zig") });
-
-    const tx = txModule(b, target, optimize, app, dev_info, dev_builds_module);
+    const tx = txModule(b, target, optimize, app, dev_info);
     const tx_bin = b.addExecutable(.{ .name = "tx", .root_module = tx });
     b.installArtifact(tx_bin);
     addTestRuns(b, b.addTest(.{ .name = "cli-test", .root_module = tx }), test_step, test_network_step);
@@ -193,13 +180,10 @@ pub fn build(b: *std.Build) void {
 
     // `zig build release` makes `tx-VERSION-OS-ARCH.tar.gz` in
     // zig-out/release for each release platform, with tx, txd, the license
-    // and the README in a directory of the same name. Each tx carries the
-    // SHA-256 of every txd.
+    // and the README in a directory of the same name.
     const release_step = b.step("release", "Build tx and txd for every release platform");
     const release_version = b.option([]const u8, "version", "The version of a release build, such as 0.0.0-nightly.20261031") orelse version;
     const release_info = buildInfo(b, release_version);
-    const release_builds = b.addRunArtifact(txd_builds_tool);
-    const release_builds_module = b.createModule(.{ .root_source_file = release_builds.addOutputFileArg("txd_builds.zig") });
     const tarball_tool = b.addExecutable(.{
         .name = "tarball",
         .root_module = b.createModule(.{
@@ -207,19 +191,12 @@ pub fn build(b: *std.Build) void {
             .target = b.graph.host,
         }),
     });
-    var release_apps: [release_targets.len]AppModules = undefined;
-    var txds: [release_targets.len]*std.Build.Step.Compile = undefined;
-    for (release_targets, &release_apps, &txds) |rt, *rt_app, *txd_exe| {
+    for (release_targets) |rt| {
         const rt_target = b.resolveTargetQuery(rt.query);
-        rt_app.* = appModules(b, rt_target, .ReleaseSafe, libraries(b, rt_target, .ReleaseSafe));
-        txd_exe.* = b.addExecutable(.{ .name = "txd", .root_module = txdModule(b, rt_target, .ReleaseSafe, rt_app.*, release_info) });
-        txd_exe.*.root_module.strip = true;
-        release_builds.addArgs(&.{ rt.os, rt.arch });
-        release_builds.addFileArg(txd_exe.*.getEmittedBin());
-    }
-    for (release_targets, release_apps, txds) |rt, rt_app, txd_exe| {
-        const rt_target = b.resolveTargetQuery(rt.query);
-        const tx_exe = b.addExecutable(.{ .name = "tx", .root_module = txModule(b, rt_target, .ReleaseSafe, rt_app, release_info, release_builds_module) });
+        const rt_app = appModules(b, rt_target, .ReleaseSafe, libraries(b, rt_target, .ReleaseSafe));
+        const txd_exe = b.addExecutable(.{ .name = "txd", .root_module = txdModule(b, rt_target, .ReleaseSafe, rt_app, release_info) });
+        txd_exe.root_module.strip = true;
+        const tx_exe = b.addExecutable(.{ .name = "tx", .root_module = txModule(b, rt_target, .ReleaseSafe, rt_app, release_info) });
         tx_exe.root_module.strip = true;
 
         const name = b.fmt("tx-{s}-{s}-{s}", .{ release_version, rt.os, rt.arch });
@@ -338,7 +315,6 @@ fn txModule(
     optimize: std.builtin.OptimizeMode,
     app: AppModules,
     info: *std.Build.Module,
-    txd_builds: *std.Build.Module,
 ) *std.Build.Module {
     const mod = b.createModule(.{
         .root_source_file = b.path("src/cli/tx.zig"),
@@ -351,7 +327,6 @@ fn txModule(
     mod.addImport("auth", app.auth);
     mod.addImport("proto", app.proto);
     mod.addImport("build_options", info);
-    mod.addImport("txd_builds", txd_builds);
     return mod;
 }
 

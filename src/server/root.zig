@@ -6,10 +6,6 @@
 //! server's own user only. Once logged in, the client sends `Attach`. The
 //! server answers with `HelloReply`, `AuthProbeReply` and `AuthOk`.
 //!
-//! With `Options.spa_key`, the server answers only clients that mark their
-//! first packets with the key, and sends nothing to anyone else (see
-//! `transport.spa`).
-//!
 //! Each session runs in a process of its own (see `session.process`),
 //! listening on a socket in the runtime directory (see `runtime_dir`). An
 //! attach starts one, or connects to one, and hands it a `Connect`
@@ -32,7 +28,9 @@
 //! (`Kill`), or run a command (`Exec`, see `exec`).
 //!
 //! Listening on a wildcard address binds each address it covers, and
-//! follows addresses as they come and go (see `addresses`).
+//! follows addresses as they come and go (see `addresses`). With
+//! `Options.scope` set to `tailnet`, those are only Tailscale's and
+//! loopback.
 //!
 //! On Linux, with `Options.wayland_socket`, the server also runs the
 //! clipboard server there (see `wayland`), and sessions find it through
@@ -52,7 +50,7 @@ const session = @import("session");
 const term = @import("term");
 const auth = @import("auth");
 const wayland = @import("wayland");
-const addresses = @import("addresses.zig");
+pub const addresses = @import("addresses.zig");
 pub const runtime_dir = @import("runtime_dir.zig");
 pub const exec = @import("exec.zig");
 pub const terminfo = @import("terminfo.zig");
@@ -69,6 +67,8 @@ const log = std.log.scoped(.server);
 
 pub const Options = struct {
     listen: IpAddress,
+    /// The addresses a wildcard `listen` covers.
+    scope: addresses.Scope = .all,
     identity: Ed25519.KeyPair,
     /// The account clients log in as. No other user name is accepted.
     user: []const u8,
@@ -99,9 +99,6 @@ pub const Options = struct {
     idle_timeout_ns: u64 = 30 * std.time.ns_per_s,
     /// Limits on connections that haven't logged in.
     pending: transport.pending.Limits = .{},
-    /// Only clients with this key get an answer. Null answers any client.
-    /// See `transport.spa`.
-    spa_key: ?transport.spa.Key = null,
     /// Where the clipboard server listens, on Linux. Null runs none.
     wayland_socket: ?[]const u8 = null,
 };
@@ -161,7 +158,6 @@ pub const Server = struct {
     tls: transport.quic.Server,
     /// Shared by the endpoints.
     pending: transport.pending.Pending,
-    guard: ?transport.spa.Guard,
     /// One per address listened on. They don't move.
     endpoints: std.ArrayList(*Endpoint) = .empty,
     /// Endpoints whose address went away, freed once stopped.
@@ -200,7 +196,6 @@ pub const Server = struct {
             .options = options,
             .tls = try .init(options.identity),
             .pending = .init(gpa, options.pending),
-            .guard = if (options.spa_key) |key| .init(gpa, key) else null,
         };
         errdefer self.deinit();
 
@@ -268,7 +263,6 @@ pub const Server = struct {
             r.timer.deinit();
         }
         self.pending.deinit();
-        if (self.guard) |*g| g.deinit();
         self.tls.deinit();
         self.* = undefined;
     }
@@ -282,7 +276,6 @@ pub const Server = struct {
             .role = .{ .server = &self.tls },
             .idle_timeout_ns = self.options.idle_timeout_ns,
             .pending = &self.pending,
-            .guard = if (self.guard) |*g| g else null,
             .handler = .{
                 .ctx = self,
                 .connected = onConnected,
@@ -309,7 +302,7 @@ pub const Server = struct {
     /// Returns how many addresses failed to bind with `AddressInUse`.
     fn updateAddresses(self: *Server, when: enum { initial, rescan }) !usize {
         const r = &self.rescan.?;
-        const found = try addresses.interfaces(self.gpa, r.wildcard);
+        const found = try addresses.interfaces(self.gpa, r.wildcard, self.options.scope);
         defer self.gpa.free(found);
 
         // Bound endpoints whose address is gone. Their connections can't
