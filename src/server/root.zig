@@ -70,7 +70,8 @@ pub const Options = struct {
     /// The addresses a wildcard `listen` covers.
     scope: addresses.Scope = .all,
     identity: Ed25519.KeyPair,
-    /// The account clients log in as. No other user name is accepted.
+    /// The account clients log in as. A login names it, or names no
+    /// account; no other name is accepted.
     user: []const u8,
     /// `authorized_keys` files. The first one that exists is read, at each
     /// login attempt.
@@ -491,7 +492,7 @@ pub const Server = struct {
 
     /// Whether `key_blob` may log in as `user`.
     fn accepts(self: *Server, user: []const u8, key_blob: []const u8) bool {
-        if (!std.mem.eql(u8, user, self.options.user)) return false;
+        if (user.len > 0 and !std.mem.eql(u8, user, self.options.user)) return false;
 
         // Ed25519 and RSA keys.
         const key = auth.ssh.PublicKey.parse(key_blob) catch return false;
@@ -982,7 +983,7 @@ const Client = struct {
             return client.fail(.auth, "login refused");
         };
 
-        log.info("{f} logged in as {s} with key {s}", .{ client.conn.remote, m.user, fingerprint.slice() });
+        log.info("{f} logged in as {s} with key {s}", .{ client.conn.remote, server.options.user, fingerprint.slice() });
         client.completeLogin();
         client.send(.{ .auth_ok = .{} });
     }

@@ -65,8 +65,8 @@ pub const Options = struct {
     servers: []const IpAddress,
     /// The server keys the client accepts.
     host_keys: []const [32]u8,
-    /// The account to log in as.
-    user: []const u8,
+    /// The account to log in as. Empty is the account the server serves.
+    user: []const u8 = "",
     /// The keys to log in with, probed in order. At least one.
     identities: []const Identity,
     /// The SSH agent's socket, for identities from the agent.
@@ -698,6 +698,7 @@ const Run = struct {
         if (r.key_index == r.options.identities.len) {
             // `Name` truncates a message longer than it holds.
             var buf: [512]u8 = undefined;
+            if (r.options.user.len == 0) return r.refuse("the server accepted none of the keys");
             return r.refuse(std.fmt.bufPrint(&buf, "the server accepted none of the keys for {s}", .{r.options.user}) catch unreachable);
         }
         r.probe();

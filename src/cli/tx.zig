@@ -7,7 +7,9 @@
 //! tx takes ssh's options, as ssh reads them, so that tools that run ssh
 //! can run tx (see `args.zig`). `-p` is txd's port. It connects to the
 //! host, and logs in as the user, that ssh's config gives the destination
-//! (see `ssh_config.zig`). tx never runs ssh.
+//! (see `ssh_config.zig`). With neither `-l` nor a user in the
+//! destination or ssh's config, the login names no user, and txd logs in
+//! to the account it runs as. tx never runs ssh.
 //!
 //! With none of `--attach`, `--new`, `--list` and `--kill`, tx attaches to
 //! the host's detached session if it has exactly one, and starts a session
@@ -136,8 +138,10 @@ pub fn main(init: std.process.Init) !u8 {
     const tx_known_hosts = try paths.config(gpa, environ, "known_hosts");
     defer gpa.free(tx_known_hosts);
 
-    const login_user = user orelse paths.userName(environ) orelse return fail("can't tell the local user name; use -l", .{});
-    if (login_user.len == 0 or login_user.len > auth.login.max_user_len) return fail("invalid user name", .{});
+    // With no user given, the login names none, and txd logs in to the
+    // account it runs as.
+    const login_user = user orelse "";
+    if (login_user.len > auth.login.max_user_len) return fail("invalid user name", .{});
 
     var address_buf: [max_addresses]IpAddress = undefined;
     const addresses = resolve(io, host, port, args.family, &address_buf) catch |err| return fail("can't resolve {s}: {t}", .{ host, err });

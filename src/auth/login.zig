@@ -4,7 +4,8 @@
 //!
 //!     string  exporter    the connection's TLS exporter value
 //!     string  host_key    the server's public key blob
-//!     string  user        the account to log in as
+//!     string  user        the account to log in as, or empty for the
+//!                         account the server serves
 //!     string  alpn        the connection's ALPN protocol ID
 //!     uint32  revision    the protocol revision
 //!

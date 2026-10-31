@@ -337,6 +337,7 @@ pub const Error = struct {
 /// Asks whether the server would accept `key` for `user`. The client probes
 /// before it signs: a signature can cost the user a touch or a prompt.
 pub const AuthProbe = struct {
+    /// Empty for the account the server serves.
     user: []const u8,
     /// An SSH public key blob.
     key: []const u8,
@@ -381,6 +382,7 @@ pub const AuthProbeReply = struct {
 /// Logs in as `user` with a signature over the connection's login
 /// transcript (see `auth.login`).
 pub const AuthSignature = struct {
+    /// Empty for the account the server serves.
     user: []const u8,
     /// An SSH public key blob.
     key: []const u8,
