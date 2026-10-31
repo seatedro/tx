@@ -1,0 +1,61 @@
+name: Nightly
+
+# Publishes main as the GitHub release 0.0.0-nightly.YYYYMMDD (the version
+# in build.zig.zon, then the date), each night that main has changed and
+# passed CI. install.sh installs the latest release.
+
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The tags, to tell whether main moved since the last release.
+          fetch-depth: 0
+      - id: plan
+        run: |
+          last=$(gh release list --limit 1 --json tagName --jq '.[0].tagName // ""')
+          if [ -n "$last" ] && [ "$(git rev-list -n 1 "$last")" = "$GITHUB_SHA" ]; then
+            echo "$last is main already"
+            exit 0
+          fi
+          passed=$(gh run list --workflow ci.yml --commit "$GITHUB_SHA" --json conclusion --jq 'map(select(.conclusion == "success")) | length')
+          if [ "$passed" = 0 ]; then
+            echo "CI hasn't passed on $GITHUB_SHA"
+            exit 0
+          fi
+          base=$(sed -n 's/^ *\.version = "\(.*\)",$/\1/p' build.zig.zon)
+          echo "version=$base-nightly.$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+      - if: steps.plan.outputs.version
+        uses: mlugg/setup-zig@v2
+      # The packages build.zig.zon names, which zig fetches into zig-pkg.
+      - if: steps.plan.outputs.version
+        uses: actions/cache@v4
+        with:
+          path: zig-pkg
+          key: zig-pkg-${{ github.job }}-${{ runner.os }}-${{ hashFiles('build.zig.zon') }}
+      - if: steps.plan.outputs.version
+        run: zig build release -Dversion=${{ steps.plan.outputs.version }}
+      - if: steps.plan.outputs.version
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+        run: |
+          cd zig-out/release
+          sha256sum tx-*.tar.gz > SHA256SUMS
+          cp ../../install.sh .
+          # A second run on one day replaces that day's release.
+          gh release delete "v$VERSION" --cleanup-tag --yes 2>/dev/null || true
+          gh release create "v$VERSION" --target "$GITHUB_SHA" --latest \
+            --title "tx $VERSION" --notes "Nightly build of $GITHUB_SHA." \
+            tx-*.tar.gz SHA256SUMS install.sh
