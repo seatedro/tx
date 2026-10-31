@@ -994,6 +994,25 @@ test "tx trusts the key ssh's known_hosts lists for a host new to it, and record
     try testing.expectEqualStrings(line, recorded);
 }
 
+test "tx reaches the host, as the user, that the config given with -F names" {
+    var es: ExecServer = undefined;
+    try es.init();
+    defer es.deinit();
+    var t: Tools = undefined;
+    try t.init(&es);
+    defer t.deinit();
+
+    // An alias only this config knows. tx reads it without ssh.
+    try t.tmp.dir.writeFile(testing.io, .{
+        .sub_path = "ssh_config",
+        .data = "Host txtest\n  HostName 127.0.0.1\n  User " ++ test_user ++ "\n",
+    });
+    var config_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var port_buf: [8]u8 = undefined;
+    const port = try std.fmt.bufPrint(&port_buf, "{d}", .{t.port});
+    try t.run(&.{ t.environ.get("GIT_SSH_COMMAND").?, "-F", try t.path(&config_buf, "ssh_config"), "-p", port, "txtest", "true" });
+}
+
 test "a new session finds the terminfo entry its client sent, or a common one" {
     var es: ExecServer = undefined;
     try es.init();

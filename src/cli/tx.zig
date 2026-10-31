@@ -5,11 +5,11 @@
 //!        tx --version
 //!
 //! tx takes ssh's options, as ssh reads them, so that tools that run ssh
-//! can run tx (see `args.zig`). `-p` is txd's port. It connects to the
-//! host, and logs in as the user, that ssh's config gives the destination
-//! (see `ssh_config.zig`). With neither `-l` nor a user in the
-//! destination or ssh's config, the login names no user, and txd logs in
-//! to the account it runs as. tx never runs ssh.
+//! can run tx (see `args.zig`). `-p` is txd's port. The host, user, port,
+//! key files and agent for the destination come from tx's config and ssh's,
+//! which tx reads as ssh does (see `ssh_config.zig`). Options on the command
+//! line win over both. With no user from either, the login names none, and
+//! txd logs in to the account it runs as. tx never runs ssh.
 //!
 //! With none of `--attach`, `--new`, `--list` and `--kill`, tx attaches to
 //! the host's detached session if it has exactly one, and starts a session
@@ -41,8 +41,10 @@
 //! and the terminfo entry for its `TERM`, from `infocmp -x`, which txd
 //! compiles for the session on a host that may lack it.
 //!
-//! The login uses the SSH agent's Ed25519 and RSA keys, then
-//! `~/.ssh/id_ed25519`.
+//! The login uses the SSH agent's Ed25519 and RSA keys, then the key
+//! files: `-i`'s and `IdentityFile`'s, or else `~/.ssh/id_ed25519`. With
+//! `IdentitiesOnly`, the agent's keys are only the ones the key files name.
+//! `IdentityAgent` replaces `SSH_AUTH_SOCK`.
 //!
 //! Exits with the program's exit status, or 255 for tx's own failures, as
 //! ssh does.
@@ -71,8 +73,9 @@ const usage_text =
     \\       tx --version
     \\
     \\The ssh options that take effect: -p PORT (txd's), -l USER, -t, -T, -4, -6,
-    \\-i KEY_FILE, -e CHAR, -n, -G, -V and -o with Port, User, IdentityFile and
-    \\RequestTTY. DESTINATION is [USER@]HOST or ssh://[USER@]HOST[:PORT].
+    \\-i KEY_FILE, -F CONFIG_FILE, -e CHAR, -n, -G, -V and -o with Port, User,
+    \\IdentityFile and RequestTTY. DESTINATION is [USER@]HOST or
+    \\ssh://[USER@]HOST[:PORT].
 ;
 
 /// How long tx waits for an answer from the server.
@@ -81,14 +84,14 @@ const connect_timeout_ns = 15 * std.time.ns_per_s;
 /// What sets up txd on a host.
 const install_command = "curl -fsSL https://github.com/seatedro/tx/releases/latest/download/install.sh | sh -s -- --txd";
 
-/// Key files tried after the agent's keys, without `-i`.
+/// Key files tried after the agent's keys, without `-i` or `IdentityFile`.
 const default_key_files = [_][]const u8{"~/.ssh/id_ed25519"};
 
 pub fn main(init: std.process.Init) !u8 {
     // First, so every thread inherits the mask: name lookups can start
     // threads, and a terminating signal must reach the session's signal
     // thread, which restores the terminal.
-    _ = client.tty.blockSignals();
+    const signal_mask = client.tty.blockSignals();
 
     const gpa = init.gpa;
     const io = init.io;
@@ -107,13 +110,30 @@ pub fn main(init: std.process.Init) !u8 {
     }
     for (args.ignored) |letter| std.debug.print("tx: ignoring -{c}, which tx doesn't support yet\n", .{letter});
 
-    // The host and user from ssh's config, as `tx pulsar` should reach
-    // what `ssh pulsar` does. A user given to tx wins, as it does in ssh.
-    const configured = ssh_config.resolve(arena, io, "ssh", &.{}, args.user, args.host);
-    const host = configured.hostname orelse args.host;
-    const user = args.user orelse configured.user;
-    const port = args.port orelse default_port;
-    if (args.print_config) return printConfig(io, environ, user, host, args.port);
+    // The destination's settings from tx's config and ssh's, as `tx pulsar`
+    // should reach what `ssh pulsar` does.
+    const configured = switch (try ssh_config.resolve(arena, io, .{
+        .host = args.host,
+        .user = args.user,
+        .port = args.port,
+        .default_port = default_port,
+        .identity_files = args.key_files,
+        .default_identity_files = &default_key_files,
+        .ssh_config = args.ssh_config,
+        .environ = environ,
+        .signal_mask = signal_mask,
+    })) {
+        .ok => |resolved| resolved,
+        .bad => |problem| return fail("{s}", .{problem}),
+    };
+    for (configured.warnings) |warning| std.debug.print("tx: {s}\n", .{warning});
+    const host = configured.hostname;
+    const user = configured.user;
+    const port = configured.port;
+    if (args.print_config) return printConfig(io, environ, configured);
+    if (configured.proxy_jump) |jump| {
+        std.debug.print("tx: ignoring ProxyJump {s}, which tx doesn't support yet; connecting directly\n", .{jump});
+    }
 
     // What to do once logged in. A command runs in a session of its own
     // with a terminal.
@@ -149,13 +169,12 @@ pub fn main(init: std.process.Init) !u8 {
     const addresses = resolve(io, host, port, args.family, &address_buf) catch |err| return fail("can't resolve {s}: {t}", .{ host, err });
 
     // The keys, before the network: without one there's no login.
-    // An empty `SSH_AUTH_SOCK` means no agent, as in ssh.
-    const agent_path = if (environ.get("SSH_AUTH_SOCK")) |path| if (path.len > 0) path else null else null;
-    const key_files = if (args.key_files.len > 0) args.key_files else &default_key_files;
-    var identities = try findIdentities(gpa, io, environ, agent_path, key_files);
+    const agent_path = agentPath(environ, configured.identity_agent);
+    var identities = try findIdentities(gpa, io, agent_path, configured.identity_files, configured.identities_only);
     defer identities.deinit(gpa);
     if (identities.list.items.len == 0) {
-        return fail("no keys to log in with: the SSH agent has no Ed25519 or RSA keys, and there is no ~/.ssh/id_ed25519", .{});
+        if (configured.identities_only) return fail("no keys to log in with: of the SSH agent's keys, IdentitiesOnly allows only the ones the key files name, and no key file holds an Ed25519 key", .{});
+        return fail("no keys to log in with: the SSH agent has no Ed25519 or RSA keys, and no key file holds an Ed25519 key", .{});
     }
 
     // The keys known_hosts lists for the host, or the one it presents
@@ -405,11 +424,44 @@ fn inFamily(address: IpAddress, family: ?args_pkg.Family) bool {
     };
 }
 
-/// The agent's Ed25519 keys in its order, then the key files that hold
-/// other keys. A key file's public key reads without its passphrase.
-fn findIdentities(gpa: Allocator, io: Io, environ: *const std.process.Environ.Map, agent_path: ?[]const u8, key_files: []const []const u8) !Identities {
+/// The agent's socket: `IdentityAgent`'s, or else `SSH_AUTH_SOCK`'s. An
+/// empty `SSH_AUTH_SOCK` means no agent, as in ssh.
+fn agentPath(environ: *const std.process.Environ.Map, configured: ?ssh_config.IdentityAgent) ?[]const u8 {
+    if (configured) |agent| return switch (agent) {
+        .none => null,
+        .path => |path| path,
+    };
+    const path = environ.get("SSH_AUTH_SOCK") orelse return null;
+    return if (path.len > 0) path else null;
+}
+
+test agentPath {
+    var environ: std.process.Environ.Map = .init(std.testing.allocator);
+    defer environ.deinit();
+    try std.testing.expectEqual(null, agentPath(&environ, null));
+    try environ.put("SSH_AUTH_SOCK", "");
+    try std.testing.expectEqual(null, agentPath(&environ, null));
+    try environ.put("SSH_AUTH_SOCK", "/env.sock");
+    try std.testing.expectEqualStrings("/env.sock", agentPath(&environ, null).?);
+
+    // IdentityAgent replaces it.
+    try std.testing.expectEqualStrings("/config.sock", agentPath(&environ, .{ .path = "/config.sock" }).?);
+    try std.testing.expectEqual(null, agentPath(&environ, .none));
+}
+
+/// The agent's Ed25519 and RSA keys in its order, then the key files that
+/// hold other keys. A key file's public key reads without its passphrase.
+/// With `identities_only`, the agent's keys are only the ones the key files
+/// name (see `namedKey`).
+fn findIdentities(gpa: Allocator, io: Io, agent_path: ?[]const u8, key_files: []const []const u8, identities_only: bool) !Identities {
     var ids: Identities = .{};
     errdefer ids.deinit(gpa);
+
+    var named: std.ArrayList(auth.ssh.PublicKey) = .empty;
+    defer named.deinit(gpa);
+    if (identities_only) for (key_files) |file| {
+        if (namedKey(gpa, io, file)) |key| try named.append(gpa, key);
+    };
 
     // An agent that can't be reached leaves the key files.
     if (agent_path) |path| agent: {
@@ -426,25 +478,24 @@ fn findIdentities(gpa: Allocator, io: Io, environ: *const std.process.Environ.Ma
         for (agent_ids.blobs) |blob| {
             // Types tx doesn't verify, such as ECDSA, are left out.
             const key = auth.ssh.PublicKey.parse(blob) catch continue;
+            if (identities_only and !containsKey(named.items, &key)) continue;
             try ids.list.append(gpa, .{ .key = key, .source = .agent });
         }
     }
 
     for (key_files) |file| {
-        const path = keyFilePath(gpa, environ, file) catch continue;
-        const key = keyFilePublicKey(gpa, io, path) catch |err| {
-            if (err != error.FileNotFound) std.debug.print("tx: skipping {s}: {t}\n", .{ path, err });
-            gpa.free(path);
+        const key = keyFilePublicKey(gpa, io, file) catch |err| {
+            // A public key file can name a key the agent holds.
+            const in_agent = if (publicKeyOf(gpa, io, file)) |public_key| ids.has(&public_key) else |_| false;
+            if (err != error.FileNotFound and !in_agent) std.debug.print("tx: skipping {s}: {t}\n", .{ file, err });
             continue;
         };
 
         // The agent may hold the same key.
-        if (ids.has(&key)) {
-            gpa.free(path);
-            continue;
-        }
+        if (ids.has(&key)) continue;
 
         // `ids.paths` owns the path from here.
+        const path = try gpa.dupe(u8, file);
         ids.list.ensureUnusedCapacity(gpa, 1) catch |err| {
             gpa.free(path);
             return err;
@@ -458,24 +509,124 @@ fn findIdentities(gpa: Allocator, io: Io, environ: *const std.process.Environ.Ma
     return ids;
 }
 
-/// `~/` is the home directory, as ssh reads it in `-i` and `IdentityFile`.
-fn keyFilePath(gpa: Allocator, environ: *const std.process.Environ.Map, file: []const u8) ![]u8 {
-    if (std.mem.startsWith(u8, file, "~/")) return paths.home(gpa, environ, file[2..]);
-    return gpa.dupe(u8, file);
+test "IdentitiesOnly limits the agent's keys to the ones the key files name" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const keys = [_]std.crypto.sign.Ed25519.KeyPair{ .generate(io), .generate(io) };
+    const agent_path = try std.fs.path.join(a, &.{ dir, "agent.sock" });
+    var agent: auth.agent.TestAgent = undefined;
+    try agent.start(io, agent_path, &keys);
+    defer agent.stop(agent_path);
+
+    // The second key's public key file, as an agent that holds the private
+    // key leaves it.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "second.pub",
+        .data = try std.fmt.allocPrint(a, "ssh-ed25519 {s} second\n", .{auth.ssh.KeyText.init(keys[1].public_key.toBytes()).slice()}),
+    });
+    const beside = [_][]const u8{try std.fs.path.join(a, &.{ dir, "second" })};
+    const public = [_][]const u8{try std.fs.path.join(a, &.{ dir, "second.pub" })};
+
+    var all = try findIdentities(gpa, io, agent_path, &beside, false);
+    defer all.deinit(gpa);
+    try std.testing.expectEqual(2, all.list.items.len);
+
+    for ([_][]const []const u8{ &beside, &public }) |key_files| {
+        var only = try findIdentities(gpa, io, agent_path, key_files, true);
+        defer only.deinit(gpa);
+        try std.testing.expectEqual(1, only.list.items.len);
+        try std.testing.expectEqual(keys[1].public_key.toBytes(), only.list.items[0].key.ed25519Key());
+        try std.testing.expectEqual(.agent, only.list.items[0].source);
+    }
+}
+
+fn containsKey(keys: []const auth.ssh.PublicKey, key: *const auth.ssh.PublicKey) bool {
+    for (keys) |*k| if (k.eql(key)) return true;
+    return false;
+}
+
+/// The key a key file names, as IdentitiesOnly reads it: its private key's,
+/// or the key of a public key file, `FILE` or `FILE.pub`.
+fn namedKey(gpa: Allocator, io: Io, path: []const u8) ?auth.ssh.PublicKey {
+    if (keyFilePublicKey(gpa, io, path)) |key| return key else |_| {}
+    return publicKeyOf(gpa, io, path) catch null;
+}
+
+/// The key in the public key file `path`, or else in `path.pub`.
+fn publicKeyOf(gpa: Allocator, io: Io, path: []const u8) !auth.ssh.PublicKey {
+    if (publicKeyFile(gpa, io, path)) |key| return key else |_| {}
+    const pub_path = try std.mem.concat(gpa, u8, &.{ path, ".pub" });
+    defer gpa.free(pub_path);
+    return publicKeyFile(gpa, io, pub_path);
+}
+
+/// The key on a public key file's line: `TYPE BASE64 [COMMENT]`.
+fn publicKeyFile(gpa: Allocator, io: Io, path: []const u8) !auth.ssh.PublicKey {
+    const text = try Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 << 10));
+    // The file may be a private key tx can't read.
+    defer {
+        std.crypto.secureZero(u8, text);
+        gpa.free(text);
+    }
+    var fields = std.mem.tokenizeAny(u8, text, " \t\r\n");
+    const key_type = fields.next() orelse return error.Malformed;
+    const encoded = fields.next() orelse return error.Malformed;
+    return auth.ssh.parsePublicKeyText(key_type, encoded);
 }
 
 /// `-G`: the configuration, as OpenSSH prints it. git runs `-G` to tell
 /// OpenSSH from other ssh programs, and passes a port only to OpenSSH.
-fn printConfig(io: Io, environ: *const std.process.Environ.Map, user: ?[]const u8, host: []const u8, port: ?u16) u8 {
+fn printConfig(io: Io, environ: *const std.process.Environ.Map, configured: ssh_config.Resolved) u8 {
     var buf: [1024]u8 = undefined;
     var w = Io.File.stdout().writerStreaming(io, &buf);
-    w.interface.print("user {s}\nhostname {s}\nport {d}\n", .{
-        user orelse paths.userName(environ) orelse "",
-        host,
-        port orelse default_port,
-    }) catch return 255;
+    writeConfig(&w.interface, paths.userName(environ), configured) catch return 255;
     w.interface.flush() catch return 255;
     return 0;
+}
+
+fn writeConfig(w: *Io.Writer, local_user: ?[]const u8, configured: ssh_config.Resolved) Io.Writer.Error!void {
+    try w.print("user {s}\nhostname {s}\nport {d}\n", .{ configured.user orelse local_user orelse "", configured.hostname, configured.port });
+    for (configured.identity_files) |file| try w.print("identityfile {s}\n", .{file});
+    try w.print("identitiesonly {s}\n", .{if (configured.identities_only) "yes" else "no"});
+    if (configured.identity_agent) |agent| switch (agent) {
+        .none => try w.writeAll("identityagent none\n"),
+        .path => |path| try w.print("identityagent {s}\n", .{path}),
+    };
+    if (configured.proxy_jump) |jump| try w.print("proxyjump {s}\n", .{jump});
+}
+
+test writeConfig {
+    var buf: [512]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    try writeConfig(&w, "local", .{
+        .hostname = "real.example.com",
+        .user = null,
+        .port = 8739,
+        .identity_files = &.{ "/keys/a", "/keys/b" },
+        .identities_only = true,
+        .identity_agent = .none,
+        .proxy_jump = "bastion",
+        .warnings = &.{},
+    });
+    try std.testing.expectEqualStrings(
+        \\user local
+        \\hostname real.example.com
+        \\port 8739
+        \\identityfile /keys/a
+        \\identityfile /keys/b
+        \\identitiesonly yes
+        \\identityagent none
+        \\proxyjump bastion
+        \\
+    , w.buffered());
 }
 
 /// The terminfo source for `term`, from `infocmp -x`. Null when there's none
