@@ -1,18 +1,13 @@
 //! tx: a session on a txd server.
 //!
 //! Usage: tx [SSH OPTIONS] [--attach ID | --new | --list | --kill ID]
-//!           [--yes] [--server COMMAND] [--ssh PATH] DESTINATION [COMMAND...]
-//!        tx [SSH OPTIONS] [--yes] [--ssh PATH] --uninstall DESTINATION
+//!           DESTINATION [COMMAND...]
 //!        tx --version
 //!
 //! tx takes ssh's options, as ssh reads them, so that tools that run ssh
 //! can run tx (see `args.zig`). `-p` is txd's port. It connects to the
 //! host, and logs in as the user, that ssh's config gives the destination
-//! (see `ssh_config.zig`).
-//!
-//! Run as `ssh`, from a link named ssh ahead of ssh in PATH, tx takes ssh's
-//! place (see `Shim`): `-p` is sshd's port, the ssh tx runs gets the same
-//! options, and the real ssh runs in tx's place for what tx can't do.
+//! (see `ssh_config.zig`). tx never runs ssh.
 //!
 //! With none of `--attach`, `--new`, `--list` and `--kill`, tx attaches to
 //! the host's detached session if it has exactly one, and starts a session
@@ -31,28 +26,13 @@
 //! and is accepted for ssh's sake.
 //!
 //! The server's key is checked against `~/.config/tx/known_hosts` and
-//! `~/.ssh/known_hosts`. For a host the first doesn't list, tx reads the
-//! key over ssh with `txd --print-host-key`, so ssh's own host check
-//! vouches for it, and adds it to the first file. The second isn't enough
-//! alone: it lists sshd's keys, and a txd that runs as the user has a key
-//! of its own. If ssh fails, tx trusts the keys the second lists, or else
-//! asks, as ssh does.
+//! `~/.ssh/known_hosts`. For a host the first doesn't list, tx learns the
+//! key the server presents, and trusts it if the second lists it, as it
+//! does for a txd that uses sshd's key, or else asks, as ssh does. A txd
+//! that runs as the user has a key of its own, which `txd --install`
+//! prints. The key is added to the first file.
 //!
-//! The same ssh command runs `txd --install`, which sets up a service that
-//! keeps txd running on the host and starts it. tx runs the install over
-//! ssh again when nothing answers on the server's port. On a host with no
-//! txd, tx copies one there first; see `remote.zig`. Before the first copy
-//! to a host, tx asks, unless it is given `--yes`.
-//!
-//! `--uninstall` runs `txd --uninstall` over ssh, which ends the host's
-//! sessions and removes txd, its service and its files. tx asks first,
-//! unless it is given `--yes`. tx then forgets the host's keys, since a txd
-//! installed later has new ones.
-//!
-//! txd answers only clients that hold its SPA key. Each ssh command
-//! reads it, and tx keeps it in `~/.config/tx/spa_keys` (see `spa_keys.zig`).
-//! A host with no key there, or one whose key changed, doesn't answer,
-//! and the install over ssh brings the key.
+//! When nothing answers, tx says how to install txd on the host.
 //!
 //! A new session gets the client's `TERM`, `COLORTERM`, `LANG` and `LC_*`,
 //! and the terminfo entry for its `TERM`, from `infocmp -x`, which txd
@@ -74,17 +54,16 @@ const proto = @import("proto");
 const build_options = @import("build_options");
 const transport = @import("transport");
 const paths = @import("paths.zig");
-const remote = @import("remote.zig");
-const spa_keys = @import("spa_keys.zig");
 const ssh_config = @import("ssh_config.zig");
 const args_pkg = @import("args.zig");
 
-const default_port = remote.default_port;
+const CloseReason = transport.endpoint.CloseReason;
+
+/// txd's port.
+const default_port = 8739;
 
 const usage_text =
-    \\usage: tx [SSH OPTIONS] [--attach ID | --new | --list | --kill ID] [--yes]
-    \\          [--server COMMAND] [--ssh PATH] DESTINATION [COMMAND...]
-    \\       tx [SSH OPTIONS] [--yes] [--ssh PATH] --uninstall DESTINATION
+    \\usage: tx [SSH OPTIONS] [--attach ID | --new | --list | --kill ID] DESTINATION [COMMAND...]
     \\       tx --version
     \\
     \\The ssh options that take effect: -p PORT (txd's), -l USER, -t, -T, -4, -6,
@@ -92,9 +71,11 @@ const usage_text =
     \\RequestTTY. DESTINATION is [USER@]HOST or ssh://[USER@]HOST[:PORT].
 ;
 
-/// How long tx waits for an answer from the server's port before it
-/// starts txd over ssh, and after.
-const no_answer_timeout_ns = 5 * std.time.ns_per_s;
+/// How long tx waits for an answer from the server.
+const connect_timeout_ns = 15 * std.time.ns_per_s;
+
+/// What sets up txd on a host.
+const install_command = "curl -fsSL https://github.com/seatedro/tx/releases/latest/download/install.sh | sh -s -- --txd";
 
 /// Key files tried after the agent's keys, without `-i`.
 const default_key_files = [_][]const u8{"~/.ssh/id_ed25519"};
@@ -103,7 +84,7 @@ pub fn main(init: std.process.Init) !u8 {
     // First, so every thread inherits the mask: name lookups can start
     // threads, and a terminating signal must reach the session's signal
     // thread, which restores the terminal.
-    const signal_mask = client.tty.blockSignals();
+    _ = client.tty.blockSignals();
 
     const gpa = init.gpa;
     const io = init.io;
@@ -111,20 +92,11 @@ pub fn main(init: std.process.Init) !u8 {
     const arena = init.arena.allocator();
     const argv = try init.minimal.args.toSlice(arena);
 
-    const shim: ?Shim = if (Shim.named(argv[0])) .{
-        .ssh = Shim.findSsh(arena, io, environ) catch |err| return fail("can't find ssh in PATH: {t}", .{err}),
-        .argv = argv,
-        .signal_mask = signal_mask,
-    } else null;
-
     const args = switch (try args_pkg.parse(arena, argv[1..])) {
         .ok => |a| a,
-        // ssh says what's wrong in its own words.
-        .usage => |problem| return if (shim) |sh| sh.run(io, null) else usage(problem),
-        .unsupported => |option| return if (shim) |sh| sh.run(io, null) else fail("{s} isn't supported", .{option}),
+        .usage => |problem| return usage(problem),
+        .unsupported => |option| return fail("{s} isn't supported", .{option}),
     };
-    // ssh describes itself and its configuration.
-    if (shim) |sh| if (args.version or args.print_config) return sh.run(io, null);
     if (args.version) {
         Io.File.stdout().writeStreamingAll(io, "tx " ++ build_options.version ++ "\n") catch return 255;
         return 0;
@@ -133,13 +105,10 @@ pub fn main(init: std.process.Init) !u8 {
 
     // The host and user from ssh's config, as `tx pulsar` should reach
     // what `ssh pulsar` does. A user given to tx wins, as it does in ssh.
-    const ssh_path = if (shim) |sh| sh.ssh else args.ssh_path;
-    const ssh_options = if (shim != null) args.ssh_options else &.{};
-    const configured = ssh_config.resolve(arena, io, ssh_path, ssh_options, args.user, args.host);
+    const configured = ssh_config.resolve(arena, io, "ssh", &.{}, args.user, args.host);
     const host = configured.hostname orelse args.host;
     const user = args.user orelse configured.user;
-    // As ssh, `-p` is sshd's.
-    const port = if (shim != null) default_port else args.port orelse default_port;
+    const port = args.port orelse default_port;
     if (args.print_config) return printConfig(io, environ, user, host, args.port);
 
     // What to do once logged in. A command runs in a session of its own
@@ -152,48 +121,20 @@ pub fn main(init: std.process.Init) !u8 {
             if (args.tty == true) session_command = words else command = .{ .exec = words };
         },
         .attach => |id| session_id = id,
-        .new, .uninstall => {},
+        .new => {},
         .list => command = .list,
         .kill => |id| command = .{ .kill = id },
     }
-    const yes = args.yes;
 
-    // ssh gets the destination as given, so that its config applies to it
-    // in full.
-    var ssh_buf: [512]u8 = undefined;
-    const ssh_destination = if (args.user) |u| std.fmt.bufPrint(&ssh_buf, "{s}@{s}", .{ u, args.host }) catch args.host else args.host;
-    const ssh: remote.Source = .{
-        .ssh = ssh_path,
-        .ssh_options = ssh_options,
-        .destination = ssh_destination,
-        .server_command = args.server_command,
-        .port = port,
-        .signal_mask = signal_mask,
-        .environ = environ,
-        .first_install = if (yes) .yes else .ask,
-    };
+    // The destination as given, for messages.
+    var destination_buf: [512]u8 = undefined;
+    const destination = if (args.user) |u| std.fmt.bufPrint(&destination_buf, "{s}@{s}", .{ u, args.host }) catch args.host else args.host;
 
-    // The host's name in tx's files, and the files.
+    // The host's name in tx's known_hosts, and the file.
     var name_buf: [512]u8 = undefined;
     const known_name = auth.known_hosts.hostName(&name_buf, host, port, default_port) catch return fail("host name too long", .{});
     const tx_known_hosts = try paths.config(gpa, environ, "known_hosts");
     defer gpa.free(tx_known_hosts);
-    const tx_spa_keys = try paths.config(gpa, environ, "spa_keys");
-    defer gpa.free(tx_spa_keys);
-
-    if (args.mode == .uninstall) {
-        // Ending the sessions loses what runs in them.
-        if (!yes) {
-            var buf: [1024]u8 = undefined;
-            const question = std.fmt.bufPrint(&buf,
-                \\This ends every session on {s}, and removes txd, its service and its keys.
-                \\Uninstall txd?
-            , .{ssh_destination}) catch return fail("host name too long", .{});
-            const answer = remote.ask(io, question, false) catch |err| return fail("can't ask: {t}", .{err});
-            if (!(answer orelse return fail("there's no terminal to ask on; with --yes, tx uninstalls without asking", .{}))) return 255;
-        }
-        return uninstallOverSsh(gpa, io, ssh, tx_known_hosts, tx_spa_keys, known_name);
-    }
 
     const login_user = user orelse paths.userName(environ) orelse return fail("can't tell the local user name; use -l", .{});
     if (login_user.len == 0 or login_user.len > auth.login.max_user_len) return fail("invalid user name", .{});
@@ -208,26 +149,23 @@ pub fn main(init: std.process.Init) !u8 {
     var identities = try findIdentities(gpa, io, environ, agent_path, key_files);
     defer identities.deinit(gpa);
     if (identities.list.items.len == 0) {
-        if (shim) |sh| return sh.run(io, "tx has no key to log in with");
         return fail("no keys to log in with: the SSH agent has no Ed25519 or RSA keys, and there is no ~/.ssh/id_ed25519", .{});
     }
 
-    // The keys known_hosts lists for the host, or the one the user accepts.
-    const ssh_spa_key: SshSpaKey = .{ .path = tx_spa_keys, .name = known_name, .host = args.host };
-    const trusted = trustedKeys(gpa, io, environ, tx_known_hosts, known_name, addresses, ssh, ssh_spa_key) catch |err| {
-        if (shim) |sh| return sh.run(io, if (err == error.Declined) "txd isn't installed there" else "can't check txd's host key");
-        return switch (err) {
-            error.Declined => 255,
-            else => fail("checking the host key failed: {t}", .{err}),
-        };
+    // The keys known_hosts lists for the host, or the one it presents
+    // that ssh's known_hosts lists or the user accepts.
+    const trust = trustedKeys(gpa, io, environ, tx_known_hosts, known_name, addresses) catch |err| {
+        return fail("checking the host key failed: {t}", .{err});
     };
-    defer gpa.free(trusted.keys);
-
-    // The SPA key read over ssh just now, or the one recorded.
-    const spa_key = trusted.spa_key orelse spa_keys.find(gpa, io, tx_spa_keys, known_name) catch |err| blk: {
-        std.debug.print("tx: can't read {s}: {t}\n", .{ tx_spa_keys, err });
-        break :blk null;
+    const host_keys = switch (trust) {
+        .keys => |keys| keys,
+        .declined => return 255,
+        .no_answer => |reason| {
+            noAnswer(host, args.host, port, reason);
+            return 255;
+        },
     };
+    defer gpa.free(host_keys);
 
     const term = environ.get("TERM") orelse "xterm-256color";
 
@@ -241,10 +179,9 @@ pub fn main(init: std.process.Init) !u8 {
     // The macOS pasteboard, for programs on the host. Elsewhere there's
     // none yet.
     var pasteboard: ?client.pasteboard.Pasteboard = if (builtin.os.tag.isDarwin() and command == .attach) client.pasteboard.Pasteboard.general() else null;
-    var options: client.session.Options = .{
+    const options: client.session.Options = .{
         .servers = addresses,
-        .host_keys = trusted.keys,
-        .spa_key = spa_key,
+        .host_keys = host_keys,
         .user = login_user,
         .agent = agent_path,
         .identities = identities.list.items,
@@ -261,22 +198,11 @@ pub fn main(init: std.process.Init) !u8 {
         .locale = try localeVariables(arena, environ),
         .escape_char = args.escape_char,
         .in_fd = if (args.no_stdin) try openNull() else std.posix.STDIN_FILENO,
-        .handshake_timeout_ns = no_answer_timeout_ns,
+        .handshake_timeout_ns = connect_timeout_ns,
         .clipboard = if (pasteboard) |*p| p.provider() else null,
     };
-    var install = trusted.install;
-    var outcome = client.session.run(gpa, io, options) catch |err| return fail("{t}", .{err});
 
-    // txd may have stopped, never been set up on a host already in
-    // known_hosts, or have an SPA key tx doesn't have.
-    if (outcome == .no_connection and install == .not_run) {
-        std.debug.print("tx: nothing answers on {s} port {d}; starting txd over ssh\n", .{ host, port });
-        install = installOverSsh(gpa, io, ssh, ssh_spa_key, &options.spa_key);
-        if (install == .declined) return if (shim) |sh| sh.run(io, "txd isn't installed there") else 255;
-        if (install == .done) outcome = client.session.run(gpa, io, options) catch |err| return fail("{t}", .{err});
-    }
-
-    switch (outcome) {
+    switch (client.session.run(gpa, io, options) catch |err| return fail("{t}", .{err})) {
         .exited => |exit| return exit.status,
         .detached => |id| {
             // The command that reattaches, with the port if it isn't the
@@ -287,24 +213,15 @@ pub fn main(init: std.process.Init) !u8 {
             // command on a terminal got SIGHUP.
             const n = id orelse return fail("interrupted before the session started", .{});
             if (session_command != null) return 255;
-            std.debug.print("tx: detached from session {d}; reattach with tx {s}--attach {d} {s}\n", .{ n, port_arg, n, ssh_destination });
+            std.debug.print("tx: detached from session {d}; reattach with tx {s}--attach {d} {s}\n", .{ n, port_arg, n, destination });
             return 0;
         },
         .no_connection => |reason| {
-            if (shim) |sh| return sh.run(io, "nothing answers on txd's port");
-            if (install == .done) return fail("txd is running on {s}, but nothing answers on UDP port {d}. A firewall may be blocking it.", .{ host, port });
-            return fail("can't connect to {s} port {d}: {t}", .{ host, port, reason });
+            noAnswer(host, args.host, port, reason);
+            return 255;
         },
         .disconnected => |reason| return fail("connection closed: {t}", .{reason}),
         .host_key_refused => |key| {
-            if (trusted.sshd_keys) {
-                std.debug.print(
-                    \\tx: the host key for {s} isn't one ~/.ssh/known_hosts lists.
-                    \\tx: it presented {s}. A txd that runs as you has a key of its own, which tx reads over ssh.
-                    \\
-                , .{ known_name, auth.Fingerprint.init(key).slice() });
-                return 255;
-            }
             std.debug.print(
                 \\tx: the host key for {s} has changed, or someone is impersonating the host.
                 \\tx: it presented {s}
@@ -330,6 +247,17 @@ pub fn main(init: std.process.Init) !u8 {
         },
         .ended => return 255,
     }
+}
+
+/// Says that nothing answered, and how to set up txd on `named`, the host
+/// as the user wrote it.
+fn noAnswer(host: []const u8, named: []const u8, port: u16, reason: CloseReason) void {
+    std.debug.print(
+        \\tx: no answer from txd on {s} port {d}: {t}
+        \\tx: to install txd and keep it running there, run this on {s}:
+        \\    {s}
+        \\
+    , .{ host, port, reason, named, install_command });
 }
 
 /// The environment's `LANG` and `LC_*` variables, as `proto.Hello.locale`
@@ -360,51 +288,6 @@ test localeVariables {
     try std.testing.expect(std.mem.indexOf(u8, items, "LANG=en_US.UTF-8\x00") != null);
     try std.testing.expect(std.mem.indexOf(u8, items, "LC_TIME=en_GB.UTF-8\x00") != null);
 }
-
-/// tx run as `ssh`. The real ssh runs, with tx's arguments, what tx can't:
-/// options tx lacks, usage errors, `-V` and `-G`, and hosts where txd isn't
-/// there to use.
-const Shim = struct {
-    /// The first ssh in PATH that isn't tx.
-    ssh: []const u8,
-    /// tx's arguments, which ssh gets.
-    argv: []const []const u8,
-    /// See `remote.Source.signal_mask`.
-    signal_mask: std.posix.sigset_t,
-
-    fn named(arg0: []const u8) bool {
-        return std.mem.eql(u8, std.fs.path.basename(arg0), "ssh");
-    }
-
-    fn findSsh(arena: Allocator, io: Io, environ: *const std.process.Environ.Map) ![]const u8 {
-        const self = try std.process.executablePathAlloc(io, arena);
-        var dirs = std.mem.tokenizeScalar(u8, environ.get("PATH") orelse return error.NoPath, ':');
-        while (dirs.next()) |dir| {
-            const path = try std.fs.path.join(arena, &.{ dir, "ssh" });
-            const real = Io.Dir.cwd().realPathFileAlloc(io, path, arena) catch continue;
-            if (std.mem.eql(u8, real, self)) continue;
-            Io.Dir.cwd().access(io, path, .{ .execute = true }) catch continue;
-            return path;
-        }
-        return error.FileNotFound;
-    }
-
-    /// Runs ssh in tx's place, saying why, if there's a reason to give.
-    /// Returns only if that fails.
-    fn run(sh: Shim, io: Io, why: ?[]const u8) u8 {
-        if (why) |reason| std.debug.print("tx: {s}; running ssh\n", .{reason});
-        var argv_buf: [256][]const u8 = undefined;
-        if (sh.argv.len > argv_buf.len) return fail("too many arguments", .{});
-        argv_buf[0] = sh.ssh;
-        @memcpy(argv_buf[1..sh.argv.len], sh.argv[1..]);
-
-        // ssh starts with the signal mask tx was given.
-        var blocked: std.posix.sigset_t = undefined;
-        _ = std.c.pthread_sigmask(std.posix.SIG.SETMASK, &sh.signal_mask, &blocked);
-        const err = std.process.replace(io, .{ .argv = argv_buf[0..sh.argv.len] });
-        return fail("can't run {s}: {t}", .{ sh.ssh, err });
-    }
-};
 
 /// One line per session, under a header.
 fn printListing(io: Io, listed: []const client.session.Outcome.Listed) !void {
@@ -621,121 +504,18 @@ fn keyFilePublicKey(gpa: Allocator, io: Io, path: []const u8) !auth.ssh.PublicKe
     return .fromEd25519(file.public_key);
 }
 
-/// Whether tx ran `txd --install` over ssh, and how it went.
-const Install = enum {
-    not_run,
-    /// The user said no to installing txd on the host.
-    declined,
-    failed,
-    done,
-};
-
-/// Where an SPA key read over ssh is recorded.
-const SshSpaKey = struct {
-    /// The SPA keys file.
-    path: []const u8,
-    /// The host's name in it.
-    name: []const u8,
-    /// The host, as the user wrote it.
-    host: []const u8,
-
-    /// Records the key txd printed, if it printed one, and returns it.
-    /// Warns of a clock off by most of `transport.spa.window_minutes`.
-    fn take(k: SshSpaKey, gpa: Allocator, io: Io, output: []const u8) ?transport.spa.Key {
-        const printed = spa_keys.parsePrinted(output) orelse return null;
-        spa_keys.store(gpa, io, k.path, k.name, printed.key) catch |err| {
-            std.debug.print("tx: can't record {s}'s SPA key in {s}: {t}\n", .{ k.host, k.path, err });
-        };
-
-        const off_s = Io.Clock.real.now(io).toSeconds() - printed.time;
-        if (@abs(off_s) > (transport.spa.window_minutes - 1) * 60) {
-            std.debug.print("tx: the clocks here and on {s} are {d} minutes apart. txd drops connections from a clock more than {d} minutes off.\n", .{ k.host, @divTrunc(@abs(off_s), 60), transport.spa.window_minutes });
-        }
-        return printed.key;
-    }
-};
-
-/// Starts txd on the host, and sets up its service. Sets `spa_key` to the
-/// SPA key txd printed.
-fn installOverSsh(gpa: Allocator, io: Io, source: remote.Source, ssh_spa_key: SshSpaKey, spa_key: *?transport.spa.Key) Install {
-    const result = remote.runTxd(gpa, io, source, &.{ "--print-spa-key", "--install" }) catch |err| switch (err) {
-        error.Declined => return .declined,
-        error.NoTxd => return .failed,
-        else => {
-            std.debug.print("tx: can't run txd over ssh: {t}\n", .{err});
-            return .failed;
-        },
-    };
-    defer gpa.free(result.stdout);
-    if (ssh_spa_key.take(gpa, io, result.stdout)) |key| spa_key.* = key;
-    return if (result.ok) .done else .failed;
-}
-
-/// Runs `txd --uninstall` on the host, then removes the host's lines from
-/// tx's known_hosts and SPA keys. A host where tx never put txd is left
-/// alone, and its lines are removed.
-fn uninstallOverSsh(gpa: Allocator, io: Io, source: remote.Source, tx_known_hosts: []const u8, tx_spa_keys: []const u8, name: []const u8) u8 {
-    var s = source;
-    s.first_install = .no;
-    if (remote.runTxd(gpa, io, s, &.{"--uninstall"})) |result| {
-        gpa.free(result.stdout);
-        if (!result.ok) return fail("txd --uninstall failed on {s}", .{source.destination});
-    } else |err| switch (err) {
-        error.NotInstalled => std.debug.print("tx: {s} has no txd from tx\n", .{source.destination}),
-        error.NoTxd => return 255,
-        else => return fail("can't run txd over ssh: {t}", .{err}),
-    }
-
-    // A txd installed later has new keys.
-    auth.known_hosts.remove(gpa, io, tx_known_hosts, name) catch |err| {
-        return fail("can't remove {s} from {s}: {t}", .{ name, tx_known_hosts, err });
-    };
-    spa_keys.remove(gpa, io, tx_spa_keys, name) catch |err| {
-        return fail("can't remove {s} from {s}: {t}", .{ name, tx_spa_keys, err });
-    };
-    std.debug.print("tx: removed {s} from {s} and {s}\n", .{ name, tx_known_hosts, tx_spa_keys });
-    return 0;
-}
-
-/// What txd printed over ssh on first contact.
-const SshKeys = struct {
-    host_key: auth.Key,
-    spa_key: ?transport.spa.Key,
-};
-
-/// Reads txd's host key and SPA key from the remote account over ssh,
-/// and installs txd there. ssh's own host key check vouches for the
-/// connection, so the key needs no prompt.
-fn hostKeyOverSsh(gpa: Allocator, io: Io, source: remote.Source, ssh_spa_key: SshSpaKey, install: *Install) !SshKeys {
-    install.* = .failed;
-    const result = try remote.runTxd(gpa, io, source, &.{ "--print-host-key", "--print-spa-key", "--install" });
-    defer gpa.free(result.stdout);
-    install.* = if (result.ok) .done else .failed;
-    const spa_key = ssh_spa_key.take(gpa, io, result.stdout);
-
-    // `ssh-ed25519 AAAA...`. txd prints it before it installs, so
-    // it arrives even when the install fails.
-    var fields = std.mem.tokenizeAny(u8, result.stdout, " \t\r\n");
-    const key_type = fields.next() orelse return error.NoKeyPrinted;
-    const text = fields.next() orelse return error.NoKeyPrinted;
-    return .{ .host_key = try auth.ssh.parseKeyText(key_type, text), .spa_key = spa_key };
-}
-
-const Trusted = struct {
-    /// The keys tx accepts from the host.
+const Trust = union(enum) {
     keys: []auth.Key,
-    /// Reading the key over ssh runs the install too.
-    install: Install = .not_run,
-    /// The SPA key, when the host key was read over ssh.
-    spa_key: ?transport.spa.Key = null,
-    /// The keys are the ones `~/.ssh/known_hosts` lists, since ssh failed.
-    sshd_keys: bool = false,
+    /// The user declined the key, or it is revoked.
+    declined,
+    /// The host didn't answer.
+    no_answer: CloseReason,
 };
 
-/// When tx's known_hosts lists no key for the host, reads the host's key
-/// over ssh, or else trusts the keys ssh's known_hosts lists, or else
-/// learns it and asks the user. A key that's read or learned is recorded
-/// in `tx_known_hosts`.
+/// The keys tx accepts from the host: the ones tx's known_hosts lists, with
+/// those ssh's lists. For a host tx's doesn't list, the key the host
+/// presents, if ssh's known_hosts lists it or the user accepts it, which is
+/// then recorded in `tx_known_hosts`.
 fn trustedKeys(
     gpa: Allocator,
     io: Io,
@@ -743,9 +523,7 @@ fn trustedKeys(
     tx_known_hosts: []const u8,
     name: []const u8,
     addresses: []const IpAddress,
-    ssh: remote.Source,
-    ssh_spa_key: SshSpaKey,
-) !Trusted {
+) !Trust {
     var known: auth.known_hosts.Known = .{};
     defer known.deinit(gpa);
     try auth.known_hosts.readFile(io, gpa, tx_known_hosts, name, &known);
@@ -761,121 +539,54 @@ fn trustedKeys(
         gpa.free(trusted);
     }
 
-    // First contact, over ssh if it can log in. That's so even for a host
-    // in ssh's known_hosts, which lists sshd's keys: a txd that runs as
-    // the user can't read them, and has a key of its own.
-    var install: Install = .not_run;
-    if (hostKeyOverSsh(gpa, io, ssh, ssh_spa_key, &install)) |read| {
-        const key = read.host_key;
-        if (known.isRevoked(key)) {
-            std.debug.print("tx: {s} has a revoked key, {s}\n", .{ name, auth.Fingerprint.init(key).slice() });
-            return error.Declined;
-        }
-        try auth.known_hosts.append(io, tx_known_hosts, name, key);
-        std.debug.print("tx: added {s} to {s}, with the key read over ssh\n", .{ name, tx_known_hosts });
-
-        const keys = try gpa.alloc(auth.Key, 1);
-        keys[0] = key;
-        return .{ .keys = keys, .install = install, .spa_key = read.spa_key };
-    } else |err| switch (err) {
-        error.Declined => return error.Declined,
-        else => std.debug.print("tx: can't read the host key over ssh: {t}\n", .{err}),
-    }
-
-    // Without ssh, the keys ssh knows, for a txd that uses sshd's key.
-    const sshd_keys = try known.trusted(gpa);
-    if (sshd_keys.len > 0) return .{ .keys = sshd_keys, .install = install, .sshd_keys = true };
-    gpa.free(sshd_keys);
-
-    // Otherwise the server's own word, checked by the user.
-    const found = switch (try client.scan.hostKey(gpa, io, addresses, 10 * std.time.ns_per_s)) {
+    // First contact: the key the host presents.
+    const found = switch (try client.scan.hostKey(gpa, io, addresses, connect_timeout_ns)) {
         .found => |found| found,
-        .failed => |reason| {
-            std.debug.print("tx: can't reach {s}: {t}\n", .{ name, reason });
-            return error.Declined;
-        },
+        .failed => |reason| return .{ .no_answer = reason },
     };
     const key = found.key;
-    if (known.isRevoked(key)) {
-        std.debug.print("tx: {s} presented a revoked key, {s}\n", .{ name, auth.Fingerprint.init(key).slice() });
-        return error.Declined;
-    }
-
-    if (!try confirm(io, name, found.address, key)) {
-        std.debug.print("tx: host key verification failed\n", .{});
-        return error.Declined;
+    switch (firstContact(&known, key)) {
+        .revoked => {
+            std.debug.print("tx: {s} presented a revoked key, {s}\n", .{ name, auth.Fingerprint.init(key).slice() });
+            return .declined;
+        },
+        .listed => std.debug.print("tx: {s}'s key is one ~/.ssh/known_hosts lists\n", .{name}),
+        .unknown => if (!try confirm(io, name, found.address, key)) {
+            std.debug.print("tx: host key verification failed\n", .{});
+            return .declined;
+        },
     }
     try auth.known_hosts.append(io, tx_known_hosts, name, key);
     std.debug.print("tx: added {s} to {s}\n", .{ name, tx_known_hosts });
 
     const keys = try gpa.alloc(auth.Key, 1);
     keys[0] = key;
-    return .{ .keys = keys, .install = install };
+    return .{ .keys = keys };
 }
 
-test "a host only ssh's known_hosts lists has its key read over ssh, or without ssh, trusts sshd's" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
-    var arena: std.heap.ArenaAllocator = .init(gpa);
-    defer arena.deinit();
-    const a = arena.allocator();
+/// What first contact makes of the key a host presents, from what the
+/// known_hosts files list for the host.
+fn firstContact(known: *const auth.known_hosts.Known, key: auth.Key) enum { revoked, listed, unknown } {
+    if (known.isRevoked(key)) return .revoked;
+    for (known.keys.items) |k| if (std.mem.eql(u8, &k, &key)) return .listed;
+    return .unknown;
+}
 
-    // sshd's key, in ssh's known_hosts, and txd's own, which the stand-in
-    // for ssh prints as `txd --print-host-key` does.
+test firstContact {
+    const gpa = std.testing.allocator;
     const sshd_key: auth.Key = @splat(1);
     const txd_key: auth.Key = @splat(2);
-    try tmp.dir.createDirPath(io, ".ssh");
-    try tmp.dir.writeFile(io, .{
-        .sub_path = ".ssh/known_hosts",
-        .data = try std.fmt.allocPrint(a, "pulsar ssh-ed25519 {s}\n", .{auth.ssh.KeyText.init(sshd_key).slice()}),
-    });
-    const scripts = [_]struct { name: []const u8, text: []const u8 }{
-        .{ .name = "ssh", .text = try std.fmt.allocPrint(a, "#!/bin/sh\necho ssh-ed25519 {s}\n", .{auth.ssh.KeyText.init(txd_key).slice()}) },
-        .{ .name = "failing-ssh", .text = "#!/bin/sh\nexit 255\n" },
-    };
-    for (scripts) |s| {
-        const file = try tmp.dir.createFile(io, s.name, .{ .permissions = .fromMode(0o755) });
-        defer file.close(io);
-        try file.writeStreamingAll(io, s.text);
-    }
+    var known: auth.known_hosts.Known = .{};
+    defer known.deinit(gpa);
+    try known.keys.append(gpa, sshd_key);
 
-    var environ: std.process.Environ.Map = .init(gpa);
-    defer environ.deinit();
-    try environ.put("HOME", dir);
-    const tx_known_hosts = try std.fs.path.join(a, &.{ dir, "known_hosts" });
-    var source: remote.Source = .{
-        .ssh = try std.fs.path.join(a, &.{ dir, "ssh" }),
-        .destination = "pulsar",
-        .server_command = "txd",
-        .port = default_port,
-        .signal_mask = std.posix.sigemptyset(),
-        .environ = &environ,
-        .first_install = .no,
-    };
-    const spa_key: SshSpaKey = .{ .path = try std.fs.path.join(a, &.{ dir, "spa_keys" }), .name = "pulsar", .host = "pulsar" };
+    // A txd that uses sshd's key, which ssh's known_hosts lists, or one
+    // with a key of its own.
+    try std.testing.expectEqual(.listed, firstContact(&known, sshd_key));
+    try std.testing.expectEqual(.unknown, firstContact(&known, txd_key));
 
-    // Over ssh, txd's key, which tx records.
-    const read = try trustedKeys(gpa, io, &environ, tx_known_hosts, "pulsar", &.{}, source, spa_key);
-    defer gpa.free(read.keys);
-    try std.testing.expectEqualSlices(auth.Key, &.{txd_key}, read.keys);
-    try std.testing.expect(!read.sshd_keys);
-
-    // Once recorded, it's trusted without ssh.
-    source.ssh = try std.fs.path.join(a, &.{ dir, "failing-ssh" });
-    const recorded = try trustedKeys(gpa, io, &environ, tx_known_hosts, "pulsar", &.{}, source, spa_key);
-    defer gpa.free(recorded.keys);
-    try std.testing.expectEqualSlices(auth.Key, &.{ txd_key, sshd_key }, recorded.keys);
-
-    // Without ssh or a recorded key, sshd's.
-    try tmp.dir.deleteFile(io, "known_hosts");
-    const sshd = try trustedKeys(gpa, io, &environ, tx_known_hosts, "pulsar", &.{}, source, spa_key);
-    defer gpa.free(sshd.keys);
-    try std.testing.expectEqualSlices(auth.Key, &.{sshd_key}, sshd.keys);
-    try std.testing.expect(sshd.sshd_keys);
+    try known.revoked.append(gpa, txd_key);
+    try std.testing.expectEqual(.revoked, firstContact(&known, txd_key));
 }
 
 /// Asks on the controlling terminal whether to trust `key`, as ssh does.
@@ -929,7 +640,5 @@ test {
     _ = &main;
     _ = args_pkg;
     _ = @import("getopt.zig");
-    _ = remote;
-    _ = spa_keys;
     _ = ssh_config;
 }

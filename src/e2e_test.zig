@@ -969,32 +969,29 @@ test "rsync copies a directory with tx as its shell" {
     try testing.expectEqualStrings("small\n", small);
 }
 
-test "tx reaches the host, as the user, that ssh's config gives the destination" {
+test "tx trusts the key ssh's known_hosts lists for a host new to it, and records it" {
     var es: ExecServer = undefined;
     try es.init();
     defer es.deinit();
     var t: Tools = undefined;
     try t.init(&es);
     defer t.deinit();
-    try t.run(&.{ "ssh", "-V" });
 
-    // An alias only this config knows, read by an ssh that's given it.
-    try t.tmp.dir.writeFile(testing.io, .{
-        .sub_path = "ssh_config",
-        .data = "Host txtest\n  HostName 127.0.0.1\n  User " ++ test_user ++ "\n",
-    });
-    var script_buf: [std.fs.max_path_bytes + 64]u8 = undefined;
-    const script = try std.fmt.bufPrint(&script_buf, "#!/bin/sh\nexec ssh -F {s}/ssh_config \"$@\"\n", .{t.dir});
-    {
-        const file = try t.tmp.dir.createFile(testing.io, "ssh-with-config", .{ .permissions = .fromMode(0o755) });
-        defer file.close(testing.io);
-        try file.writeStreamingAll(testing.io, script);
-    }
+    // ssh's known_hosts lists the server's key, as it would for a txd that
+    // uses sshd's key, and tx's lists nothing.
+    try t.tmp.dir.deleteFile(testing.io, "config/tx/known_hosts");
+    var line_buf: [256]u8 = undefined;
+    const line = try std.fmt.bufPrint(&line_buf, "[127.0.0.1]:{d} ssh-ed25519 {s}\n", .{ t.port, auth.ssh.KeyText.init(es.st.host_keys[0]).slice() });
+    try t.tmp.dir.createDirPath(testing.io, ".ssh");
+    try t.tmp.dir.writeFile(testing.io, .{ .sub_path = ".ssh/known_hosts", .data = line });
 
-    var ssh_buf: [std.fs.max_path_bytes]u8 = undefined;
     var port_buf: [8]u8 = undefined;
     const port = try std.fmt.bufPrint(&port_buf, "{d}", .{t.port});
-    try t.run(&.{ t.environ.get("GIT_SSH_COMMAND").?, "--ssh", try t.path(&ssh_buf, "ssh-with-config"), "-p", port, "txtest", "true" });
+    try t.run(&.{ t.environ.get("GIT_SSH_COMMAND").?, "-p", port, "-l", test_user, "127.0.0.1", "true" });
+
+    const recorded = try t.tmp.dir.readFileAlloc(testing.io, "config/tx/known_hosts", gpa, .limited(4096));
+    defer gpa.free(recorded);
+    try testing.expectEqualStrings(line, recorded);
 }
 
 test "a new session finds the terminfo entry its client sent, or a common one" {
@@ -2170,162 +2167,6 @@ test "past retry_from, a client logs in after a Retry" {
     _ = try rc.waitAttached();
     // Each Initial the client sends before the Retry arrives gets one.
     try testing.expect(@atomicLoad(u64, &st.server.pending.retries, .monotonic) >= 1);
-}
-
-test "a server with an SPA key answers only clients with its key" {
-    transport.crypto.init(testing.io);
-    var environ: std.process.Environ.Map = .init(gpa);
-    defer environ.deinit();
-    var login: Login = undefined;
-    try login.init(null);
-    defer login.deinit();
-    const key = transport.spa.generate(testing.io);
-    var options = try login.serverOptions(&environ, &.{ "/bin/sh", "-c", "sleep 10" });
-    options.spa_key = key;
-    var st: ServerThread = undefined;
-    try st.init(options);
-    defer st.deinit();
-
-    // Without the key, or with another, nothing answers.
-    var pty: TestPty = try .open();
-    defer pty.close();
-    for ([_]?transport.spa.Key{ null, transport.spa.generate(testing.io) }) |spa_key| {
-        var ct: ClientThread = .{ .options = login.clientOptions(&st, &pty, &.{login.key.public_key.toBytes()}) };
-        ct.options.command = .list;
-        ct.options.spa_key = spa_key;
-        ct.options.handshake_timeout_ns = std.time.ns_per_s;
-        try ct.start();
-        const outcome = try ct.join(&pty);
-        try testing.expectEqual(transport.endpoint.CloseReason.idle_timeout, outcome.no_connection);
-    }
-
-    // With it, the client logs in.
-    var ct: ClientThread = .{ .options = login.clientOptions(&st, &pty, &.{login.key.public_key.toBytes()}) };
-    ct.options.command = .list;
-    ct.options.spa_key = key;
-    try ct.start();
-    const listed = (try ct.join(&pty)).listed;
-    defer gpa.free(listed);
-    try testing.expectEqual(0, listed.len);
-}
-
-test "a client with the SPA key logs in after a Retry" {
-    transport.crypto.init(testing.io);
-    var environ: std.process.Environ.Map = .init(gpa);
-    defer environ.deinit();
-    var login: Login = undefined;
-    try login.init(null);
-    defer login.deinit();
-    const key = transport.spa.generate(testing.io);
-    var options = try login.serverOptions(&environ, &.{ "/bin/sh", "-c", "sleep 10" });
-    options.spa_key = key;
-    options.pending.retry_from = 0;
-    var st: ServerThread = undefined;
-    try st.init(options);
-    defer st.deinit();
-
-    // The Initial after the Retry has the same source ID, so the same
-    // nonce, from the same address.
-    var pty: TestPty = try .open();
-    defer pty.close();
-    var ct: ClientThread = .{ .options = login.clientOptions(&st, &pty, &.{login.key.public_key.toBytes()}) };
-    ct.options.command = .list;
-    ct.options.spa_key = key;
-    try ct.start();
-    const listed = (try ct.join(&pty)).listed;
-    defer gpa.free(listed);
-    try testing.expect(@atomicLoad(u64, &st.server.pending.retries, .monotonic) >= 1);
-}
-
-test "a server with an SPA key sends nothing to a copy of a first packet from another address" {
-    transport.crypto.init(testing.io);
-    var environ: std.process.Environ.Map = .init(gpa);
-    defer environ.deinit();
-    var login: Login = undefined;
-    try login.init(null);
-    defer login.deinit();
-    const key = transport.spa.generate(testing.io);
-    var options = try login.serverOptions(&environ, &.{ "/bin/sh", "-c", "sleep 10" });
-    options.spa_key = key;
-    // The connection the first packet starts is gone a few seconds later:
-    // ngtcp2 waits at least three probe timeouts.
-    options.idle_timeout_ns = 500 * std.time.ns_per_ms;
-    var st: ServerThread = undefined;
-    try st.init(options);
-    defer st.deinit();
-    const server = Relay.loopback(st.addresses[0].getPort());
-
-    var marked_buf: [2048]u8 = undefined;
-    const marked = try firstDatagram(&key, &marked_buf);
-    var unmarked_buf: [2048]u8 = undefined;
-    const unmarked = try firstDatagram(null, &unmarked_buf);
-
-    const first = try Relay.open(0);
-    defer _ = c.close(first);
-    const other = try Relay.open(0);
-    defer _ = c.close(other);
-
-    // An unmarked packet gets nothing, and the marked one an answer.
-    try testing.expect(!answered(first, unmarked, server, 500));
-    try testing.expect(answered(first, marked, server, timeout_ms));
-
-    // Once the server has dropped that connection, the copy from another
-    // address gets nothing. From the first address, it is a retransmit,
-    // and gets an answer.
-    const deadline = nowMs() + timeout_ms;
-    while (@atomicLoad(u32, &st.server.pending.total, .monotonic) > 0) {
-        if (nowMs() > deadline) return error.Timeout;
-        try testing.io.sleep(.fromMilliseconds(20), .awake);
-    }
-    while (receive(first, 0) != null) {}
-    try testing.expect(!answered(other, marked, server, 500));
-    try testing.expect(answered(first, marked, server, timeout_ms));
-}
-
-/// The first datagram of a client, marked with `spa_key` if it is set,
-/// caught on a socket of the test's before it reaches any server.
-fn firstDatagram(spa_key: ?*const transport.spa.Key, buf: []u8) ![]u8 {
-    const catcher = try Relay.open(0);
-    defer _ = c.close(catcher);
-    var addr: c.sockaddr.in = undefined;
-    var len: c.socklen_t = @sizeOf(c.sockaddr.in);
-    if (c.getsockname(catcher, @ptrCast(&addr), &len) != 0) return error.SocketFailed;
-
-    var loop: xev.Loop = try .init(.{});
-    defer loop.deinit();
-    var tls: transport.quic.Client = try .init(.any);
-    defer tls.deinit();
-    var endpoint: transport.endpoint.Endpoint = undefined;
-    try endpoint.init(gpa, testing.io, &loop, .{
-        .local = try .parseIp4("127.0.0.1", 0),
-        .role = .{ .client = &tls },
-        .spa_key = spa_key,
-    });
-    defer endpoint.deinit();
-
-    // `connect` sends the first Initial before it returns.
-    _ = try endpoint.connect(try .parseIp4("127.0.0.1", std.mem.bigToNative(u16, addr.port)));
-    const n = c.recv(catcher, buf.ptr, buf.len, 0);
-    endpoint.stop();
-    try loop.run(.until_done);
-    if (n <= 0) return error.ReceiveFailed;
-    return buf[0..@intCast(n)];
-}
-
-/// Sends `packet` from `fd` to `to`, and waits up to `ms` for anything
-/// back.
-fn answered(fd: posix.fd_t, packet: []const u8, to: c.sockaddr.in, ms: i32) bool {
-    if (c.sendto(fd, packet.ptr, packet.len, 0, @ptrCast(&to), @sizeOf(c.sockaddr.in)) != packet.len) return false;
-    return receive(fd, ms) != null;
-}
-
-/// The length of a datagram that arrives on `fd` within `ms`.
-fn receive(fd: posix.fd_t, ms: i32) ?usize {
-    var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
-    if (c.poll(&fds, 1, ms) != 1) return null;
-    var buf: [2048]u8 = undefined;
-    const n = c.recv(fd, &buf, buf.len, 0);
-    return if (n > 0) @intCast(n) else null;
 }
 
 // From `ssh-keygen -t ed25519`, with no passphrase and with "correct horse".

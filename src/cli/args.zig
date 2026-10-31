@@ -42,17 +42,8 @@ pub const Args = struct {
     print_config: bool = false,
     /// `--version` or `-V`.
     version: bool = false,
-    /// `--yes`: no questions before installing or uninstalling.
-    yes: bool = false,
-    /// `--server`.
-    server_command: ?[]const u8 = null,
-    /// `--ssh`.
-    ssh_path: []const u8 = "ssh",
     /// The letters of ssh's options ignored with a warning.
     ignored: []const u8 = "",
-    /// The words of ssh's options, in order, for an ssh that tx runs with
-    /// them. tx's own options are left out.
-    ssh_options: []const []const u8 = &.{},
 };
 
 pub const Mode = union(enum) {
@@ -67,8 +58,6 @@ pub const Mode = union(enum) {
     list,
     /// `--kill ID`.
     kill: u64,
-    /// `--uninstall`.
-    uninstall,
 };
 
 pub const Family = enum { ip4, ip6 };
@@ -101,9 +90,6 @@ const State = struct {
     modes: usize = 0,
     key_files: std.ArrayList([]const u8) = .empty,
     ignored: std.ArrayList(u8) = .empty,
-    ssh_options: std.ArrayList([]const u8) = .empty,
-    /// The first word not yet put in `ssh_options` or passed over.
-    recorded: usize = 0,
     /// For `error.Usage` and `error.Unsupported`.
     problem: []const u8 = "",
 
@@ -115,7 +101,6 @@ const State = struct {
         if (s.p.index < s.p.args.len) {
             try s.destination(s.p.args[s.p.index]);
             s.p.index += 1;
-            s.recorded = s.p.index;
             if (!s.p.ended) try s.options();
         }
 
@@ -124,43 +109,22 @@ const State = struct {
             s.args.command = try std.mem.join(s.arena, " ", words);
             s.modes += 1;
         }
-        if (s.modes > 1) return s.usage("a command, --attach, --new, --list, --kill and --uninstall don't go together");
+        if (s.modes > 1) return s.usage("a command, --attach, --new, --list and --kill don't go together");
         if (s.args.host.len == 0 and !s.args.version) return s.usage("no host");
 
         s.args.key_files = s.key_files.items;
         s.args.ignored = s.ignored.items;
-        s.args.ssh_options = s.ssh_options.items;
     }
 
     /// Reads options until the first operand, or `--`.
     fn options(s: *State) Error!void {
         while (true) {
-            const item = (s.p.next() catch |err| return s.optionError(err)) orelse {
-                // Passes over `--`.
-                s.recorded = s.p.index;
-                return;
-            };
+            const item = (s.p.next() catch |err| return s.optionError(err)) orelse return;
             switch (item) {
-                .short => |o| {
-                    try s.short(o);
-                    try s.record(.ssh);
-                },
-                .long => |name| {
-                    try s.long(name);
-                    try s.record(.own);
-                },
+                .short => |o| try s.short(o),
+                .long => |name| try s.long(name),
             }
         }
-    }
-
-    /// Puts the words of the option just read in `ssh_options`, if it is
-    /// ssh's.
-    fn record(s: *State, whose: enum { ssh, own }) Error!void {
-        // A group of letters being read ends in the current word.
-        const end = if (s.p.offset > 0) s.p.index + 1 else s.p.index;
-        if (end <= s.recorded) return;
-        if (whose == .ssh) try s.ssh_options.appendSlice(s.arena, s.p.args[s.recorded..end]);
-        s.recorded = end;
     }
 
     fn optionError(s: *State, err: getopt.Error) Error {
@@ -221,8 +185,6 @@ const State = struct {
             .list
         else if (eql(name, "kill"))
             .{ .kill = try s.sessionId() }
-        else if (eql(name, "uninstall"))
-            .uninstall
         else
             null;
         if (mode) |m| {
@@ -231,13 +193,7 @@ const State = struct {
             return;
         }
 
-        if (eql(name, "yes")) {
-            s.args.yes = true;
-        } else if (eql(name, "server")) {
-            s.args.server_command = try s.value(name);
-        } else if (eql(name, "ssh")) {
-            s.args.ssh_path = try s.value(name);
-        } else if (eql(name, "version")) {
+        if (eql(name, "version")) {
             s.args.version = true;
         } else {
             return s.usage(try std.fmt.allocPrint(s.arena, "unknown option --{s}", .{name}));
@@ -417,21 +373,6 @@ test "options group, take joined values, and come after the destination too" {
     try testing.expectEqualStrings("-p 22", ended.command.?);
 }
 
-test "ssh's options are kept for an ssh that tx runs, without tx's own" {
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    const a = try expectArgs(&arena, &.{ "-tp", "22", "--yes", "-oUser=ro", "--", "example.com", "-v", "ls" });
-    try testing.expectEqual(3, a.ssh_options.len);
-    try testing.expectEqualStrings("-tp", a.ssh_options[0]);
-    try testing.expectEqualStrings("22", a.ssh_options[1]);
-    try testing.expectEqualStrings("-oUser=ro", a.ssh_options[2]);
-    try testing.expectEqualStrings("-v ls", a.command.?);
-
-    const after = try expectArgs(&arena, &.{ "example.com", "-i", "key", "--list" });
-    try testing.expectEqual(2, after.ssh_options.len);
-    try testing.expectEqualStrings("key", after.ssh_options[1]);
-}
-
 test "the first user and port given win" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -455,12 +396,10 @@ test "ssh URIs" {
 test "tx's own options, and modes that exclude each other" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const a = try expectArgs(&arena, &.{ "--attach", "3", "--yes", "--ssh", "/bin/ssh", "example.com" });
+    const a = try expectArgs(&arena, &.{ "--attach", "3", "example.com" });
     try testing.expectEqual(3, a.mode.attach);
-    try testing.expect(a.yes);
-    try testing.expectEqualStrings("/bin/ssh", a.ssh_path);
 
-    try testing.expectEqualStrings("a command, --attach, --new, --list, --kill and --uninstall don't go together", (try parse(arena.allocator(), &.{ "--list", "example.com", "ls" })).usage);
+    try testing.expectEqualStrings("a command, --attach, --new, --list and --kill don't go together", (try parse(arena.allocator(), &.{ "--list", "example.com", "ls" })).usage);
     try testing.expectEqualStrings("unknown option --frobnicate", (try parse(arena.allocator(), &.{ "--frobnicate", "example.com" })).usage);
     try testing.expectEqualStrings("unknown option -Z", (try parse(arena.allocator(), &.{ "-Z", "example.com" })).usage);
     try testing.expectEqualStrings("-p needs a value", (try parse(arena.allocator(), &.{"-p"})).usage);

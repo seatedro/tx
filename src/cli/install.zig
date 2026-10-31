@@ -1,6 +1,6 @@
 //! `txd --install`: keeps txd running for the user, and
-//! starts it if it isn't running. tx runs it over ssh the first time it
-//! connects to a host, and whenever nothing answers on the server's port.
+//! starts it if it isn't running. `install.sh --txd` runs it after it
+//! installs txd.
 //!
 //! On Linux with a systemd user manager, it installs the user service
 //! `txd.service` and turns on lingering, so that the user's manager
@@ -124,7 +124,7 @@ fn systemd(gpa: Allocator, io: Io, environ: *const Environ.Map, options: Options
     if (!try succeeds(gpa, io, &.{ "systemctl", "--user", "--quiet", "show-environment" }, .quiet)) return null;
 
     // Without lingering, the user's manager stops at their last logout,
-    // with its services. tx's ssh logs out right after this runs.
+    // with its services, such as when the ssh session this runs in ends.
     const linger = try output(gpa, io, &.{ "loginctl", "show-user", options.user, "--property=Linger", "--value" }, .quiet);
     defer if (linger) |text| gpa.free(text);
     const lingering = if (linger) |text| std.mem.eql(u8, std.mem.trim(u8, text, " \n"), "yes") else false;
@@ -214,7 +214,7 @@ fn launchd(gpa: Allocator, io: Io, environ: *const Environ.Map, options: Options
 }
 
 /// Starts the server in its own process group, with its output going to
-/// `txd.log` in the state directory. It outlives the ssh session
+/// `txd.log` in the state directory. It outlives the login that started it
 /// unless logind kills a user's processes at logout (`KillUserProcesses`).
 fn background(gpa: Allocator, io: Io, environ: *const Environ.Map, options: Options) !Start {
     if (serving(options.listen)) return .serving;
@@ -251,9 +251,11 @@ fn background(gpa: Allocator, io: Io, environ: *const Environ.Map, options: Opti
 /// Undoes `install`. Stops txd: its service, or the server it started in
 /// the background. Turns lingering off if `install` turned it on. Ends the
 /// sessions, as `tx --kill` does. Then removes txd's files in the state
-/// directory, the default host key, the SPA key and the log, and last
-/// `~/.local/share/tx`, where tx puts txd. A key given with `--key` and
-/// `~/.config/tx/authorized_keys` stay.
+/// directory, the default host key and the log, and last
+/// `~/.local/share/tx`, with the terminfo entries txd compiled, and the
+/// copies of txd that older versions of tx put there over ssh. A key given
+/// with `--key`, `~/.config/tx/authorized_keys`, and the tx and txd that
+/// were installed stay.
 ///
 /// Each step must succeed before the next. Nothing is removed while
 /// something still has the port of `listen`, the address the server was
@@ -277,6 +279,7 @@ pub fn uninstall(gpa: Allocator, io: Io, environ: *const Environ.Map, user: []co
     // after a failure the next uninstall has a txd to run. The binary
     // running this keeps running.
     const dir = Io.Dir.cwd();
+    // `spa_key` is an older txd's.
     for ([_][]const u8{ "host_key", "spa_key", name ++ ".log" }) |file| {
         const path = try paths.state(gpa, environ, file);
         defer gpa.free(path);

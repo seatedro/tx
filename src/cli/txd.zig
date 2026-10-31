@@ -1,31 +1,30 @@
 //! txd: serves the user's sessions over QUIC.
 //!
-//! Usage: txd [--listen ADDRESS:PORT] [--key PATH] [--open]
-//!            [--print-host-key] [--print-spa-key] [--install]
-//!        txd [--listen ADDRESS:PORT] --uninstall
+//! Usage: txd [--listen ADDRESS:PORT | --listen tailnet[:PORT]] [--key PATH]
+//!            [--print-host-key] [--install]
+//!        txd [--listen ...] --uninstall
 //!        txd --version
 //!        txd --session --fd N
 //!
 //! Personal mode: clients log in as the user running txd, with a key
 //! from `~/.config/tx/authorized_keys` if that file exists, or else from
-//! `~/.ssh/authorized_keys`. It listens on every address by default.
+//! `~/.ssh/authorized_keys`.
+//!
+//! `--listen tailnet` listens only on Tailscale's addresses and loopback,
+//! so that only the tailnet's members and this machine reach txd (see
+//! `server.addresses`). It is the default on a machine where Tailscale is
+//! up. Elsewhere the default is every address.
 //!
 //! `--print-host-key` prints the public host key as `ssh-ed25519 AAAA...`
-//! and exits, creating the key if there is none. `tx` runs it over ssh to
-//! learn a new host's key.
+//! and exits, creating the key if there is none.
 //!
-//! txd answers only clients that hold its SPA key (see
-//! `transport.spa`), kept in `spa_key` next to the default host key.
-//! To anyone else the port looks closed. `--print-spa-key` prints
-//! `spa-key KEY TIME`, the key in base64 and txd's clock in Unix seconds,
-//! creating the key if there is none. `tx` runs it over ssh with
-//! `--print-host-key`. `--open` answers every client.
-//!
-//! `--install` sets up a service that keeps txd running with the
-//! given `--listen`, `--key` and `--open`, starts it if it isn't running,
-//! and exits; see `install.zig`. With `--print-host-key` or
-//! `--print-spa-key`, those are printed first. `--uninstall` stops txd,
-//! ends its sessions, and removes the service and txd's files.
+//! `--install` sets up a service that keeps txd running with the given
+//! `--listen` and `--key`, starts it if it isn't running, prints the host
+//! key's fingerprint, and exits; see `install.zig`. Without `--listen`,
+//! the service gets the default as it is when `--install` runs, so that
+//! it doesn't depend on whether Tailscale is up when the service starts.
+//! `--uninstall` stops txd, ends its sessions, and removes the service and
+//! txd's files.
 //!
 //! `--session` runs one session, on the socket txd passes as fd N. txd
 //! starts it; see `session.process`.
@@ -41,6 +40,7 @@ const build_options = @import("build_options");
 const install = @import("install.zig");
 const keyfile = @import("keyfile.zig");
 const paths = @import("paths.zig");
+const Scope = server_pkg.addresses.Scope;
 
 /// Below the ephemeral port ranges of Linux and macOS.
 pub const default_port = 8739;
@@ -61,10 +61,10 @@ pub fn main(init: std.process.Init) !u8 {
 
     // Options. `::` covers every IPv4 and IPv6 address.
     var listen: Io.net.IpAddress = try .parseIp6("::", default_port);
+    // Null until `--listen` picks.
+    var scope: ?Scope = null;
     var key_path: ?[]const u8 = null;
     var print_host_key = false;
-    var print_spa_key = false;
-    var open = false;
     var install_service = false;
     var uninstall = false;
     // `--listen` and `--key` as given, for the service.
@@ -74,17 +74,19 @@ pub fn main(init: std.process.Init) !u8 {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "--listen") and i + 1 < args.len) {
             i += 1;
-            listen = Io.net.IpAddress.parseLiteral(args[i]) catch return usage("invalid address");
+            if (parseTailnet(args[i])) |port| {
+                listen.setPort(port orelse return usage("invalid port"));
+                scope = .tailnet;
+            } else {
+                listen = Io.net.IpAddress.parseLiteral(args[i]) catch return usage("invalid address");
+                scope = .all;
+            }
             listen_arg = args[i];
         } else if (std.mem.eql(u8, arg, "--key") and i + 1 < args.len) {
             i += 1;
             key_path = args[i];
         } else if (std.mem.eql(u8, arg, "--print-host-key")) {
             print_host_key = true;
-        } else if (std.mem.eql(u8, arg, "--print-spa-key")) {
-            print_spa_key = true;
-        } else if (std.mem.eql(u8, arg, "--open")) {
-            open = true;
         } else if (std.mem.eql(u8, arg, "--install")) {
             install_service = true;
         } else if (std.mem.eql(u8, arg, "--uninstall")) {
@@ -102,7 +104,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     // Before the keys, which it removes.
     if (uninstall) {
-        if (install_service or print_host_key or print_spa_key or key_path != null or open) return usage("--uninstall goes with --listen only");
+        if (install_service or print_host_key or key_path != null) return usage("--uninstall goes with --listen only");
         install.uninstall(gpa, io, init.environ_map, user, listen) catch |err| {
             std.debug.print("txd: --uninstall failed: {t}\n", .{err});
             return 1;
@@ -116,38 +118,35 @@ pub fn main(init: std.process.Init) !u8 {
     const path = key_path orelse try paths.state(gpa, init.environ_map, "host_key");
     defer if (key_path == null) gpa.free(path);
     const identity = try keyfile.loadOrCreate(io, path);
-    const spa_path = try paths.state(gpa, init.environ_map, "spa_key");
-    defer gpa.free(spa_path);
-    var spa_key = try keyfile.loadOrCreateSecret(io, spa_path);
-    defer std.crypto.secureZero(u8, &spa_key);
+    const fingerprint = auth.Fingerprint.init(identity.public_key.toBytes());
 
-    if (print_host_key or print_spa_key) {
+    if (print_host_key) {
         var buf: [256]u8 = undefined;
         var w = Io.File.stdout().writerStreaming(io, &buf);
-        if (print_host_key) {
-            try w.interface.print("{s} {s}\n", .{ auth.ssh.ed25519, auth.ssh.KeyText.init(identity.public_key.toBytes()).slice() });
-        }
-        if (print_spa_key) {
-            var text: [std.base64.standard.Encoder.calcSize(spa_key.len)]u8 = undefined;
-            _ = std.base64.standard.Encoder.encode(&text, &spa_key);
-            try w.interface.print("spa-key {s} {d}\n", .{ &text, Io.Clock.real.now(io).toSeconds() });
-        }
+        try w.interface.print("{s} {s}\n", .{ auth.ssh.ed25519, auth.ssh.KeyText.init(identity.public_key.toBytes()).slice() });
         try w.interface.flush();
         if (!install_service) return 0;
     }
+
+    // Without `--listen`, the tailnet if Tailscale is up.
+    const listen_scope = scope orelse if (server_pkg.addresses.hasTailnet(gpa) catch false) Scope.tailnet else Scope.all;
 
     if (install_service) {
         const arena = init.arena.allocator();
         const exe = try install.exePath(arena, io, init.environ_map, args[0]);
 
+        // The scope as it is now, which the service keeps.
         var service_args: std.ArrayList([]const u8) = .empty;
-        if (listen_arg) |text| try service_args.appendSlice(arena, &.{ "--listen", text });
+        const listen_text = listen_arg orelse switch (listen_scope) {
+            .tailnet => "tailnet",
+            .all => try std.fmt.allocPrint(arena, "{f}", .{listen}),
+        };
+        try service_args.appendSlice(arena, &.{ "--listen", listen_text });
         if (key_path) |p| {
             // The service may start in another directory.
             const cwd = try std.process.currentPathAlloc(io, arena);
             try service_args.appendSlice(arena, &.{ "--key", try std.fs.path.resolve(arena, &.{ cwd, p }) });
         }
-        if (open) try service_args.append(arena, "--open");
 
         install.install(gpa, io, init.environ_map, .{
             .exe = exe,
@@ -158,6 +157,11 @@ pub fn main(init: std.process.Init) !u8 {
             std.debug.print("txd: --install failed: {t}\n", .{err});
             return 1;
         };
+        switch (listen_scope) {
+            .tailnet => std.debug.print("txd: listening on the tailnet only, port {d}\n", .{listen.getPort()}),
+            .all => std.debug.print("txd: listening on {f}\n", .{listen}),
+        }
+        std.debug.print("txd: host key {s}, which tx shows the first time it connects\n", .{fingerprint.slice()});
         return 0;
     }
     const tx_authorized_keys = try paths.config(gpa, init.environ_map, "authorized_keys");
@@ -207,6 +211,7 @@ pub fn main(init: std.process.Init) !u8 {
     var server: server_pkg.Server = undefined;
     server.init(gpa, io, &loop, .{
         .listen = listen,
+        .scope = listen_scope,
         .runtime_dir = runtime_dir,
         .session_exe = session_exe,
         .identity = identity,
@@ -218,7 +223,6 @@ pub fn main(init: std.process.Init) !u8 {
         .shell = shell,
         .terminfo_dir = terminfo_dir,
         .cwd = if (init.environ_map.get("HOME")) |home| .{ .path = home } else .inherit,
-        .spa_key = if (open) null else spa_key,
         .wayland_socket = wayland_socket,
     }) catch |err| switch (err) {
         error.AddressInUse => {
@@ -233,13 +237,28 @@ pub fn main(init: std.process.Init) !u8 {
     };
     defer server.deinit();
 
-    std.log.info("serving {s}, host key {s}", .{ user, auth.Fingerprint.init(identity.public_key.toBytes()).slice() });
+    std.log.info("serving {s}{s}, host key {s}", .{ user, if (listen_scope == .tailnet) " on the tailnet" else "", fingerprint.slice() });
     try loop.run(.until_done);
     return 0;
 }
 
+/// The port of `tailnet` or `tailnet:PORT`, null in it if the port is
+/// invalid. Null for any other text.
+fn parseTailnet(text: []const u8) ?(?u16) {
+    if (std.mem.eql(u8, text, "tailnet")) return default_port;
+    if (!std.mem.startsWith(u8, text, "tailnet:")) return null;
+    return std.fmt.parseInt(u16, text["tailnet:".len..], 10) catch @as(?u16, null);
+}
+
+test parseTailnet {
+    try std.testing.expectEqual(@as(?(?u16), default_port), parseTailnet("tailnet"));
+    try std.testing.expectEqual(@as(?(?u16), 9000), parseTailnet("tailnet:9000"));
+    try std.testing.expectEqual(@as(?(?u16), @as(?u16, null)), parseTailnet("tailnet:x"));
+    try std.testing.expectEqual(@as(?(?u16), null), parseTailnet("[::]:8739"));
+}
+
 fn usage(reason: []const u8) u8 {
-    std.debug.print("txd: {s}\nusage: txd [--listen ADDRESS:PORT] [--key PATH] [--open] [--print-host-key] [--print-spa-key] [--install]\n       txd [--listen ADDRESS:PORT] --uninstall\n       txd --version\n       txd --session --fd N\n", .{reason});
+    std.debug.print("txd: {s}\nusage: txd [--listen ADDRESS:PORT | --listen tailnet[:PORT]] [--key PATH] [--print-host-key] [--install]\n       txd [--listen ...] --uninstall\n       txd --version\n       txd --session --fd N\n", .{reason});
     return 2;
 }
 
