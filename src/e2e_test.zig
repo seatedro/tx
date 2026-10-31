@@ -1701,6 +1701,28 @@ test "a client logging in as another user is refused" {
     try testing.expectEqualStrings("the server accepted none of the keys for root", outcome.refused.message.slice());
 }
 
+test "a login that names no user is to the server's account" {
+    transport.crypto.init(testing.io);
+    var environ: std.process.Environ.Map = .init(gpa);
+    defer environ.deinit();
+    var login: Login = undefined;
+    try login.init(null);
+    defer login.deinit();
+    var st: ServerThread = undefined;
+    try st.init(try login.serverOptions(&environ, &.{ "/bin/sh", "-c", "sleep 10" }));
+    defer st.deinit();
+
+    var pty: TestPty = try .open();
+    defer pty.close();
+    var ct: ClientThread = .{ .options = login.clientOptions(&st, &pty, &.{login.key.public_key.toBytes()}) };
+    ct.options.user = "";
+    ct.options.command = .list;
+    try ct.start();
+    const listed = (try ct.join(&pty)).listed;
+    defer gpa.free(listed);
+    try testing.expectEqual(0, listed.len);
+}
+
 test "a refused signature fails the login" {
     transport.crypto.init(testing.io);
     var environ: std.process.Environ.Map = .init(gpa);

@@ -44,6 +44,8 @@ with the host's `tic`; without it, the session's `TERM` is `xterm-256color`.
 
 tx logs in with the same keys as ssh: the SSH agent's Ed25519 and RSA keys,
 then `~/.ssh/id_ed25519`. txd accepts the keys in `~/.ssh/authorized_keys`.
+Without a user from `-l`, the destination or ssh's config, tx names none,
+and txd logs you in to the account it runs as.
 
 The first time tx connects to a host, it shows the host's key fingerprint
 and asks whether to trust it, as ssh does. `txd --install` prints the same
