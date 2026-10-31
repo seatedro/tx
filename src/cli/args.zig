@@ -34,6 +34,9 @@ pub const Args = struct {
     family: ?Family = null,
     /// `-i` and `IdentityFile`, in order.
     key_files: []const []const u8 = &.{},
+    /// `-F`: ssh's config file, or `none`. The last one given wins, as in
+    /// ssh.
+    ssh_config: ?[]const u8 = null,
     /// `-e`. Null turns the escape character off.
     escape_char: ?u8 = '~',
     /// `-n`: stdin from /dev/null.
@@ -149,6 +152,7 @@ const State = struct {
             '4' => s.args.family = .ip4,
             '6' => s.args.family = .ip6,
             'i' => try s.key_files.append(s.arena, o.value.?),
+            'F' => s.args.ssh_config = o.value.?,
             'e' => s.args.escape_char = escapeChar(o.value.?) catch return s.usage("invalid escape character"),
             'n' => s.args.no_stdin = true,
             'o' => try s.config(o.value.?),
@@ -161,9 +165,9 @@ const State = struct {
             // a log file, and a Match tag.
             '2', 'a', 'x', 'k', 'K', 'C', 'q', 'v', 'y', 'g', 'c', 'm', 'b', 'B', 'E', 'P' => {},
 
-            // Agent and X11 forwarding, ssh_config, and PKCS#11 keys. The
-            // connection goes ahead without them.
-            'A', 'X', 'Y', 'F', 'I' => try s.ignored.append(s.arena, o.letter),
+            // Agent and X11 forwarding, and PKCS#11 keys. The connection
+            // goes ahead without them.
+            'A', 'X', 'Y', 'I' => try s.ignored.append(s.arena, o.letter),
 
             // Protocol 1, forwards, jump hosts, no command, going to the
             // background, connection sharing, tunnels, subsystems such as
@@ -371,6 +375,15 @@ test "options group, take joined values, and come after the destination too" {
     const ended = try expectArgs(&arena, &.{ "--", "example.com", "-p", "22" });
     try testing.expectEqual(null, ended.port);
     try testing.expectEqualStrings("-p 22", ended.command.?);
+}
+
+test "-F names ssh's config, and the last one given wins" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqual(null, (try expectArgs(&arena, &.{"example.com"})).ssh_config);
+    const a = try expectArgs(&arena, &.{ "-F", "first", "-Fsecond", "example.com" });
+    try testing.expectEqualStrings("second", a.ssh_config.?);
+    try testing.expectEqualStrings("", a.ignored);
 }
 
 test "the first user and port given win" {

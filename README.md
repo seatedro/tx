@@ -33,9 +33,14 @@ service for your user. Run it again to upgrade; sessions keep running.
 tx takes ssh's options, read as ssh reads them, so tools that run ssh can
 run tx: `GIT_SSH_COMMAND=tx git clone ssh://host/repo`, `rsync -e tx`. `-p`
 is txd's port. Options for features tx lacks, such as `-L`, are refused.
-tx connects to the `HostName`, as the `User`, that ssh's config gives the
-host, as `ssh -G` prints them, so `tx pulsar` reaches what `ssh pulsar`
-does.
+
+tx reads ssh's config itself, after its own, `~/.config/tx/config`, which
+has the same format, so `tx pulsar` reaches what `ssh pulsar` does. From
+both it takes `Host`, `Match`, `Include`, `HostName`, `User`,
+`IdentityFile`, `IdentitiesOnly`, `IdentityAgent` and `ProxyJump`, and from
+tx's alone, `Port`, since the port in ssh's is sshd's. `-F` names another
+ssh config. tx can't go through a `ProxyJump` host yet; it warns, and
+connects directly.
 
 `~.` detaches. A new session gets the client's `TERM`, `COLORTERM`, `LANG`
 and `LC_*`, and the terminfo entry for its `TERM`, so `xterm-ghostty` and
@@ -43,7 +48,8 @@ and `LC_*`, and the terminfo entry for its `TERM`, so `xterm-ghostty` and
 with the host's `tic`; without it, the session's `TERM` is `xterm-256color`.
 
 tx logs in with the same keys as ssh: the SSH agent's Ed25519 and RSA keys,
-then `~/.ssh/id_ed25519`. txd accepts the keys in `~/.ssh/authorized_keys`.
+then the `IdentityFile`s, or else `~/.ssh/id_ed25519`. txd accepts the keys
+in `~/.ssh/authorized_keys`.
 Without a user from `-l`, the destination or ssh's config, tx names none,
 and txd logs you in to the account it runs as.
 
