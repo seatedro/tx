@@ -49,8 +49,10 @@ and txd logs you in to the account it runs as.
 
 The first time tx connects to a host, it shows the host's key fingerprint
 and asks whether to trust it, as ssh does. `txd --install` prints the same
-fingerprint on the host. A key that `~/.ssh/known_hosts` lists for the host
-is trusted without asking. tx records the key in `~/.config/tx/known_hosts`.
+fingerprint on the host. tx trusts the key without asking when
+`~/.ssh/known_hosts` lists it for the host, or when Tailscale says the host
+is one of your own nodes: yours, and not tagged. tx records the key in
+`~/.config/tx/known_hosts`.
 
 ### Clipboard
 

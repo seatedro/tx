@@ -30,9 +30,10 @@
 //! The server's key is checked against `~/.config/tx/known_hosts` and
 //! `~/.ssh/known_hosts`. For a host the first doesn't list, tx learns the
 //! key the server presents, and trusts it if the second lists it, as it
-//! does for a txd that uses sshd's key, or else asks, as ssh does. A txd
-//! that runs as the user has a key of its own, which `txd --install`
-//! prints. The key is added to the first file.
+//! does for a txd that uses sshd's key, or if Tailscale says the host is
+//! one of the user's own nodes (see `tailscale.zig`). Otherwise it asks, as
+//! ssh does. A txd that runs as the user has a key of its own, which
+//! `txd --install` prints. The key is added to the first file.
 //!
 //! When nothing answers, tx says how to install txd on the host.
 //!
@@ -57,6 +58,7 @@ const build_options = @import("build_options");
 const transport = @import("transport");
 const paths = @import("paths.zig");
 const ssh_config = @import("ssh_config.zig");
+const tailscale = @import("tailscale.zig");
 const args_pkg = @import("args.zig");
 
 const CloseReason = transport.endpoint.CloseReason;
@@ -518,8 +520,9 @@ const Trust = union(enum) {
 
 /// The keys tx accepts from the host: the ones tx's known_hosts lists, with
 /// those ssh's lists. For a host tx's doesn't list, the key the host
-/// presents, if ssh's known_hosts lists it or the user accepts it, which is
-/// then recorded in `tx_known_hosts`.
+/// presents, if ssh's known_hosts lists it, Tailscale says the host is the
+/// user's, or the user accepts it, which is then recorded in
+/// `tx_known_hosts`.
 fn trustedKeys(
     gpa: Allocator,
     io: Io,
@@ -555,9 +558,15 @@ fn trustedKeys(
             return .declined;
         },
         .listed => std.debug.print("tx: {s}'s key is one ~/.ssh/known_hosts lists\n", .{name}),
-        .unknown => if (!try confirm(io, name, found.address, key)) {
-            std.debug.print("tx: host key verification failed\n", .{});
-            return .declined;
+        .unknown => {
+            var arena: std.heap.ArenaAllocator = .init(gpa);
+            defer arena.deinit();
+            if (tailscale.ownNode(arena.allocator(), io, found.address)) |node| {
+                std.debug.print("tx: Tailscale says {s} is {s}, a node of yours\n", .{ name, node });
+            } else if (!try confirm(io, name, found.address, key)) {
+                std.debug.print("tx: host key verification failed\n", .{});
+                return .declined;
+            }
         },
     }
     try auth.known_hosts.append(io, tx_known_hosts, name, key);
@@ -645,4 +654,5 @@ test {
     _ = args_pkg;
     _ = @import("getopt.zig");
     _ = ssh_config;
+    _ = tailscale;
 }
