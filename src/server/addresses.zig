@@ -1,7 +1,3 @@
-//! The addresses a wildcard listen covers. root.zig binds one endpoint per
-//! address, and calls interfaces again every rescan_ms to follow interfaces
-//! that come and go. Scope.tailnet narrows them to Tailscale's and loopback.
-
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -27,7 +23,6 @@ extern "c" fn freeifaddrs(ifa: ?*Ifaddrs) void;
 // IFF_UP from <net/if.h>.
 const iff_up = 0x1;
 
-/// 0.0.0.0 or ::. src/cli/install.zig has its own copy of this check.
 pub fn isWildcard(address: IpAddress) bool {
     return switch (address) {
         .ip4 => |a| std.mem.allEqual(u8, &a.bytes, 0),
@@ -40,8 +35,6 @@ pub fn covers(wildcard: IpAddress, address: IpAddress) bool {
     return wildcard == .ip6 or address == .ip4;
 }
 
-/// Compares the family and the address bytes. Ports and IPv6 scopes are
-/// ignored.
 pub fn eql(a: IpAddress, b: IpAddress) bool {
     return switch (a) {
         .ip4 => |x| b == .ip4 and std.mem.eql(u8, &x.bytes, &b.ip4.bytes),
@@ -49,7 +42,6 @@ pub fn eql(a: IpAddress, b: IpAddress) bool {
     };
 }
 
-/// Which interfaces a wildcard listen uses. Loopback is in both.
 pub const Scope = enum {
     all,
     tailnet,
@@ -60,9 +52,6 @@ const Entry = struct {
     address: IpAddress,
 };
 
-/// The addresses of up interfaces that wildcard covers under scope, with the
-/// wildcard's port. Link-local IPv6 addresses are left out. The caller frees
-/// the slice.
 pub fn interfaces(gpa: Allocator, wildcard: IpAddress, scope: Scope) ![]IpAddress {
     var list: ?*Ifaddrs = null;
     if (getifaddrs(&list) != 0) return error.GetIfaddrsFailed;
@@ -73,7 +62,6 @@ pub fn interfaces(gpa: Allocator, wildcard: IpAddress, scope: Scope) ![]IpAddres
     return select(gpa, entries, wildcard, scope);
 }
 
-/// Whether an up interface belongs to Tailscale.
 pub fn hasTailnet(gpa: Allocator) !bool {
     var list: ?*Ifaddrs = null;
     if (getifaddrs(&list) != 0) return error.GetIfaddrsFailed;

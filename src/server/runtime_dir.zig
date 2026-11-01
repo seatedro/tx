@@ -48,13 +48,10 @@ pub fn checkMode(mode: posix.mode_t, owner: posix.uid_t, uid: posix.uid_t) bool 
     return posix.S.ISDIR(mode) and owner == uid and mode & 0o077 == 0;
 }
 
-/// The path session id's process listens on, written into buf.
 pub fn socketPath(buf: []u8, dir: []const u8, id: u64) error{NameTooLong}![]const u8 {
     return std.fmt.bufPrint(buf, "{s}/{d}.sock", .{ dir, id }) catch error.NameTooLong;
 }
 
-/// The IDs of the sockets in the directory, in ascending order. The caller
-/// frees the slice.
 pub fn ids(gpa: Allocator, io: Io, path: []const u8) ![]u64 {
     var dir = try Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
     defer dir.close(io);
@@ -76,7 +73,6 @@ pub fn parseName(name: []const u8) ?u64 {
     return std.fmt.parseInt(u64, digits, 10) catch null;
 }
 
-/// Unlinks session id's socket, for a socket whose process is gone.
 pub fn remove(dir: []const u8, id: u64) void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = socketPath(buf[0 .. buf.len - 1], dir, id) catch return;

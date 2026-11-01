@@ -1,17 +1,3 @@
-//! txd's server. It accepts QUIC connections, logs clients in, and connects
-//! them to session processes.
-//!
-//! A client logs in by signing a login.Transcript with a key from
-//! authorized_keys, or by resuming a session, whose process checks the resume
-//! proof. The server relays frames between the client's main stream and the
-//! session process. A new session's process is reached over the socketpair it
-//! was spawned with, and an existing one's over the unix socket it listens on
-//! in the runtime directory (runtime_dir.zig). A command without a terminal
-//! runs in an Exec (exec.zig). A Query asks every session for its SessionInfo,
-//! to list them or to find the detached one to reuse. terminfo.zig compiles
-//! the terminfo entry a client sends. On Linux the server also runs a Wayland
-//! clipboard server for programs in sessions (clipboard.zig).
-
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
@@ -42,38 +28,24 @@ const unix = session.unix;
 const log = std.log.scoped(.server);
 
 pub const Options = struct {
-    /// A wildcard address listens on each interface address that scope
-    /// selects.
     listen: IpAddress,
     scope: addresses.Scope = .all,
-    /// The host key.
     identity: Ed25519.KeyPair,
     /// The account txd serves. A login that names a user must name this one.
     user: []const u8,
-    /// Paths of authorized_keys files.
     authorized_keys: []const []const u8,
     runtime_dir: []const u8,
-    /// The txd binary that runs as each session process.
     session_exe: []const u8,
-    /// Becomes the session processes' stderr. Null leaves them txd's.
     session_log: ?posix.fd_t = null,
-    /// The environment every program starts from.
     environ: *const std.process.Environ.Map,
-    /// Runs commands as `shell -c command`.
     shell: []const u8 = "/bin/sh",
-    /// Where clients' terminfo entries are compiled. Null leaves TERM as the
-    /// client sent it.
     terminfo_dir: ?[]const u8 = null,
-    /// The argv of a session without a command. The session runs program, or
-    /// argv[0] when program is null. A name without a '/' is looked up in PATH.
     argv: []const []const u8,
     program: ?[]const u8 = null,
     cwd: std.process.Child.Cwd = .inherit,
     terminal: session.host.Options.TerminalOptions = .{},
     idle_timeout_ns: u64 = 30 * std.time.ns_per_s,
-    /// Limits on connections that haven't logged in.
     pending: transport.pending.Limits = .{},
-    /// Where the Wayland clipboard server listens, on Linux. Null starts none.
     wayland_socket: ?[]const u8 = null,
 };
 
@@ -90,18 +62,13 @@ const display_defaults = [_]struct { []const u8, []const u8 }{
     .{ "QT_QPA_PLATFORM", "xcb" },
 };
 
-/// The codes of the Error messages the server sends.
 pub const ErrorCode = proto.ErrorCode;
 
-// Unacked bytes on a client's main stream above which reading from its session
-// pauses, and at or below which it resumes.
 const high_water = 1 << 20;
 const low_water = 256 << 10;
 
-// Sessions that don't answer List within this are left out.
 const query_timeout_ms = 1000;
 
-// The largest message body from a client that has logged in.
 const max_message = 1 << 20;
 
 // The largest message body before login, to bound what an unauthenticated
@@ -127,14 +94,10 @@ pub const Server = struct {
     tls: transport.quic.Server,
     pending: transport.pending.Pending,
     endpoints: std.ArrayList(*Endpoint) = .empty,
-    // Endpoints whose address went away, freed once they have stopped.
     retired: std.ArrayList(*Endpoint) = .empty,
-    // Set for a wildcard listen.
     rescan: ?Rescan = null,
-    /// Every Exec until it is freed, including those whose client is gone.
     execs: std.ArrayList(*Exec) = .empty,
     stopping: bool = false,
-    // newId raises it above the IDs in the runtime directory.
     next_id: u64 = 1,
     clipboard: ?*Clipboard = null,
 
@@ -187,13 +150,10 @@ pub const Server = struct {
         };
     }
 
-    /// The first endpoint's address, with the port the kernel chose for port 0.
     pub fn address(self: *const Server) IpAddress {
         return self.endpoints.items[0].local;
     }
 
-    /// Kills running commands, and closes the clipboard server and every
-    /// endpoint with its connections.
     pub fn stop(self: *Server) void {
         self.stopping = true;
         for (self.execs.items) |e| e.kill();
@@ -252,8 +212,6 @@ pub const Server = struct {
         self.gpa.destroy(e);
     }
 
-    // Retires endpoints whose address is gone and listens on new addresses.
-    // Returns how many addresses were in use.
     fn updateAddresses(self: *Server, when: enum { initial, rescan }) !usize {
         const r = &self.rescan.?;
         const found = try addresses.interfaces(self.gpa, r.wildcard, self.options.scope);
@@ -426,7 +384,6 @@ pub const Server = struct {
         client.fail(.auth, "login timed out");
     }
 
-    // A login that names no user is for the account txd runs as.
     fn accepts(self: *Server, user: []const u8, key_blob: []const u8) bool {
         if (user.len > 0 and !std.mem.eql(u8, user, self.options.user)) return false;
 
@@ -479,7 +436,6 @@ pub const Server = struct {
         return id;
     }
 
-    // options.environ with the clipboard's display and the client's locale.
     fn clientEnviron(self: *Server, arena: Allocator, hello: *const Hello) !std.process.Environ.Map {
         var environ = try self.options.environ.clone(arena);
         // WAYLAND_DISPLAY may be an absolute path.
@@ -503,8 +459,6 @@ pub const Server = struct {
         return environ;
     }
 
-    // Spawns a session process and sends it Start over a socketpair. Returns
-    // the channel to the process.
     fn startSession(self: *Server, hello: *const Hello, new: NewSession, handler: session.channel.Handler) !*Channel {
         const command = new.command;
         const id = try self.newId();
@@ -526,7 +480,6 @@ pub const Server = struct {
             }
         };
 
-        // Start carries argv and environ as lists of NUL-terminated strings.
         var environ_list: std.ArrayList(u8) = .empty;
         var it = environ.iterator();
         while (it.next()) |entry| try environ_list.print(arena, "{s}={s}\x00", .{ entry.key_ptr.*, entry.value_ptr.* });
@@ -537,7 +490,6 @@ pub const Server = struct {
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const socket_path = try self.socketPath(&path_buf, id);
 
-        // The session process gets a dup of fds[1].
         const fds = try unix.pair();
         defer unix.close(fds[1]);
         errdefer unix.close(fds[0]);
@@ -582,7 +534,6 @@ const NewSession = struct {
 const Colors = struct {
     foreground: ?u32 = null,
     background: ?u32 = null,
-    // Up to 16 entries, each an index then red, green and blue bytes.
     palette: [16 * 4]u8 = undefined,
     palette_len: usize = 0,
     dark: ?bool = null,
@@ -634,32 +585,25 @@ const Hello = struct {
     }
 };
 
-// A uni stream the client opened to answer a ClipboardRequest. It carries a
-// ClipboardData frame, then the data until FIN.
 const ClipboardAnswer = struct {
     stream: *Stream,
     bytes: std.ArrayList(u8) = .empty,
-    // Set when the ClipboardData frame has arrived.
     id: ?u64 = null,
     refused: bool = false,
-    // Where the data starts in bytes.
     data_start: usize = 0,
 };
 
 // The client encodes ClipboardData in a 64-byte buffer.
 const max_answer_header = 64;
 
-// One connection's state, from the handshake until it closes.
 const Client = struct {
     server: *Server,
     conn: *Conn,
-    // The main stream, the first the client opens.
     stream: ?*Stream = null,
     decoder: proto.Decoder,
     hello: ?Hello = null,
     logged_in: bool = false,
     login_attempts: u32 = 0,
-    // The channel to the session process.
     upstream: ?*Channel = null,
     session_id: ?u64 = null,
     query: ?*Query = null,
@@ -669,7 +613,6 @@ const Client = struct {
     terminfo: std.ArrayList(u8) = .empty,
     colors: Colors = .{},
     hangup: bool = false,
-    // Bytes of the main stream left unconsumed while upstream is congested.
     held: usize = 0,
     acked: ?u64 = null,
     peer: clipboard.Peer = .{ .request = sendClipboardRequest, .copy = sendClipboardCopy },
@@ -679,8 +622,6 @@ const Client = struct {
         return @ptrCast(@alignCast(conn.context orelse return null));
     }
 
-    // left is true when the client closed the connection itself. The session
-    // then gets Detach.
     fn destroy(client: *Client, left: bool) void {
         const gpa = client.server.gpa;
         if (client.upstream) |u| {
@@ -760,8 +701,6 @@ const Client = struct {
         fromPeer(peer).send(.{ .clipboard_request = m });
     }
 
-    // Sends a program's copy on a uni stream of its own, a ClipboardCopy frame
-    // and then the data.
     fn sendClipboardCopy(peer: *clipboard.Peer, mimes: []const []const u8, data: []const *wayland.pipe.Blob) void {
         const client = fromPeer(peer);
         const gpa = client.server.gpa;
@@ -892,7 +831,6 @@ const Client = struct {
 
     fn completeLogin(client: *Client) void {
         client.logged_in = true;
-        // Takes the connection off the pending limits.
         client.conn.admit();
         client.decoder.max_body_len = max_message;
     }
@@ -1079,7 +1017,6 @@ const Client = struct {
         client.query = null;
         switch (q.purpose) {
             .list => {
-                // SessionInfo frames go to the client as the sessions sent them.
                 for (q.answers.items) |a| if (a.reply) |reply| client.forward(reply);
                 client.send(.{ .list_end = .{} });
             },
@@ -1087,8 +1024,6 @@ const Client = struct {
         }
     }
 
-    // Attaches to the one detached session, or starts a session when there is
-    // none. Several detached sessions fail with their IDs in the message.
     fn reuseDetached(client: *Client, q: *const Query) void {
         var found: ?u64 = null;
         var count: usize = 0;
@@ -1123,7 +1058,6 @@ const Client = struct {
     fn onUpstream(context: *anyopaque, u: *Channel, raw: proto.Decoder.Raw) void {
         const client = fromContext(context);
         switch (raw.type_id) {
-            // The session process's answer to the server's Start.
             proto.messages.Started.type_id => return,
             proto.Attached.type_id => {
                 const m = proto.Attached.decode(raw.body) catch return client.fail(.protocol, "malformed message from the session");
@@ -1189,7 +1123,6 @@ const Client = struct {
 // itself once it has reported and its timer is done.
 const Query = struct {
     server: *Server,
-    // Null once the client is gone.
     client: ?*Client,
     purpose: Purpose,
     answers: std.ArrayList(Answer) = .empty,
@@ -1205,9 +1138,7 @@ const Query = struct {
         query: *Query,
         id: u64,
         channel: ?*Channel,
-        // The SessionInfo frame as the session sent it.
         reply: ?[]u8 = null,
-        // Where the frame's body starts in reply.
         body_start: usize = 0,
 
         fn info(a: *const Answer) ?proto.SessionInfo {

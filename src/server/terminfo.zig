@@ -11,9 +11,6 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 /// The largest entry accepted. tx caps what it sends at the same 64 KiB.
 pub const max_source_len = 64 << 10;
 
-/// Compiles source into a directory under base, unless an earlier install
-/// did, and returns the directory's path, which the caller frees. Fails with
-/// NoEntry when tic doesn't produce the entry source names.
 pub fn install(gpa: Allocator, io: Io, base: []const u8, source: []const u8) ![]u8 {
     if (source.len > max_source_len) return error.TooLong;
 
