@@ -1,6 +1,4 @@
 *
-# Git doesn't look inside an ignored directory, so directories are let
-# through. Their files stay ignored unless a line below allows them.
 !*/
 
 !/.gitignore

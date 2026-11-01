@@ -16,7 +16,6 @@ let
     ];
   };
 
-  # The Zig targets of build.zig's release_targets.
   target =
     {
       aarch64-linux = "aarch64-linux-musl";
@@ -54,8 +53,6 @@ stdenvNoCC.mkDerivation {
   inherit version src;
   nativeBuildInputs = [ zig ];
 
-  # With the packages in zig-pkg, zig build fetches nothing. It installs into
-  # $out itself.
   buildPhase = ''
     export ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig-global-cache
     cp -r ${deps} zig-pkg

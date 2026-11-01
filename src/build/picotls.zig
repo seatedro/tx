@@ -1,12 +1,7 @@
-//! Builds picotls from the source build.zig.zon fetches. `core` has no crypto
-//! backend, and src/crypto supplies tx's. `minicrypto` is picotls's backend on
-//! cifra and micro-ecc; crypto-test compares tx's backend with it.
-
 const std = @import("std");
 
 const flags = &[_][]const u8{ "-std=gnu99", "-fno-sanitize=undefined" };
 
-/// libpicotls, from the sources of picotls's CMake target picotls-core.
 pub fn core(
     b: *std.Build,
     dep: *std.Build.Dependency,
@@ -31,7 +26,6 @@ pub fn core(
     return lib;
 }
 
-/// picotls-minicrypto, from the sources of its CMake target. Link it with `core`.
 pub fn minicrypto(
     b: *std.Build,
     dep: *std.Build.Dependency,

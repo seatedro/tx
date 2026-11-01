@@ -38,8 +38,6 @@
           inherit version;
         };
 
-        # clang-tools has clang-format. Tests that run wl-paste and wl-copy
-        # skip without wl-clipboard.
         devShells.default = pkgs.mkShell {
           packages = [
             zig'

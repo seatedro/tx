@@ -15,12 +15,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
-      # Zig fetches build.zig.zon's packages into zig-pkg.
       - uses: actions/cache@v4
         with:
           path: zig-pkg
           key: zig-pkg-${{ github.job }}-${{ runner.os }}-${{ hashFiles('build.zig.zon') }}
-      # Tests that run wl-paste and wl-copy skip without wl-clipboard.
       - if: runner.os == 'Linux'
         run: sudo apt-get install -y --no-install-recommends wl-clipboard
       - run: zig fmt --check src build.zig
