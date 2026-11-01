@@ -1,3 +1,8 @@
+//! Clipboard data through pipes on an xev loop. write sends a Blob into a pipe
+//! a program reads, and Reader collects what a program writes into one. Each
+//! owns its descriptor and closes it when done. Like socket.zig, it waits with
+//! raw poll completions and makes Linux syscalls.
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
@@ -6,11 +11,14 @@ const xev = @import("xev");
 
 const fd_t = posix.fd_t;
 
+/// Bytes with a reference count, without atomics. The last unref frees them.
 pub const Blob = struct {
     gpa: Allocator,
     refs: usize = 1,
     bytes: []u8,
 
+    /// Takes bytes, allocated with gpa, and frees them if it fails. The Blob
+    /// starts with one reference.
     pub fn create(gpa: Allocator, bytes: []u8) Allocator.Error!*Blob {
         errdefer gpa.free(bytes);
         const blob = try gpa.create(Blob);
@@ -31,6 +39,9 @@ pub const Blob = struct {
     }
 };
 
+/// Writes blob to fd without blocking the loop, then closes fd and drops the
+/// reference. Takes fd and one reference. Errors end the write. The process
+/// must ignore SIGPIPE, or a reader that closes early kills it.
 pub fn write(gpa: Allocator, loop: *xev.Loop, fd: fd_t, blob: *Blob) void {
     setNonblocking(fd);
     const w = gpa.create(Writer) catch {
@@ -49,6 +60,7 @@ const Writer = struct {
     written: usize = 0,
     c: xev.Completion = .{},
 
+    // Returns true when the pipe is full and the write waits for room.
     fn writeSome(w: *Writer) bool {
         while (w.written < w.blob.bytes.len) {
             const rest = w.blob.bytes[w.written..];
@@ -90,6 +102,8 @@ const Writer = struct {
     }
 };
 
+/// Reads a pipe to EOF, up to limit bytes. handler.done is called once, with
+/// fd closed. The Reader frees itself after that.
 pub const Reader = struct {
     gpa: Allocator,
     loop: *xev.Loop,
@@ -99,10 +113,12 @@ pub const Reader = struct {
     handler: Handler,
     c: xev.Completion = .{},
     cancel_c: xev.Completion = .{},
+    // The Reader is freed when neither the poll nor a cancel is pending.
     polling: bool = true,
     canceling: bool = false,
 
     pub const Result = union(enum) {
+        /// Allocated with gpa. The handler owns it.
         done: []u8,
         too_long,
         failed,
@@ -113,6 +129,7 @@ pub const Reader = struct {
         done: *const fn (context: ?*anyopaque, reader: *Reader, result: Result) void,
     };
 
+    /// Takes fd, which is closed if start fails.
     pub fn start(gpa: Allocator, loop: *xev.Loop, fd: fd_t, limit: usize, handler: Handler) Allocator.Error!*Reader {
         errdefer close(fd);
         setNonblocking(fd);
@@ -127,6 +144,8 @@ pub const Reader = struct {
         return r;
     }
 
+    /// Stops the poll. done is still called, with .failed when the poll is
+    /// stopped.
     pub fn cancel(r: *Reader) void {
         if (r.canceling or !r.polling) return;
         r.canceling = true;

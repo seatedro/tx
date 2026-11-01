@@ -1,9 +1,17 @@
+//! The Wayland wire format. A message is a header of two native-endian
+//! words, the object id and then size << 16 | opcode, followed by arguments
+//! padded to 4 bytes. Descriptors travel beside the bytes as SCM_RIGHTS, and
+//! each fd argument takes the next one in order. server.zig decodes requests
+//! with Reader and queues events in an Outbox, which socket.zig sends.
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const fd_t = std.posix.fd_t;
 
 pub const header_len = 8;
 
+/// The largest message read or written, header included. It is libwayland's
+/// WL_MAX_MESSAGE_SIZE.
 pub const max_message_len = 4096;
 
 pub const DecodeError = error{
@@ -17,6 +25,7 @@ pub const DecodeError = error{
 pub const Header = struct {
     object: u32,
     opcode: u16,
+    /// Bytes in the message, header included.
     size: u16,
 
     pub fn read(bytes: *const [header_len]u8) DecodeError!Header {
@@ -33,6 +42,8 @@ pub const Message = struct {
     args: []const u8,
 };
 
+/// Returns the first message in bytes and its length, or null until all of
+/// it has arrived.
 pub fn next(bytes: []const u8) DecodeError!?struct { Message, usize } {
     if (bytes.len < header_len) return null;
     const header = try Header.read(bytes[0..header_len]);
@@ -40,6 +51,8 @@ pub fn next(bytes: []const u8) DecodeError!?struct { Message, usize } {
     return .{ .{ .header = header, .args = bytes[header_len..header.size] }, header.size };
 }
 
+/// Reads one message's arguments in order. An fd argument takes the front
+/// descriptor of fds, the ones received on the connection.
 pub const Reader = struct {
     bytes: []const u8,
     fds: *std.Deque(fd_t),
@@ -58,11 +71,14 @@ pub const Reader = struct {
         return @bitCast(try r.uint());
     }
 
+    /// Id 0 is a null object.
     pub fn object(r: *Reader) DecodeError!?u32 {
         const id = try r.uint();
         return if (id == 0) null else id;
     }
 
+    /// A string's length counts its terminating NUL, and length 0 is a null
+    /// string. The returned text has no NUL.
     pub fn string(r: *Reader) DecodeError!?[]const u8 {
         const bytes = try r.sized();
         if (bytes.len == 0) return null;
@@ -76,10 +92,12 @@ pub const Reader = struct {
         return r.sized();
     }
 
+    /// The caller owns the descriptor.
     pub fn fd(r: *Reader) DecodeError!fd_t {
         return r.fds.popFront() orelse error.MissingFd;
     }
 
+    /// Fails if the message has bytes left over.
     pub fn end(r: *const Reader) DecodeError!void {
         if (r.bytes.len != 0) return error.TrailingBytes;
     }
@@ -93,6 +111,7 @@ pub const Reader = struct {
     }
 };
 
+/// An event argument. An fd takes no bytes in the message.
 pub const Arg = union(enum) {
     uint: u32,
     int: i32,
@@ -115,8 +134,10 @@ pub const EncodeError = Allocator.Error || error{
     BadString,
 };
 
+/// Encoded events waiting to be sent.
 pub const Outbox = struct {
     bytes: std.ArrayList(u8) = .empty,
+    /// The descriptors of fd arguments, in order. deinit leaves them open.
     fds: std.ArrayList(fd_t) = .empty,
 
     pub fn deinit(o: *Outbox, gpa: Allocator) void {
@@ -125,6 +146,7 @@ pub const Outbox = struct {
         o.* = undefined;
     }
 
+    /// Appends one message. On error nothing is appended.
     pub fn event(o: *Outbox, gpa: Allocator, object: u32, opcode: u16, args: []const Arg) EncodeError!void {
         var size: usize = header_len;
         var fd_count: usize = 0;
@@ -148,6 +170,7 @@ pub const Outbox = struct {
             .string => |s| if (s) |text| {
                 o.word(@intCast(text.len + 1));
                 o.bytes.appendSliceAssumeCapacity(text);
+                // The NUL is the first byte of padding.
                 o.pad(text.len, text.len + 1);
             } else o.word(0),
             .array => |bytes| {

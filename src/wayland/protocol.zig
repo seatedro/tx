@@ -1,5 +1,10 @@
+//! Interface names and opcodes for the interfaces server.zig implements, from
+//! wayland.xml and the wlr and ext data-control protocol XML. Requests and
+//! events are numbered apart, in the order each interface declares them.
+
 pub const display = struct {
     pub const name = "wl_display";
+    /// wl_display is object 1 on every connection.
     pub const id: u32 = 1;
 
     pub const Request = enum(u16) {
@@ -122,6 +127,9 @@ pub const output = struct {
     };
 };
 
+/// The wlr and ext data-control protocols have the same requests, events and
+/// opcodes under different interface names. The wlr device has the primary
+/// selection from version 2; the ext device always has it.
 pub const data_control = struct {
     pub const Protocol = enum {
         wlr,
@@ -207,4 +215,6 @@ pub const data_control = struct {
     };
 };
 
+/// The server allocates object ids from here up, and programs allocate the ids
+/// below. libwayland calls it WL_SERVER_ID_START.
 pub const server_id_start: u32 = 0xff00_0000;
