@@ -3,7 +3,8 @@ const ngtcp2_build = @import("src/build/ngtcp2.zig");
 const picotls_build = @import("src/build/picotls.zig");
 
 /// The version in build.zig.zon. Builds other than `zig build release`
-/// add `-dev`. A nightly release gives its own with `-Dversion`.
+/// add `-dev`. `-Dversion` gives another, as nightly releases and the Nix
+/// package do.
 const version = @import("build.zig.zon").version;
 
 /// The platforms `zig build release` builds for. `os` and `arch` are the
@@ -19,6 +20,8 @@ const release_targets = [_]struct { query: std.Target.Query, os: []const u8, arc
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const version_option = b.option([]const u8, "version", "The version tx and txd print, such as 0.0.0-nightly.20261031");
+    const strip = b.option(bool, "strip", "Leave debug information out of tx and txd");
 
     const libs = libraries(b, target, optimize);
     const ghostty_vt = libs.ghostty_vt;
@@ -94,20 +97,14 @@ pub fn build(b: *std.Build) void {
 
     // The tests with fuzz tests that `--fuzz` can build. Under it, C code
     // doesn't link and ghostty-vt's build makes a Unicode table that
-    // doesn't compile. So the SPA guard's tests build alone, and the
-    // end-to-end tests are left out. They build with LLVM, which adds the
-    // fuzzer's instrumentation; the x86_64 backend Debug builds use
-    // doesn't.
+    // doesn't compile, so the end-to-end tests are left out. They build
+    // with LLVM, which adds the fuzzer's instrumentation; the x86_64
+    // backend Debug builds use doesn't.
     const fuzz_step = b.step("fuzz", "Run the fuzz tests of what a client reaches before login and of the Wayland wire format; with --fuzz, fuzz them");
     for ([_]struct { []const u8, *std.Build.Module }{
         .{ "proto-fuzz", protoModule(b, target, optimize) },
         .{ "auth-fuzz", authModule(b, target, optimize) },
         .{ "wayland-fuzz", waylandModule(b, target, optimize, xev) },
-        .{ "spa-fuzz", b.createModule(.{
-            .root_source_file = b.path("src/transport/spa.zig"),
-            .target = target,
-            .optimize = optimize,
-        }) },
     }) |entry| {
         const name, const module = entry;
         module.addImport("fuzz", fuzz);
@@ -144,14 +141,16 @@ pub fn build(b: *std.Build) void {
     });
     addTestRuns(b, client_tests, test_step, test_network_step);
 
-    const dev_info = buildInfo(b, version ++ "-dev");
+    const dev_info = buildInfo(b, version_option orelse version ++ "-dev");
     const tx = txModule(b, target, optimize, app, dev_info);
     const tx_bin = b.addExecutable(.{ .name = "tx", .root_module = tx });
+    tx_bin.root_module.strip = strip;
     b.installArtifact(tx_bin);
     addTestRuns(b, b.addTest(.{ .name = "cli-test", .root_module = tx }), test_step, test_network_step);
 
     const txd = txdModule(b, target, optimize, app, dev_info);
     const txd_bin = b.addExecutable(.{ .name = "txd", .root_module = txd });
+    txd_bin.root_module.strip = strip;
     b.installArtifact(txd_bin);
     addTestRuns(b, b.addTest(.{ .name = "txd-test", .root_module = txd }), test_step, test_network_step);
 
@@ -182,7 +181,7 @@ pub fn build(b: *std.Build) void {
     // zig-out/release for each release platform, with tx, txd, the license
     // and the README in a directory of the same name.
     const release_step = b.step("release", "Build tx and txd for every release platform");
-    const release_version = b.option([]const u8, "version", "The version of a release build, such as 0.0.0-nightly.20261031") orelse version;
+    const release_version = version_option orelse version;
     const release_info = buildInfo(b, release_version);
     const tarball_tool = b.addExecutable(.{
         .name = "tarball",
