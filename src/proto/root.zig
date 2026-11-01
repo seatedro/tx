@@ -1,3 +1,7 @@
+//! The protocol between tx, txd and session processes. messages.zig defines
+//! each message and encodes its body as wire.zig fields. frame.zig prefixes a
+//! body with its type id and length to carry it on a byte stream.
+
 pub const wire = @import("wire.zig");
 pub const messages = @import("messages.zig");
 pub const frame = @import("frame.zig");

@@ -1,11 +1,22 @@
+//! Encodings below the message level. A varint is a QUIC variable-length
+//! integer (RFC 9000 section 16). A message body is a run of fields, each a
+//! varint tag, a varint value length and the value. An integer value is
+//! big-endian with no leading zero bytes. frame.zig writes frame headers as
+//! varints, and messages.zig builds bodies from fields.
+
 const std = @import("std");
 const Writer = std.Io.Writer;
 
 pub const DecodeError = error{
+    /// The input ends inside a varint or a field.
     Truncated,
+    /// A frame's body length is over the caller's limit.
     Oversize,
+    /// A varint or integer value is encoded in more bytes than it needs.
     NonMinimal,
+    /// A field with no default value is absent.
     MissingField,
+    /// A field value doesn't fit the field's type.
     WrongType,
 };
 
@@ -13,6 +24,8 @@ pub const max_varint: u64 = (1 << 62) - 1;
 
 pub const max_varint_len = 8;
 
+/// Length of value's shortest encoding, 1, 2, 4 or 8 bytes. value is at most
+/// max_varint.
 pub fn varintLen(value: u64) usize {
     std.debug.assert(value <= max_varint);
 
@@ -22,6 +35,8 @@ pub fn varintLen(value: u64) usize {
     return 8;
 }
 
+/// Writes value big-endian in varintLen(value) bytes. The top two bits of the
+/// first byte hold log2 of the length.
 pub fn writeVarint(w: *Writer, value: u64) Writer.Error!void {
     switch (varintLen(value)) {
         1 => try w.writeByte(@intCast(value)),
@@ -37,6 +52,9 @@ pub const Varint = struct {
     len: usize,
 };
 
+/// Decodes the varint at the start of bytes and ignores the bytes after it.
+/// RFC 9000 allows a longer encoding than needed; readVarint rejects one as
+/// NonMinimal.
 pub fn readVarint(bytes: []const u8) DecodeError!Varint {
     if (bytes.len == 0) return error.Truncated;
 
@@ -51,10 +69,12 @@ pub fn readVarint(bytes: []const u8) DecodeError!Varint {
     return .{ .value = value, .len = len };
 }
 
+/// Bytes in value's encoding as an integer field value. Zero takes none.
 pub fn uintLen(value: u64) usize {
     return (64 - @clz(value) + 7) / 8;
 }
 
+/// Writes value big-endian without leading zero bytes.
 pub fn writeUint(w: *Writer, value: u64) Writer.Error!void {
     const len = uintLen(value);
     var buf: [8]u8 = undefined;
@@ -62,6 +82,8 @@ pub fn writeUint(w: *Writer, value: u64) Writer.Error!void {
     try w.writeAll(buf[8 - len ..]);
 }
 
+/// Decodes an integer field value into T. A value over 8 bytes, or one T
+/// can't hold, is WrongType; a leading zero byte is NonMinimal.
 pub fn readUint(comptime T: type, value: []const u8) DecodeError!T {
     if (value.len > 8) return error.WrongType;
 
@@ -72,6 +94,7 @@ pub fn readUint(comptime T: type, value: []const u8) DecodeError!T {
     return std.math.cast(T, n) orelse error.WrongType;
 }
 
+/// Encoded length of a field whose value is value_len bytes.
 pub fn fieldLen(tag: u64, value_len: usize) usize {
     return varintLen(tag) + varintLen(value_len) + value_len;
 }
@@ -97,6 +120,7 @@ pub const Field = struct {
     value: []const u8,
 };
 
+/// Walks the fields of a body in order. Each Field.value points into bytes.
 pub const FieldIterator = struct {
     bytes: []const u8,
     pos: usize = 0,
@@ -105,6 +129,8 @@ pub const FieldIterator = struct {
         return .{ .bytes = bytes };
     }
 
+    /// Returns null at the end of bytes. A field that runs past the end is
+    /// Truncated.
     pub fn next(it: *FieldIterator) DecodeError!?Field {
         if (it.pos == it.bytes.len) return null;
 
