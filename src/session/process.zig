@@ -1,9 +1,3 @@
-//! The session process, `txd --session --fd 3`. txd sends Start on the
-//! inherited socket, and the process starts its Session and listens on
-//! Start.socket_path. txd connects there for each client, and for control
-//! requests such as List and Kill. The process exits once its session has
-//! ended or stopped and every connection has closed.
-
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -24,7 +18,6 @@ const log = std.log.scoped(.session);
 
 const stop_signals = [_]posix.SIG{ .TERM, .INT, .HUP };
 
-/// The session process's main loop, on the socket txd passed as fd.
 pub fn run(gpa: Allocator, io: Io, fd: posix.fd_t) !u8 {
     unix.ignoreSigpipe();
 
@@ -95,16 +88,13 @@ const Process = struct {
     uid: posix.uid_t,
     session: ?*Session = null,
     started: bool = false,
-    /// null once its accept has been canceled and the socket closed.
     listener: ?posix.fd_t = null,
-    /// Owned. Unlinked when the process stops listening.
     socket_path: ?[]u8 = null,
     accept_c: xev.Completion = .{},
     cancel_accept_c: xev.Completion = .{},
     peers: std.ArrayList(*Peer) = .empty,
     signal: xev.Async,
     signal_c: xev.Completion = .{},
-    /// Set by watchSignals and taken by onSignal.
     signaled: std.atomic.Value(bool) = .init(false),
     exiting: bool = false,
 
@@ -153,7 +143,6 @@ const Process = struct {
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
-        // Start carries argv and environ as NUL-terminated lists.
         var argv: std.ArrayList([]const u8) = .empty;
         var args = std.mem.splitScalar(u8, std.mem.trimEnd(u8, m.argv, "\x00"), 0);
         while (args.next()) |arg| try argv.append(arena, arg);
@@ -265,20 +254,14 @@ fn unlink(path: []const u8) void {
 const Peer = struct {
     process: *Process,
     channel: *Channel,
-    /// The socket txd passed at spawn, the one connection that may send
-    /// Start.
     inherited: bool,
     role: enum {
         new,
-        /// Connect arrived. Attach or Resume comes next.
         connected,
         client,
         control,
     } = .new,
-    /// Set when Attached goes out, and cleared by Link.detached. A client
-    /// that isn't attached is ignored.
     attached: bool = false,
-    /// The client sent Detach before its connection closed.
     left: bool = false,
     /// remote and resume_exporter are copied into the buffers below. The
     /// channel's buffers that Connect came in don't last until Attach or

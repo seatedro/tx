@@ -20,10 +20,6 @@ pub const Error = error{
     Unexpected,
 };
 
-/// Starts the session process with socket on its fd 3, and stderr, when
-/// given, on its fd 2; otherwise it keeps txd's fd 2. Its stdin and stdout are
-/// /dev/null. Returns once the process has exec'd, or with the error that
-/// stopped it.
 pub fn spawn(gpa: Allocator, exe: []const u8, socket: posix.fd_t, stderr: ?posix.fd_t) Error!void {
     const exe_z = try gpa.dupeSentinel(u8, exe, 0);
     defer gpa.free(exe_z);
@@ -95,8 +91,6 @@ pub fn spawn(gpa: Allocator, exe: []const u8, socket: posix.fd_t, stderr: ?posix
     return spawnError(@fromBackingInt(@intCast(errno)));
 }
 
-/// What the forked children need, prepared before fork. They make
-/// async-signal-safe calls only until they exec.
 const Child = struct {
     exe: [*:0]const u8,
     argv: [*:null]const ?[*:0]const u8,
@@ -111,7 +105,6 @@ const Child = struct {
     fn run(child: *const Child) noreturn {
         if (c.setsid() == -1) child.fail();
 
-        // The middle child exits at once, and txd reaps it.
         switch (c.fork()) {
             0 => {},
             -1 => c._exit(1),

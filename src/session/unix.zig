@@ -1,7 +1,3 @@
-//! Unix stream sockets for the connections between txd and session processes,
-//! made by pair, listen and connect. Every socket is close-on-exec, in the
-//! blocking mode xev's backend needs, with larger buffers.
-
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
@@ -38,8 +34,6 @@ pub fn pair() Error![2]posix.fd_t {
     return fds;
 }
 
-/// Binds and listens on path. It fails with error.AddressInUse when the file
-/// exists.
 pub fn listen(path: []const u8) Error!posix.fd_t {
     const address = try unixAddress(path);
     const fd = try socket();
@@ -68,8 +62,6 @@ pub fn connect(path: []const u8) Error!posix.fd_t {
     return fd;
 }
 
-/// Prepares a socket that unix.zig didn't create, such as the inherited fd 3
-/// or an accepted connection.
 pub fn adopt(fd: posix.fd_t) Error!void {
     return prepare(fd);
 }

@@ -1,8 +1,3 @@
-//! Session processes. A session process runs one program on a pty and keeps
-//! its terminal state while clients attach and leave. txd starts one with
-//! spawn and talks to it over unix sockets with Channel. server/exec.zig also
-//! uses pty.Pipes for commands that run without a terminal.
-
 pub const pty = @import("pty.zig");
 pub const host = @import("host.zig");
 pub const session = @import("session.zig");

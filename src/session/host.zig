@@ -33,11 +33,8 @@ pub const Options = struct {
     /// or the program has exited.
     notify: *const fn (context: ?*anyopaque) void,
     context: ?*anyopaque = null,
-    /// Bytes of output queued for the loop thread past which the host thread
-    /// stops reading the pty.
     output_limit: usize = 256 * 1024,
 
-    /// Limits of the session's Primary.
     pub const TerminalOptions = struct {
         max_scrollback_bytes: ?usize = 10_000_000,
         max_scrollback_lines: ?usize = null,
@@ -60,39 +57,27 @@ pub const Host = struct {
     /// Session clears it while a client is attached; that client's terminal
     /// sees the same output and answers.
     answer_queries: bool = true,
-    /// The last client's dark or light preference, for color scheme reports.
     dark: ?bool = null,
-    /// Set by processOutput once the program has exited and its last output
-    /// is in the Primary. reap comes next.
     finished: bool = false,
-    /// The batch processOutput swapped out of queues.output.
     taken: std.ArrayList(u8) = .empty,
 
     notify: *const fn (context: ?*anyopaque) void,
     context: ?*anyopaque,
     output_limit: usize,
-    /// Wakes the host thread out of poll.
     wake: Wake,
     thread: ?std.Thread = null,
-    /// Guards queues.
     mutex: Io.Mutex = .init,
     queues: Queues = .{},
 
     const Queues = struct {
         output: std.ArrayList(u8) = .empty,
-        /// Bytes before input_start have been written to the pty.
         input: std.ArrayList(u8) = .empty,
         input_start: usize = 0,
-        /// The pty reached end of file or failed. The host thread reads and
-        /// writes it no more.
         closed: bool = false,
-        /// The program has exited. Set after its last output was queued.
         exited: bool = false,
-        /// Set by destroy to make the thread return.
         stopping: bool = false,
     };
 
-    /// Starts the program on a pty, and the thread that runs the pty.
     pub fn create(gpa: Allocator, io: Io, options: Options) !*Host {
         const self = try gpa.create(Host);
         errdefer gpa.destroy(self);
@@ -140,8 +125,6 @@ pub const Host = struct {
         return self;
     }
 
-    /// Kills the program if it hasn't been reaped, joins the thread, and frees
-    /// the Host.
     pub fn destroy(self: *Host) void {
         const gpa = self.gpa;
         if (self.thread) |thread| {
@@ -165,8 +148,6 @@ pub const Host = struct {
         gpa.destroy(self);
     }
 
-    /// Feeds the output the host thread queued into the Primary and its log,
-    /// and sets finished once the program has exited.
     pub fn processOutput(self: *Host) term.log.AppendError!void {
         self.mutex.lockUncancelable(self.io);
         std.mem.swap(std.ArrayList(u8), &self.queues.output, &self.taken);
@@ -201,8 +182,6 @@ pub const Host = struct {
         return self.pty.wait();
     }
 
-    /// Queues bytes for the program. They are dropped once the pty has
-    /// closed.
     pub fn sendInput(self: *Host, bytes: []const u8) Allocator.Error!void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -215,14 +194,11 @@ pub const Host = struct {
         if (was_empty) self.wake.notify();
     }
 
-    /// Logs the size in the Primary and sets it on the pty.
     pub fn resize(self: *Host, size: term.log.Resize) !void {
         try self.primary.resize(size);
         try self.pty.resize(ptySize(size));
     }
 
-    /// Takes the default colors, palette and dark preference of a client's
-    /// Attach, which the Primary uses to answer color queries.
     pub fn setColors(self: *Host, m: proto.Attach) void {
         const colors = &self.primary.terminal.colors;
         if (m.foreground) |rgb| colors.foreground.default = toRgb(rgb);
@@ -330,7 +306,6 @@ pub const Host = struct {
         while (q.input_start < q.input.items.len) {
             const n = self.pty.write(q.input.items[q.input_start..]) catch |err| switch (err) {
                 error.WouldBlock, error.SystemResources => break,
-                // The pty refuses input; what is queued is dropped.
                 error.BrokenPipe, error.Unexpected => {
                     q.input_start = q.input.items.len;
                     break;

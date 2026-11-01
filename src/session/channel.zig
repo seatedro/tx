@@ -1,9 +1,3 @@
-//! Channel sends and receives proto frames over a unix stream socket on an xev
-//! loop. txd and the session process use it at both ends of their
-//! connections. Writes queue in memory, and congested and the drained callback
-//! give the owner flow control. A Channel owns its socket, and frees itself
-//! once the socket is closed.
-
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -12,9 +6,7 @@ const xev = @import("xev");
 const proto = @import("proto");
 const unix = @import("unix.zig");
 
-/// congested() is true while more than this many bytes are queued.
 pub const high_water = 256 << 10;
-/// After congestion, drained is called once the queue falls to this.
 pub const low_water = 64 << 10;
 
 /// A frame with a larger body closes the channel.
@@ -27,7 +19,6 @@ pub const Handler = struct {
     /// raw, and the slices of the message it decodes to, are valid during the
     /// call only.
     received: *const fn (context: *anyopaque, channel: *Channel, raw: proto.Decoder.Raw) void,
-    /// The queue fell to low_water after it went past high_water.
     drained: ?*const fn (context: *anyopaque, channel: *Channel) void = null,
     /// The socket is closed and the channel is about to be freed. It isn't
     /// called after close().
@@ -38,15 +29,12 @@ pub const Channel = struct {
     gpa: Allocator,
     loop: *xev.Loop,
     socket: xev.TCP,
-    /// null after close().
     handler: ?Handler,
     decoder: proto.Decoder,
     read_buf: []u8,
     read_c: xev.Completion = .{},
     reading: bool = false,
     paused: bool = false,
-    /// Frames sent while writing is in flight. written counts the bytes of
-    /// writing already on the socket.
     queue: std.ArrayList(u8) = .empty,
     writing: std.ArrayList(u8) = .empty,
     written: usize = 0,
@@ -55,10 +43,7 @@ pub const Channel = struct {
     was_congested: bool = false,
     state: enum {
         open,
-        /// Sending what is queued. The socket is shut down after.
         finishing,
-        /// Shut down. The channel frees itself once its read and write have
-        /// ended.
         closing,
         done,
     } = .open,
@@ -91,14 +76,12 @@ pub const Channel = struct {
         ch.afterQueue();
     }
 
-    /// Queues bytes that are already framed.
     pub fn sendRaw(ch: *Channel, bytes: []const u8) void {
         if (ch.state != .open) return;
         ch.queue.appendSlice(ch.gpa, bytes) catch return ch.shut();
         ch.afterQueue();
     }
 
-    /// Bytes queued and not yet written.
     pub fn queued(ch: *const Channel) usize {
         return ch.queue.items.len + ch.writing.items.len - ch.written;
     }
@@ -107,7 +90,6 @@ pub const Channel = struct {
         return ch.queued() > high_water;
     }
 
-    /// Stops reading once the messages of the current read are delivered.
     pub fn pauseReading(ch: *Channel) void {
         ch.paused = true;
     }

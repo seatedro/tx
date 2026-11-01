@@ -1,9 +1,3 @@
-//! Starts a program on a new pty (Pty) or on three socketpairs (Pipes), and
-//! waits for it. host.zig runs a Pty from its thread; server/exec.zig runs
-//! commands without a terminal on Pipes. Between fork and exec the child makes
-//! async-signal-safe calls on data startChild prepared, and reports the step
-//! that failed and its errno over a close-on-exec pipe.
-
 const std = @import("std");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
@@ -14,7 +8,6 @@ const native_os = builtin.os.tag;
 
 pub const Term = std.process.Child.Term;
 
-/// The pty's window size. width_px and height_px are 0 when unknown.
 pub const Size = struct {
     cols: u16,
     rows: u16,
@@ -34,7 +27,6 @@ pub const Options = struct {
     environ: *const std.process.Environ.Map,
     cwd: std.process.Child.Cwd = .inherit,
     size: Size,
-    /// Receives the step and errno of a failure in the child.
     diagnostic: ?*Diagnostic = null,
 };
 
@@ -86,12 +78,9 @@ pub const KillError = posix.KillError;
 
 pub const ResizeError = error{Unexpected};
 
-/// A program running on a pty. Pty owns the master side.
 pub const Pty = struct {
     /// Nonblocking. -1 after hangup.
     master: posix.fd_t,
-    /// null once the program has been reaped, or waitpid has found it gone.
-    /// term holds the status of a reaped program.
     pid: ?posix.pid_t,
     term: ?Term,
     tty_name_buf: [128]u8,
@@ -100,8 +89,6 @@ pub const Pty = struct {
     /// exited and the master is drained. Output still unread when the last
     /// slave fd closes is lost there.
     held_slave: posix.fd_t = -1,
-    /// On Darwin, a kqueue that turns readable when the program exits; -1
-    /// elsewhere.
     exit_fd: posix.fd_t = -1,
 
     /// Opens a pty and starts the program as a session leader with the pty as
@@ -234,23 +221,18 @@ pub const Pty = struct {
         return self.tty_name_buf[0..self.tty_name_len :0];
     }
 
-    /// Fails with error.ProcessNotFound once the program has been reaped.
     pub fn kill(self: *Pty, sig: posix.SIG) KillError!void {
         return posix.kill(self.pid orelse return error.ProcessNotFound, sig);
     }
 
-    /// Signals the process group the program leads.
     pub fn killGroup(self: *Pty, sig: posix.SIG) KillError!void {
         return posix.kill(-(self.pid orelse return error.ProcessNotFound), sig);
     }
 
-    /// Blocks until the program exits, and reaps it.
     pub fn wait(self: *Pty) WaitError!Term {
         return (try self.reapChild(0)).?;
     }
 
-    /// Reaps the program if it has exited. After that it returns the saved
-    /// status.
     pub fn tryWait(self: *Pty) WaitError!?Term {
         return self.reapChild(posix.W.NOHANG);
     }
@@ -291,7 +273,6 @@ pub const Pty = struct {
         self.exit_fd = -1;
     }
 
-    /// Hangs up, and kills and reaps the program if it hasn't been reaped.
     pub fn deinit(self: *Pty) void {
         self.hangup();
         if (self.pid) |pid| {
@@ -314,17 +295,12 @@ pub const PipesOptions = struct {
 /// sockets so that xev.TCP, which reads and writes with recv and send, can
 /// drive the parent's ends. The parent's ends are nonblocking.
 pub const Pipes = struct {
-    /// The parent's ends. -1 once closed.
     stdin: posix.fd_t,
     stdout: posix.fd_t,
     stderr: posix.fd_t,
-    /// null once the program has been reaped, or waitpid has found it gone.
-    /// term holds the status of a reaped program.
     pid: ?posix.pid_t,
     term: ?Term = null,
 
-    /// Starts the program with default signal dispositions, an empty signal
-    /// mask, and no fds other than 0, 1 and 2.
     pub fn spawn(gpa: Allocator, options: PipesOptions) SpawnError!Pipes {
         const stdin = try socketPair();
         defer closeFd(stdin[0]);
@@ -347,7 +323,6 @@ pub const Pipes = struct {
         return .{ .stdin = stdin[1], .stdout = stdout[0], .stderr = stderr[0], .pid = pid };
     }
 
-    /// Closes one of stdin, stdout and stderr, and sets it to -1.
     pub fn close(self: *Pipes, fd: *posix.fd_t) void {
         _ = self;
         if (fd.* == -1) return;
@@ -359,13 +334,10 @@ pub const Pipes = struct {
         return posix.kill(self.pid orelse return error.ProcessNotFound, sig);
     }
 
-    /// Blocks until the program exits, and leaves it unreaped for tryWait.
     pub fn waitExited(self: *const Pipes) WaitError!void {
         return waitExitedPid(self.pid orelse return);
     }
 
-    /// Reaps the program if it has exited. After that it returns the saved
-    /// status.
     pub fn tryWait(self: *Pipes) WaitError!?Term {
         const pid = self.pid orelse return self.term orelse error.ProcessNotFound;
         const term = reap(pid, posix.W.NOHANG) catch |err| {
@@ -379,8 +351,6 @@ pub const Pipes = struct {
         return term;
     }
 
-    /// Closes the parent's ends, and kills and reaps the program if it hasn't
-    /// been reaped.
     pub fn deinit(self: *Pipes) void {
         self.close(&self.stdin);
         self.close(&self.stdout);
@@ -575,7 +545,6 @@ const Child = struct {
     }
 };
 
-/// What the child writes to the error pipe when a step fails.
 const ChildError = extern struct {
     step: u32,
     errno: u32,
@@ -608,7 +577,6 @@ const ChildError = extern struct {
     };
 };
 
-/// Returns null at end of file, which means exec succeeded.
 fn readChildError(fd: posix.fd_t) ?ChildError.Failure {
     var child_err: ChildError = undefined;
     const bytes = std.mem.asBytes(&child_err);
@@ -655,7 +623,6 @@ fn childExited(kq: posix.fd_t) bool {
 }
 
 fn waitExitedPid(pid: posix.pid_t) WaitError!void {
-    // Space for the siginfo_t waitid fills in. It isn't read.
     var info: [128]u8 align(8) = undefined;
 
     while (libc.waitid(p_pid, @intCast(pid), &info, w_exited | w_nowait) == -1) switch (posix.errno(-1)) {
@@ -800,7 +767,6 @@ fn aboveStdio(fd: posix.fd_t) SpawnError!posix.fd_t {
     return new;
 }
 
-/// The soft RLIMIT_NOFILE, capped at max_fd_limit, for closeFrom.
 pub fn maxFd() posix.fd_t {
     var limit: posix.rlimit = undefined;
     if (c.getrlimit(.NOFILE, &limit) != 0) return max_fd_limit;
