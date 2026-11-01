@@ -1,7 +1,15 @@
+//! A Primary's log of the output chunks and resizes it fed its terminal, in
+//! order, each numbered by a seq counting from zero. The log holds a bounded
+//! number of bytes and drops its oldest records to make room. A reader keeps
+//! the seq it wants next. Feeding the records from a seq on to a terminal that
+//! saw everything before it brings that terminal to the Primary's state.
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const vt = @import("ghostty-vt");
 
+/// Output bytes belong to the log and stay valid until a later append drops
+/// the record or the log is freed.
 pub const Record = struct {
     seq: u64,
     payload: Payload,
@@ -16,6 +24,7 @@ pub const Payload = union(enum) {
 pub const Resize = struct {
     cols: u16,
     rows: u16,
+    /// Null leaves the terminal's pixel size as it was.
     cell_size_px: ?CellSize = null,
 
     pub const CellSize = struct {
@@ -37,17 +46,21 @@ pub const AppendError = Allocator.Error || error{
 };
 
 pub const ReadError = error{
+    /// The record was dropped to make room for newer ones.
     Trimmed,
+    /// The record hasn't been appended yet.
     Ahead,
 };
 
 pub const Log = struct {
     gpa: Allocator,
     capacity: usize,
+    /// The total cost of the records held, at most capacity.
     used: usize = 0,
     entries: std.Deque(Entry) = .empty,
     first_seq: u64 = 0,
 
+    /// What each record costs against the capacity on top of its output bytes.
     pub const record_overhead = @sizeOf(Entry);
 
     const Entry = struct {
@@ -61,6 +74,8 @@ pub const Log = struct {
         }
     };
 
+    /// capacity is in bytes, and each record costs record_overhead plus its
+    /// output.
     pub fn init(gpa: Allocator, capacity: usize) Log {
         return .{ .gpa = gpa, .capacity = capacity };
     }
@@ -71,18 +86,24 @@ pub const Log = struct {
         self.* = undefined;
     }
 
+    /// The longest output one record can hold.
     pub fn maxOutputLen(self: *const Log) usize {
         return self.capacity -| record_overhead;
     }
 
+    /// The seq the next append gets.
     pub fn nextSeq(self: *const Log) u64 {
         return self.first_seq + self.entries.len;
     }
 
+    /// The seq of the oldest record held.
     pub fn firstSeq(self: *const Log) u64 {
         return self.first_seq;
     }
 
+    /// Appends a copy of payload, dropping the oldest records until it fits,
+    /// and returns its seq. A record that costs more than the capacity fails
+    /// with error.RecordTooLarge.
     pub fn append(self: *Log, payload: Payload) AppendError!u64 {
         const owned: Payload = switch (payload) {
             .output => |bytes| owned: {
@@ -95,6 +116,9 @@ pub const Log = struct {
         errdefer self.free(entry);
         if (entry.cost() > self.capacity) return error.RecordTooLarge;
 
+        // Reserving before dropping leaves the log as it was if the
+        // allocation fails. The entry's cost is within the capacity, so the
+        // loop stops by the time the log is empty.
         try self.entries.ensureUnusedCapacity(self.gpa, 1);
         while (self.used + entry.cost() > self.capacity) self.dropOldest();
         self.entries.pushBackAssumeCapacity(entry);
@@ -108,6 +132,7 @@ pub const Log = struct {
         return .{ .seq = seq, .payload = self.entries.at(@intCast(seq - self.first_seq)).payload };
     }
 
+    /// Iterates from seq, which may be nextSeq(), to the newest record.
     pub fn iterator(self: *const Log, seq: u64) ReadError!Iterator {
         try self.check(seq);
         return .{ .log = self, .seq = seq };
@@ -117,6 +142,9 @@ pub const Log = struct {
         log: *const Log,
         seq: u64,
 
+        /// Returns null at the end of the log, and later calls return the
+        /// records appended since. Once the next record has been dropped,
+        /// every call returns null.
         pub fn next(self: *Iterator) ?Record {
             const record = self.log.get(self.seq) catch return null;
             self.seq += 1;

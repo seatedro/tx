@@ -1,3 +1,8 @@
+//! The terminal a session keeps for its program. A Primary feeds the program's
+//! output through a ghostty-vt TerminalStream into a Terminal and appends each
+//! chunk and each resize to a Log. A client follows the log from a seq, or
+//! starts from a rebuild that ends where the log's next record begins.
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const vt = @import("ghostty-vt");
@@ -7,6 +12,8 @@ const rebuild_pkg = @import("rebuild.zig");
 const Log = log_pkg.Log;
 
 pub const Stream = vt.TerminalStream;
+/// Effect callbacks in handler().effects take this, and fromHandler finds the
+/// Primary from it.
 pub const Handler = Stream.Handler;
 
 pub const Options = struct {
@@ -15,15 +22,21 @@ pub const Options = struct {
     max_scrollback_bytes: ?usize = 10_000_000,
     max_scrollback_lines: ?usize = null,
     kitty_image_storage_limit: usize = 320 * 1000 * 1000,
+    /// In bytes. See Log.init.
     log_capacity: usize = 8 * 1024 * 1024,
+    /// The longest unfinished sequence, in bytes, that a rebuild can end
+    /// inside. Must be above zero. Zero turns off the stream's continuation
+    /// tracking, which rebuild needs.
     max_continuation: usize = 1024 * 1024,
 };
 
+/// Lives on the heap because the stream's handler points at terminal.
 pub const Primary = struct {
     gpa: Allocator,
     terminal: vt.Terminal,
     stream: Stream,
     log: Log,
+    /// For effect callbacks, which reach it through fromHandler.
     context: ?*anyopaque = null,
 
     pub fn create(gpa: Allocator, io: std.Io, options: Options) !*Primary {
@@ -41,6 +54,9 @@ pub const Primary = struct {
             .stream = undefined,
             .log = .init(gpa, options.log_capacity),
         };
+
+        // The handler keeps &self.terminal, so the stream is made once
+        // self holds the terminal.
         self.stream = .init(.{
             .allocator = gpa,
             .handler = .init(&self.terminal),
@@ -51,21 +67,28 @@ pub const Primary = struct {
 
     pub fn destroy(self: *Primary) void {
         const gpa = self.gpa;
+        // The handler frees through the terminal's allocator, so the stream
+        // goes first.
         self.stream.deinit();
         self.terminal.deinit(gpa);
         self.log.deinit();
         gpa.destroy(self);
     }
 
+    /// Effects set here run inside output and resize.
     pub fn handler(self: *Primary) *Handler {
         return &self.stream.handler;
     }
 
+    /// The Primary that owns h, for use inside an effect callback.
     pub fn fromHandler(h: *Handler) *Primary {
         const stream: *Stream = @fieldParentPtr("handler", h);
         return @fieldParentPtr("stream", stream);
     }
 
+    /// Logs bytes in records of at most log.maxOutputLen() and feeds each
+    /// record to the terminal. On error, the records before the failing one
+    /// have been logged and fed, and the rest of bytes is neither.
     pub fn output(self: *Primary, bytes: []const u8) log_pkg.AppendError!void {
         var rest = bytes;
         while (rest.len > 0) {
@@ -77,22 +100,37 @@ pub const Primary = struct {
     }
 
     pub const RebuildError = std.Io.Writer.Error || error{
+        /// The stream didn't keep the unfinished sequence the output ends in,
+        /// because it is longer than max_continuation or memory ran out. A
+        /// rebuild works again after later output ends the sequence.
         Unfinished,
     };
 
+    /// Writes the escape sequences that bring a terminal of the same size to
+    /// the Primary's state, then the unfinished sequence the output ends in.
+    /// The record at log.nextSeq() continues from there. Writes nothing when
+    /// it fails with error.Unfinished.
     pub fn rebuild(self: *const Primary, w: *std.Io.Writer, kind: rebuild_pkg.Kind) RebuildError!void {
         if (self.stream.continuation.?.broken) return error.Unfinished;
         try rebuild_pkg.write(w, &self.terminal, kind);
         self.stream.writeContinuation(w) catch |err| switch (err) {
             error.ContinuationUnavailable => return error.Unfinished,
+            // create turns continuation tracking on.
             error.ContinuationDisabled => unreachable,
             error.WriteFailed => return error.WriteFailed,
         };
     }
 
+    /// Logs size and resizes the terminal. A zero dimension fails with
+    /// error.InvalidValue and logs nothing.
     pub fn resize(self: *Primary, size: log_pkg.Resize) (log_pkg.AppendError || vt.Terminal.ResizeError)!void {
+        // Terminal.resize refuses a zero dimension, but it runs after the
+        // append.
         if (size.cols == 0 or size.rows == 0) return error.InvalidValue;
         _ = try self.log.append(.{ .resize = size });
+
+        // The handler's resize also writes the in-band size report through
+        // write_pty when mode 2048 is set and size has a cell size.
         try self.stream.handler.resize(size.terminal());
     }
 };
