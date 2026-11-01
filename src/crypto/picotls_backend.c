@@ -18,7 +18,6 @@ typedef struct {
   _Alignas(16) uint8_t b[TX_HASH_STATE_SIZE];
 } tx_hash_state;
 
-// Exported by primitives.zig.
 void tx_aead_seal(int kind, const uint8_t *key, const uint8_t nonce[12], const void *ad,
                   size_t adlen, const void *m, size_t mlen, void *c);
 int tx_aead_open(int kind, const uint8_t *key, const uint8_t nonce[12], const void *ad,
@@ -90,7 +89,6 @@ struct tx_chacha20_ctx {
   uint8_t key[32];
   uint32_t counter;
   uint8_t nonce[12];
-  // Keystream bytes used since do_init.
   uint64_t offset;
 };
 
@@ -200,7 +198,6 @@ static int aead_setup(ptls_aead_context_t *_ctx, const void *key, const void *iv
   ctx->super.do_encrypt_init = NULL;
   ctx->super.do_encrypt_update = NULL;
   ctx->super.do_encrypt_final = NULL;
-  // picotls' helper runs do_encrypt_v, then the supplementary cipher.
   ctx->super.do_encrypt = ptls_aead__do_encrypt;
   ctx->super.do_encrypt_v = aead_encrypt_v;
   ctx->super.do_decrypt = aead_decrypt;
@@ -510,7 +507,6 @@ static int ed25519_verify_cert(ptls_verify_certificate_t *_self, ptls_t *tls,
     return PTLS_ALERT_BAD_CERTIFICATE;
   }
 
-  // Refused keys are recorded too.
   memcpy(self->presented, key, sizeof(self->presented));
   self->has_presented = 1;
 

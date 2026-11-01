@@ -1,11 +1,8 @@
-// picotls algorithms and certificate callbacks built on Zig's std.crypto, through the C
-// exports in src/crypto/primitives.zig.
 #ifndef TX_PICOTLS_BACKEND_H
 #define TX_PICOTLS_BACKEND_H
 
 #include <picotls.h>
 
-// Fills buf with random bytes from the Io given to crypto.init. Panics if crypto.init has not run.
 void tx_random_bytes(void *buf, size_t len);
 
 // tx_aes256gcm and tx_aes256ecb belong to no cipher suite. ngtcp2's picotls glue refers to them

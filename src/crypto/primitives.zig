@@ -6,8 +6,6 @@
 const std = @import("std");
 const crypto = std.crypto;
 
-/// Source of randomness for key generation, encapsulation and
-/// tx_random_bytes. Set by crypto.init.
 pub var io: ?std.Io = null;
 
 // Sizes of the opaque state buffers in picotls_backend.c's contexts. std's
@@ -15,9 +13,7 @@ pub var io: ?std.Io = null;
 // comptime checks below assert that each state fits.
 const aes_state_size = 4096;
 const hash_state_size = 128;
-// Matches _Alignas(16) on tx_aes_state and tx_hash_state.
 const state_align = 16;
-// FIPS 203 ML-KEM-768 encapsulation key, decapsulation key and ciphertext sizes.
 const mlkem_pk_len = 1184;
 const mlkem_sk_len = 2400;
 const mlkem_ct_len = 1088;
@@ -39,20 +35,16 @@ fn slice(ptr: ?[*]const u8, len: usize) []const u8 {
     return if (ptr) |p| p[0..len] else &.{};
 }
 
-/// Panics until crypto.init sets io.
 pub fn random(buf: []u8) void {
     getIo().random(buf);
 }
 
-/// picotls' and ngtcp2's random_bytes callback. buf may be NULL when len is 0.
 export fn tx_random_bytes(buf: ?*anyopaque, len: usize) void {
     if (len == 0) return;
     const p: [*]u8 = @ptrCast(buf.?);
     random(p[0..len]);
 }
 
-// Indexed by kind. picotls_backend.c numbers them TX_AES128GCM,
-// TX_AES256GCM and TX_CHACHA20POLY1305.
 const aead_kinds = [_]type{
     crypto.aead.aes_gcm.Aes128Gcm,
     crypto.aead.aes_gcm.Aes256Gcm,
@@ -79,8 +71,6 @@ export fn tx_aead_seal(
     }
 }
 
-/// c is clen bytes, the ciphertext followed by the tag. Returns -1 when clen
-/// is shorter than the tag or the tag does not verify.
 export fn tx_aead_open(
     kind: c_int,
     key: [*]const u8,
@@ -155,7 +145,6 @@ export fn tx_chacha20_xor(out: [*]u8, in: [*]const u8, len: usize, key: *const [
     var pos = offset;
     var i: usize = 0;
 
-    // Use up the rest of the partly used block first.
     if (pos % 64 != 0 and len > 0) {
         var ks: [64]u8 = undefined;
         C.stream(&ks, counter +% @as(u32, @truncate(pos / 64)), key.*, nonce.*);
@@ -225,8 +214,6 @@ export fn tx_mlkem768_decaps(sk: *const [mlkem_sk_len]u8, ct: *const [mlkem_ct_l
 
 const Ed25519 = crypto.sign.Ed25519;
 
-/// secret_key is std.crypto's 64-byte Ed25519 secret key, the seed followed
-/// by the public key. Signatures are deterministic, as in RFC 8032.
 export fn tx_ed25519_sign(secret_key: *const [64]u8, msg: [*]const u8, len: usize, out: *[64]u8) c_int {
     const sk = Ed25519.SecretKey.fromBytes(secret_key.*) catch return -1;
     const kp = Ed25519.KeyPair.fromSecretKey(sk) catch return -1;
