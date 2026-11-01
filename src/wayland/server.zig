@@ -1,10 +1,3 @@
-//! The Wayland objects of each program's connection, and the clipboard and
-//! primary selections they share. A Connection handles requests from bytes
-//! and descriptors socket.zig receives, and queues events for socket.zig to
-//! send. A selection is held by nothing, by the user, whose data comes from
-//! the Backend, or by a program's data source. Each change is sent to the
-//! data-control devices that have that selection.
-
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const c = std.c;
@@ -34,11 +27,8 @@ pub const Backend = struct {
     copied: *const fn (context: ?*anyopaque, selection: Selection, mimes: ?[]const []const u8) void,
 };
 
-/// Types kept per selection or source. Later ones are dropped.
 pub const max_mimes = 64;
-/// Longer types are dropped.
 pub const max_mime_len = 255;
-// Per connection.
 const max_objects = 16 * 1024;
 /// Received descriptors a connection holds before requests take them.
 /// socket.zig closes a program that sends more.
@@ -57,7 +47,6 @@ const seat_name = "seat0";
 
 const Owner = union(enum) {
     none,
-    // The types from setClipboard. Reads go to Backend.fetch.
     user: Mimes,
     source: *Source,
 };
@@ -69,7 +58,6 @@ fn freeMimes(gpa: Allocator, mimes: *Mimes) void {
     mimes.deinit(gpa);
 }
 
-/// The two selections, and the Connections of the programs that share them.
 pub const Server = struct {
     gpa: Allocator,
     backend: Backend,
@@ -92,7 +80,6 @@ pub const Server = struct {
         s.* = undefined;
     }
 
-    /// Adds a connection that holds wl_display. It lives until disconnect.
     pub fn connect(s: *Server) Allocator.Error!*Connection {
         const conn = try s.gpa.create(Connection);
         errdefer s.gpa.destroy(conn);
@@ -182,8 +169,6 @@ pub const Server = struct {
     fn copied(s: *Server, selection: Selection) void {
         switch (s.selections.get(selection)) {
             .none => s.backend.copied(s.backend.context, selection, null),
-            // Called after a program's change, which never makes the user
-            // the owner.
             .user => unreachable,
             .source => |source| {
                 const mimes: []const []const u8 = @ptrCast(source.mimes.items);
@@ -203,7 +188,6 @@ pub const Server = struct {
     }
 
     fn receive(s: *Server, offer: Offer, mime: []const u8, fd: fd_t) void {
-        // The offer was made before the selection last changed.
         if (offer.generation != s.generations.get(offer.selection)) return close(fd);
         switch (s.selections.get(offer.selection)) {
             .none => close(fd),
@@ -253,13 +237,10 @@ const Offer = struct {
     generation: u64,
 };
 
-/// One program's objects, received descriptors and queued events.
 pub const Connection = struct {
     server: *Server,
     objects: std.AutoHashMapUnmanaged(u32, Object) = .empty,
-    // The data-control devices, which get the selection events.
     devices: std.ArrayList(u32) = .empty,
-    /// Received descriptors that no request has taken yet.
     fds: std.Deque(fd_t) = .empty,
     /// Events to send. The sender closes the descriptors it sends.
     out: wire.Outbox = .{},
@@ -397,7 +378,6 @@ pub const Connection = struct {
                 },
                 .get_data_device => {
                     const new = try conn.newId(r);
-                    // The seat. seat0 is the only one.
                     _ = try r.object();
                     try r.end();
                     // Reserved before add, so a device object is never missing
@@ -592,7 +572,6 @@ pub const Connection = struct {
     fn send(conn: *Connection, object: u32, opcode: u16, args: []const wire.Arg) void {
         if (conn.failed) return;
         conn.out.event(conn.server.gpa, object, opcode, args) catch |err| switch (err) {
-            // An error event couldn't be queued either.
             error.OutOfMemory => conn.failed = true,
             // Strings sent are fixed text, or types that passed max_mime_len
             // and the NUL checks on the way in.
@@ -659,8 +638,6 @@ const TestBackend = struct {
     }
 };
 
-// A program on a Connection with no socket. events prints its queued events,
-// one per line, and names offers o1, o2, and so on, in the order they came.
 const TestProgram = struct {
     conn: *Connection,
     interfaces: std.AutoHashMapUnmanaged(u32, Interface) = .empty,

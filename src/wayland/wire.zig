@@ -25,7 +25,6 @@ pub const DecodeError = error{
 pub const Header = struct {
     object: u32,
     opcode: u16,
-    /// Bytes in the message, header included.
     size: u16,
 
     pub fn read(bytes: *const [header_len]u8) DecodeError!Header {
@@ -42,8 +41,6 @@ pub const Message = struct {
     args: []const u8,
 };
 
-/// Returns the first message in bytes and its length, or null until all of
-/// it has arrived.
 pub fn next(bytes: []const u8) DecodeError!?struct { Message, usize } {
     if (bytes.len < header_len) return null;
     const header = try Header.read(bytes[0..header_len]);
@@ -97,7 +94,6 @@ pub const Reader = struct {
         return r.fds.popFront() orelse error.MissingFd;
     }
 
-    /// Fails if the message has bytes left over.
     pub fn end(r: *const Reader) DecodeError!void {
         if (r.bytes.len != 0) return error.TrailingBytes;
     }
@@ -134,7 +130,6 @@ pub const EncodeError = Allocator.Error || error{
     BadString,
 };
 
-/// Encoded events waiting to be sent.
 pub const Outbox = struct {
     bytes: std.ArrayList(u8) = .empty,
     /// The descriptors of fd arguments, in order. deinit leaves them open.

@@ -1,8 +1,3 @@
-//! Clipboard data through pipes on an xev loop. write sends a Blob into a pipe
-//! a program reads, and Reader collects what a program writes into one. Each
-//! owns its descriptor and closes it when done. Like socket.zig, it waits with
-//! raw poll completions and makes Linux syscalls.
-
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
@@ -60,7 +55,6 @@ const Writer = struct {
     written: usize = 0,
     c: xev.Completion = .{},
 
-    // Returns true when the pipe is full and the write waits for room.
     fn writeSome(w: *Writer) bool {
         while (w.written < w.blob.bytes.len) {
             const rest = w.blob.bytes[w.written..];
@@ -113,7 +107,6 @@ pub const Reader = struct {
     handler: Handler,
     c: xev.Completion = .{},
     cancel_c: xev.Completion = .{},
-    // The Reader is freed when neither the poll nor a cancel is pending.
     polling: bool = true,
     canceling: bool = false,
 
