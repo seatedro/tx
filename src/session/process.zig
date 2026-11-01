@@ -1,22 +1,3 @@
-//! A session process, `txd --session --fd N`: one session (see `session`),
-//! reached over Unix sockets.
-//!
-//! txd starts it with one end of a socket pair as fd N, and sends `Start`
-//! there. The process starts the program, listens at `Start.socket_path`,
-//! and answers `Started`. After that the socket pair is a channel like any
-//! txd connects later.
-//!
-//! On each channel txd's first message says what the channel is for.
-//! `Connect` describes a client, and the client's `Attach` or `Resume`,
-//! then its `Input`, `Resize` and `Detach`, follow. `List` gets the
-//! session's `SessionInfo`, and `Kill` ends the session and gets `Killed`.
-//! For tests, `Dump` gets `DumpReply`, and `Inject` types into the program.
-//! Only the user running the process may connect.
-//!
-//! The process exits once the program has exited and its client has read
-//! `Exit`. SIGTERM, SIGINT and SIGHUP stop the session (see
-//! `Session.stop`); after the grace period the program is killed and the
-//! process exits.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -35,16 +16,11 @@ const Channel = channel.Channel;
 
 const log = std.log.scoped(.session);
 
-/// The signals that stop the session.
 const stop_signals = [_]posix.SIG{ .TERM, .INT, .HUP };
 
-/// Runs the session process on `fd`, the socket from txd. Returns the
-/// exit status: 0, or 1 if the session didn't start.
 pub fn run(gpa: Allocator, io: Io, fd: posix.fd_t) !u8 {
     unix.ignoreSigpipe();
 
-    // Blocked before any thread starts, so that only `watchSignals` takes
-    // them.
     var signals: posix.sigset_t = undefined;
     _ = c.sigemptyset(&signals);
     for (stop_signals) |sig| _ = c.sigaddset(&signals, sig);
@@ -66,8 +42,6 @@ pub fn run(gpa: Allocator, io: Io, fd: posix.fd_t) !u8 {
     while (!p.finished()) {
         try loop.run(.once);
 
-        // A program that outlived the grace period is killed, and the
-        // clients learn the session is gone.
         if (p.session) |s| if (s.stopped()) {
             s.destroy();
             p.session = null;
@@ -75,8 +49,6 @@ pub fn run(gpa: Allocator, io: Io, fd: posix.fd_t) !u8 {
         };
     }
 
-    // The session frees itself in a callback of its own. The loop then
-    // has nothing left but the signal wait, which the notification ends.
     p.exiting = true;
     try p.signal.notify();
     try loop.run(.until_done);
@@ -108,25 +80,18 @@ const Process = struct {
     io: Io,
     loop: *xev.Loop,
     uid: posix.uid_t,
-    /// Null until `Start`, and once the session has ended or been
-    /// destroyed.
     session: ?*Session = null,
-    /// The session started.
     started: bool = false,
-    /// The listening socket, null once closed.
     listener: ?posix.fd_t = null,
     socket_path: ?[]u8 = null,
     accept_c: xev.Completion = .{},
     cancel_accept_c: xev.Completion = .{},
     peers: std.ArrayList(*Peer) = .empty,
-    /// Notified by `watchSignals`.
     signal: xev.Async,
     signal_c: xev.Completion = .{},
     signaled: std.atomic.Value(bool) = .init(false),
-    /// The process is done, and the signal wait ends.
     exiting: bool = false,
 
-    /// Nothing is left to serve.
     fn finished(p: *const Process) bool {
         return p.session == null and p.listener == null and p.peers.items.len == 0;
     }
@@ -152,7 +117,6 @@ const Process = struct {
         p.gpa.destroy(peer);
     }
 
-    /// Starts the session `start` describes, and listens for txd.
     fn start(p: *Process, peer: *Peer, m: proto.Start) void {
         if (p.started) return peer.fail(.protocol, "the session has started");
         p.startSession(m) catch |err| {
@@ -166,8 +130,6 @@ const Process = struct {
     fn startSession(p: *Process, m: proto.Start) !void {
         if (m.internal_revision != proto.internal_revision) return error.WrongRevision;
 
-        // `Start` points into the channel's buffer. Host.create copies what
-        // it keeps.
         var arena_state: std.heap.ArenaAllocator = .init(p.gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
@@ -216,7 +178,6 @@ const Process = struct {
     fn onAccept(p_: ?*Process, _: *xev.Loop, _: *xev.Completion, result: xev.AcceptError!xev.TCP) xev.CallbackAction {
         const p = p_.?;
         const socket = result catch |err| {
-            // `stopListening` canceled the accept.
             if (err == error.Canceled) {
                 unix.close(p.listener.?);
                 p.listener = null;
@@ -237,8 +198,6 @@ const Process = struct {
         try p.addPeer(fd, false);
     }
 
-    /// No new channels. The socket goes away, and txd stops listing the
-    /// session.
     fn stopListening(p: *Process) void {
         if (p.socket_path) |path| unlink(path);
         if (p.listener == null or p.cancel_accept_c.state() == .active) return;
@@ -246,10 +205,7 @@ const Process = struct {
         p.loop.add(&p.cancel_accept_c);
     }
 
-    /// Ends every channel after what was sent on it.
     fn finishPeers(p: *Process) void {
-        // Backwards: a channel that closes at once removes its peer, and
-        // the last peer takes its place.
         var i = p.peers.items.len;
         while (i > 0) {
             i -= 1;
@@ -257,8 +213,6 @@ const Process = struct {
         }
     }
 
-    /// The program exited and the client, if any, was sent `Exit`. The
-    /// session frees itself.
     fn onSessionEnded(context: ?*anyopaque, _: *Session) void {
         const p: *Process = @ptrCast(@alignCast(context.?));
         p.session = null;
@@ -280,26 +234,17 @@ fn unlink(path: []const u8) void {
     _ = c.unlink(buf[0..path.len :0]);
 }
 
-/// A channel from txd.
 const Peer = struct {
     process: *Process,
     channel: *Channel,
-    /// The socket pair txd started the process with, on which `Start`
-    /// comes.
     inherited: bool,
     role: enum {
-        /// Before the first message.
         new,
-        /// After `Connect`, waiting for `Attach` or `Resume`.
         connected,
-        /// The client's `Attach` or `Resume` went to the session.
         client,
-        /// `List`, `Kill`, `Dump` or `Inject`.
         control,
     } = .new,
-    /// The session holds this channel as its link.
     attached: bool = false,
-    /// txd said the client left on purpose (`Detach`).
     left: bool = false,
     connect: proto.Connect = undefined,
     remote_buf: [64]u8 = undefined,
@@ -360,7 +305,6 @@ const Peer = struct {
         const s = peer.process.session orelse return;
         switch (message) {
             .input, .resize => s.handle(message),
-            // The client left, on purpose. Its channel closing detaches it.
             .detach => {
                 peer.left = true;
                 peer.channel.finish();
@@ -406,7 +350,6 @@ const Peer = struct {
         if (peer.process.session) |s| s.drained();
     }
 
-    /// txd closed the channel, or it was finished.
     fn onClosed(context: *anyopaque, _: *Channel) void {
         const peer = of(context);
         const p = peer.process;

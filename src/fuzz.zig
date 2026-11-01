@@ -1,17 +1,7 @@
-//! Fuzz tests that do some work in every test run.
-//!
-//! A fuzz test is a function that checks one `Input`. Under
-//! `zig build fuzz --fuzz`, the fuzzer makes the inputs. Otherwise each
-//! test run checks `Options.count` inputs from a seeded PRNG, the same
-//! ones each run.
-//!
-//! The methods of `Input` are inline, so that the fuzzer tells each place
-//! that calls one apart.
 const std = @import("std");
 const Smith = std.testing.Smith;
 
 pub const Options = struct {
-    /// Inputs checked in a test run that isn't fuzzing.
     count: usize = 1000,
 };
 
@@ -25,8 +15,6 @@ pub fn run(
         count: usize,
 
         fn one(r: @This(), smith: *Smith) anyerror!void {
-            // The fuzzer's input. `Smith.in` holds an input given to a
-            // test run that isn't fuzzing, and this one has none.
             if (smith.in == null) return testOne(r.context, .{ .source = .{ .smith = smith } });
 
             var prng: std.Random.DefaultPrng = .init(0x7478_6675_7a7a);
@@ -47,7 +35,6 @@ pub const Input = struct {
         random: std.Random,
     },
 
-    /// An integer from `at_least` to `at_most`.
     pub inline fn int(in: Input, comptime T: type, at_least: T, at_most: T) T {
         return switch (in.source) {
             .smith => |s| @intCast(s.valueRangeAtMost(Fixed(T), at_least, at_most)),
@@ -55,7 +42,6 @@ pub const Input = struct {
         };
     }
 
-    /// Smith takes integers of a fixed size only.
     fn Fixed(comptime T: type) type {
         return switch (T) {
             usize => u64,
@@ -64,7 +50,6 @@ pub const Input = struct {
         };
     }
 
-    /// Any value of `T`, an integer or a bool.
     pub inline fn any(in: Input, comptime T: type) T {
         return switch (in.source) {
             .smith => |s| s.value(T),
@@ -72,7 +57,6 @@ pub const Input = struct {
         };
     }
 
-    /// Any value of the enum `T`.
     pub inline fn enumValue(in: Input, comptime T: type) T {
         return switch (in.source) {
             .smith => |s| s.value(T),
@@ -80,7 +64,6 @@ pub const Input = struct {
         };
     }
 
-    /// An index into something `len` long.
     pub inline fn index(in: Input, len: usize) usize {
         return switch (in.source) {
             .smith => |s| s.index(len),
@@ -88,7 +71,6 @@ pub const Input = struct {
         };
     }
 
-    /// True with odds `true_weight` to `false_weight`.
     pub inline fn chance(in: Input, true_weight: u64, false_weight: u64) bool {
         return switch (in.source) {
             .smith => |s| s.boolWeighted(false_weight, true_weight),
@@ -96,7 +78,6 @@ pub const Input = struct {
         };
     }
 
-    /// Fills a prefix of `buf`, of any length, and returns it.
     pub inline fn bytes(in: Input, buf: []u8) []u8 {
         const len = switch (in.source) {
             .smith => |s| s.slice(buf),
@@ -106,7 +87,6 @@ pub const Input = struct {
         return buf[0..len];
     }
 
-    /// Fills `buf`.
     pub inline fn fill(in: Input, buf: []u8) void {
         switch (in.source) {
             .smith => |s| s.bytes(buf),
@@ -114,8 +94,6 @@ pub const Input = struct {
         }
     }
 
-    /// Whether a sequence ends here. The fuzzer ends every sequence
-    /// eventually; a PRNG ends one at each call with odds 1 to 7.
     pub inline fn done(in: Input) bool {
         return switch (in.source) {
             .smith => |s| s.eos(),

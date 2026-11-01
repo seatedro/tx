@@ -1,5 +1,3 @@
-//! Keys and logins: SSH key formats, SSHSIG, the agent client, private
-//! key files, `authorized_keys` and `known_hosts`.
 pub const ssh = @import("ssh.zig");
 pub const sshsig = @import("sshsig.zig");
 pub const login = @import("login.zig");

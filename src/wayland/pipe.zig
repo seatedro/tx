@@ -1,7 +1,3 @@
-//! Clipboard data through the pipes programs pass, on the loop.
-//!
-//! Linux only, as `socket` is: the loop says when a pipe is ready, and the
-//! reads and writes are plain, non-blocking ones.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
@@ -10,14 +6,11 @@ const xev = @import("xev");
 
 const fd_t = posix.fd_t;
 
-/// Bytes that several writers may be sending at once. Freed with the last
-/// reference.
 pub const Blob = struct {
     gpa: Allocator,
     refs: usize = 1,
     bytes: []u8,
 
-    /// Takes `bytes`, which `gpa` allocated. On error they are freed.
     pub fn create(gpa: Allocator, bytes: []u8) Allocator.Error!*Blob {
         errdefer gpa.free(bytes);
         const blob = try gpa.create(Blob);
@@ -38,9 +31,6 @@ pub const Blob = struct {
     }
 };
 
-/// Writes `blob` to `fd`, then closes it. Takes `fd` and a reference to
-/// `blob`. A program that closes its end, or never reads, ends the write
-/// when it exits.
 pub fn write(gpa: Allocator, loop: *xev.Loop, fd: fd_t, blob: *Blob) void {
     setNonblocking(fd);
     const w = gpa.create(Writer) catch {
@@ -59,8 +49,6 @@ const Writer = struct {
     written: usize = 0,
     c: xev.Completion = .{},
 
-    /// Writes as much as the pipe takes. True if there's more to write
-    /// once it has room.
     fn writeSome(w: *Writer) bool {
         while (w.written < w.blob.bytes.len) {
             const rest = w.blob.bytes[w.written..];
@@ -102,8 +90,6 @@ const Writer = struct {
     }
 };
 
-/// Reads a pipe to its end, up to `limit` bytes, then calls `done`.
-/// `cancel` ends it sooner. It frees itself once the loop is done with it.
 pub const Reader = struct {
     gpa: Allocator,
     loop: *xev.Loop,
@@ -113,27 +99,20 @@ pub const Reader = struct {
     handler: Handler,
     c: xev.Completion = .{},
     cancel_c: xev.Completion = .{},
-    /// The poll is in flight, or its callback is running.
     polling: bool = true,
-    /// So is the cancel.
     canceling: bool = false,
 
     pub const Result = union(enum) {
-        /// The pipe's end came. The caller owns the bytes.
         done: []u8,
-        /// More than `limit` bytes.
         too_long,
-        /// The read failed, or was canceled.
         failed,
     };
 
     pub const Handler = struct {
         context: ?*anyopaque,
-        /// Called once. The reader can't be canceled after.
         done: *const fn (context: ?*anyopaque, reader: *Reader, result: Result) void,
     };
 
-    /// Takes `fd`.
     pub fn start(gpa: Allocator, loop: *xev.Loop, fd: fd_t, limit: usize, handler: Handler) Allocator.Error!*Reader {
         errdefer close(fd);
         setNonblocking(fd);
@@ -148,7 +127,6 @@ pub const Reader = struct {
         return r;
     }
 
-    /// Ends the read. `done` follows, with `failed`, from the loop.
     pub fn cancel(r: *Reader) void {
         if (r.canceling or !r.polling) return;
         r.canceling = true;

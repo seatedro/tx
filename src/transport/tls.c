@@ -7,10 +7,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* X25519MLKEM768 first, X25519 for peers without it. */
 static ptls_key_exchange_algorithm_t *key_exchanges[] = {&tx_x25519mlkem768, &tx_x25519, NULL};
 
-/* Without hardware AES, ChaCha20-Poly1305 is the faster suite. */
 static ptls_cipher_suite_t *suites_aes_first[] = {&tx_aes128gcmsha256, &tx_chacha20poly1305sha256,
                                                   NULL};
 static ptls_cipher_suite_t *suites_chacha_first[] = {&tx_chacha20poly1305sha256,
@@ -18,7 +16,6 @@ static ptls_cipher_suite_t *suites_chacha_first[] = {&tx_chacha20poly1305sha256,
 
 static ptls_iovec_t alpn = {(uint8_t *)TX_TLS_ALPN, sizeof(TX_TLS_ALPN) - 1};
 
-/* Selects ALPN tx/1 or fails the handshake. */
 static int on_client_hello(ptls_on_client_hello_t *self, ptls_t *tls,
                            ptls_on_client_hello_parameters_t *params) {
   (void)self;
@@ -123,8 +120,6 @@ int tx_tls_client_presented_key(const tx_tls_client *c, uint8_t out[32]) {
 
 struct tx_tls_session {
   ngtcp2_crypto_picotls_ctx cptls;
-  /* ngtcp2 puts the QUIC transport parameters extension in slot 0; the
-     list is terminated by an entry with type UINT16_MAX. */
   ptls_raw_extension_t extensions[2];
 };
 

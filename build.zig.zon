@@ -9,9 +9,6 @@
             .hash = "ghostty-1.3.2-dev-5UdBC__whQXAL8QvZGz2l3tnrp1BTVI2yEQudaD4wgEw",
         },
         .libxev = .{
-            // seatedro/libxev, branch tx: 819ffa18, the commit Ghostty pins,
-            // plus fixes to UDP receive on kqueue and to disarms in kqueue
-            // ticks that don't wait.
             .url = "https://github.com/seatedro/libxev/archive/1bf7b0848b8268f019d0232b03c9a114e12f9448.tar.gz",
             .hash = "libxev-0.0.0-86vtcxk7FAAb7Ad7QAYld65xUS8n3627DtvBFvfFF3Ce",
         },

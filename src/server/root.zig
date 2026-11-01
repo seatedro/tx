@@ -1,41 +1,3 @@
-//! txd's server: QUIC connections attached to sessions.
-//!
-//! A client opens one bidirectional stream and sends `Hello`, then logs in:
-//! `AuthProbe` for each key it might sign with, and `AuthSignature` with
-//! one the server accepts. Keys come from `authorized_keys`, for the
-//! server's own user only. Once logged in, the client sends `Attach`. The
-//! server answers with `HelloReply`, `AuthProbeReply` and `AuthOk`.
-//!
-//! Each session runs in a process of its own (see `session.process`),
-//! listening on a socket in the runtime directory (see `runtime_dir`). An
-//! attach starts one, or connects to one, and hands it a `Connect`
-//! describing the client and the client's `Attach` or `Resume`. From then
-//! on the server relays: the client's `Input` and `Resize` to the session,
-//! and what the session sends, `Attached`, `Rebuild`, `Output` and `Exit`,
-//! to the client. The session process outlives the server, and a new
-//! server finds it in the runtime directory.
-//!
-//! A connection that closes leaves its session running, detached. A
-//! session ends when its program exits; the attached client gets `Exit`.
-//! A session process that ends without `Exit` gets the client `Error`
-//! with `session_lost`.
-//!
-//! A client that lost its connection logs in on a new one with `Resume`,
-//! which the session checks against its resume key. The login completes
-//! when the session answers with `Attached`.
-//!
-//! A logged-in client may also list the sessions (`List`), end one
-//! (`Kill`), or run a command (`Exec`, see `exec`).
-//!
-//! Listening on a wildcard address binds each address it covers, and
-//! follows addresses as they come and go (see `addresses`). With
-//! `Options.scope` set to `tailnet`, those are only Tailscale's and
-//! loopback.
-//!
-//! On Linux, with `Options.wayland_socket`, the server also runs the
-//! clipboard server there (see `wayland`), and sessions find it through
-//! `WAYLAND_DISPLAY`. Attached clients offer their clipboard to it with
-//! `ClipboardOffer` and answer its reads (see `clipboard`).
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
@@ -67,57 +29,30 @@ const log = std.log.scoped(.server);
 
 pub const Options = struct {
     listen: IpAddress,
-    /// The addresses a wildcard `listen` covers.
     scope: addresses.Scope = .all,
     identity: Ed25519.KeyPair,
-    /// The account clients log in as. A login names it, or names no
-    /// account; no other name is accepted.
     user: []const u8,
-    /// `authorized_keys` files. The first one that exists is read, at each
-    /// login attempt.
     authorized_keys: []const []const u8,
-    /// Where the session processes listen. See `runtime_dir`.
     runtime_dir: []const u8,
-    /// txd's executable, as an absolute path, which runs the session
-    /// processes.
     session_exe: []const u8,
-    /// Where the session processes log. Null is txd's stderr.
     session_log: ?posix.fd_t = null,
-    /// The environment of new sessions. `TERM` and `COLORTERM` come from the
-    /// client, and so do the `LANG` and `LC_*` variables it sends.
     environ: *const std.process.Environ.Map,
-    /// The user's shell, which runs the commands of `Exec` with `-c`.
     shell: []const u8 = "/bin/sh",
-    /// Where clients' terminfo entries are compiled (see `terminfo`). Null
-    /// leaves them out.
     terminfo_dir: ?[]const u8 = null,
-    /// argv of the program new sessions run. See `session.pty.Options`.
     argv: []const []const u8,
     program: ?[]const u8 = null,
     cwd: std.process.Child.Cwd = .inherit,
-    /// Scrollback and log limits of each session's terminal.
     terminal: session.host.Options.TerminalOptions = .{},
     idle_timeout_ns: u64 = 30 * std.time.ns_per_s,
-    /// Limits on connections that haven't logged in.
     pending: transport.pending.Limits = .{},
-    /// Where the clipboard server listens, on Linux. Null runs none.
     wayland_socket: ?[]const u8 = null,
 };
 
-/// The clipboard server, which only Linux has. Code that uses it is behind
-/// `has_clipboard`, so that it isn't compiled elsewhere.
 const has_clipboard = builtin.os.tag == .linux;
 const Clipboard = if (has_clipboard) clipboard.Clipboard else void;
 
-/// What sessions get with the clipboard server, besides `WAYLAND_DISPLAY`.
-/// A program that finds a Wayland server takes it for a display, and these
-/// keep the ones that would draw on it to what they do on a server with
-/// none. A shell profile can still set them. `XDG_SESSION_TYPE` is left
-/// unset, since `wayland` there would send Qt 5, SDL and Chromium to it.
 const display_defaults = [_]struct { []const u8, []const u8 }{
-    // matplotlib draws to files, as without a display.
     .{ "MPLBACKEND", "Agg" },
-    // SDL 2 and 3, and Qt, look for X11 instead, and find none.
     .{ "SDL_VIDEODRIVER", "x11" },
     .{ "SDL_VIDEO_DRIVER", "x11" },
     .{ "QT_QPA_PLATFORM", "xcb" },
@@ -125,30 +60,20 @@ const display_defaults = [_]struct { []const u8, []const u8 }{
 
 pub const ErrorCode = proto.ErrorCode;
 
-/// Output buffered on a stream above which the server stops reading the
-/// session's channel, and below which it resumes.
 const high_water = 1 << 20;
 const low_water = 256 << 10;
 
-/// How long the sessions have to answer a `List`.
 const query_timeout_ms = 1000;
 
-/// The longest message body accepted from a client.
 const max_message = 1 << 20;
 
-/// The longest message body accepted before login. Login messages carry
-/// a user name, a key and a signature.
 const max_login_message = 16 << 10;
 
-/// Probes and signatures a client may send before the server gives up, as
-/// sshd's MaxAuthTries.
 const max_login_attempts = 6;
 
 const boundedSize = session.session.boundedSize;
 const cellSize = session.session.cellSize;
 
-/// How often a server listening on a wildcard address looks for addresses
-/// that came or went.
 const rescan_ms = 5000;
 
 pub const Server = struct {
@@ -157,36 +82,23 @@ pub const Server = struct {
     loop: *xev.Loop,
     options: Options,
     tls: transport.quic.Server,
-    /// Shared by the endpoints.
     pending: transport.pending.Pending,
-    /// One per address listened on. They don't move.
     endpoints: std.ArrayList(*Endpoint) = .empty,
-    /// Endpoints whose address went away, freed once stopped.
     retired: std.ArrayList(*Endpoint) = .empty,
-    /// Set when `Options.listen` is a wildcard address.
     rescan: ?Rescan = null,
-    /// The commands clients run. Each removes itself when it frees itself.
     execs: std.ArrayList(*Exec) = .empty,
     stopping: bool = false,
-    /// No session started by this server has an ID below it.
     next_id: u64 = 1,
-    /// Running at `Options.wayland_socket`. It frees itself once stopped.
     clipboard: ?*Clipboard = null,
 
     const Rescan = struct {
-        /// `Options.listen`, with the port the first bind got if it asked
-        /// for 0.
         wildcard: IpAddress,
-        /// Loopback addresses for the host name, found once at startup.
         host_loopback: []IpAddress,
         timer: xev.Timer,
         c: xev.Completion = .{},
         cancel_c: xev.Completion = .{},
     };
 
-    /// The server must not move while the loop runs. Ignores SIGPIPE: a
-    /// session process that ends would otherwise end txd at the next write
-    /// to it.
     pub fn init(self: *Server, gpa: Allocator, io: Io, loop: *xev.Loop, options: Options) !void {
         unix.ignoreSigpipe();
         try runtime_dir.prepare(io, options.runtime_dir);
@@ -206,21 +118,17 @@ pub const Server = struct {
             return;
         }
 
-        // A wildcard: each address it covers, and again as they change.
         self.rescan = .{
             .wildcard = options.listen,
             .host_loopback = try addresses.hostLoopback(gpa, io, options.listen),
             .timer = try .init(),
         };
         const in_use = try self.updateAddresses(.initial);
-        // With every address taken, another server likely has the port.
         if (self.endpoints.items.len == 0) return if (in_use > 0) error.AddressInUse else error.NoAddresses;
         self.rescan.?.timer.run(loop, &self.rescan.?.c, rescan_ms, Server, self, onRescan);
         self.startClipboard();
     }
 
-    /// Last in `init`, since nothing frees the clipboard but the loop.
-    /// Sessions do without one if it doesn't start.
     fn startClipboard(self: *Server) void {
         if (!has_clipboard) return;
         const path = self.options.wayland_socket orelse return;
@@ -230,17 +138,12 @@ pub const Server = struct {
         };
     }
 
-    /// The first bound address, with the port the kernel picked.
     pub fn address(self: *const Server) IpAddress {
         return self.endpoints.items[0].local;
     }
 
-    /// Closes every connection. The sessions keep running, detached. Run
-    /// the loop until it has no active completions, then call `deinit`.
     pub fn stop(self: *Server) void {
         self.stopping = true;
-        // Their connections close too. The commands may not end on their
-        // own, and the loop runs until they do.
         for (self.execs.items) |e| e.kill();
         for (self.endpoints.items) |e| e.stop();
         if (has_clipboard) if (self.clipboard) |cb| cb.close();
@@ -253,7 +156,6 @@ pub const Server = struct {
 
     pub fn deinit(self: *Server) void {
         for (self.endpoints.items) |e| self.destroyEndpoint(e);
-        // Commands left from a server that wasn't stopped.
         while (self.execs.items.len > 0) self.execs.items[0].destroy();
         self.execs.deinit(self.gpa);
         self.endpoints.deinit(self.gpa);
@@ -268,7 +170,6 @@ pub const Server = struct {
         self.* = undefined;
     }
 
-    /// Binds an endpoint to `local`.
     fn listen(self: *Server, local: IpAddress) !*Endpoint {
         const e = try self.gpa.create(Endpoint);
         errdefer self.gpa.destroy(e);
@@ -298,16 +199,11 @@ pub const Server = struct {
         self.gpa.destroy(e);
     }
 
-    /// Binds the wildcard's addresses that have no endpoint, and stops the
-    /// endpoints of addresses that went away.
-    /// Returns how many addresses failed to bind with `AddressInUse`.
     fn updateAddresses(self: *Server, when: enum { initial, rescan }) !usize {
         const r = &self.rescan.?;
         const found = try addresses.interfaces(self.gpa, r.wildcard, self.options.scope);
         defer self.gpa.free(found);
 
-        // Bound endpoints whose address is gone. Their connections can't
-        // reach the server any more.
         var i: usize = 0;
         while (i < self.endpoints.items.len) {
             const e = self.endpoints.items[i];
@@ -325,13 +221,9 @@ pub const Server = struct {
         for ([_][]const IpAddress{ found, r.host_loopback }) |list| for (list) |found_address| {
             if (self.endpointFor(found_address) != null) continue;
 
-            // The lists carry the port `wildcard` had when they were made,
-            // which is 0 until the first bind picks one.
             var local = found_address;
             local.setPort(r.wildcard.getPort());
 
-            // An IPv6 address still being checked for duplicates can't be
-            // bound yet. A later rescan tries again.
             const e = self.listen(local) catch |err| {
                 if (err == error.AddressInUse) in_use += 1;
                 if (when == .initial) log.warn("can't listen on {f}: {t}", .{ local, err });
@@ -339,7 +231,6 @@ pub const Server = struct {
             };
             log.info("listening on {f}", .{e.local});
 
-            // A port of 0 lets the first bind pick one. The others use it.
             if (r.wildcard.getPort() == 0) r.wildcard.setPort(e.local.getPort());
         };
         return in_use;
@@ -365,7 +256,6 @@ pub const Server = struct {
             break :blk 0;
         };
 
-        // Retired endpoints are freed once the loop has finished with them.
         var i: usize = 0;
         while (i < self.retired.items.len) {
             const e = self.retired.items[i];
@@ -386,9 +276,6 @@ pub const Server = struct {
         return @ptrCast(@alignCast(ctx.?));
     }
 
-    // Endpoint callbacks. A connection's `context` is its `Client`, set once
-    // the handshake completes.
-
     fn onConnected(ctx: ?*anyopaque, conn: *Conn) void {
         const self = fromCtx(ctx);
         const client = self.gpa.create(Client) catch return conn.close(0);
@@ -396,9 +283,6 @@ pub const Server = struct {
         conn.context = client;
     }
 
-    /// A client's first stream carries its messages. An attached client's
-    /// unidirectional streams after it answer clipboard reads. Others are
-    /// refused.
     fn onStreamOpened(_: ?*anyopaque, stream: *Stream) void {
         const client = Client.of(stream.conn) orelse return stream.reset(0);
         if (client.stream == null) {
@@ -419,7 +303,6 @@ pub const Server = struct {
         stream.reset(0);
     }
 
-    /// Stream IDs have the stream's direction in bit 1.
     fn isUni(stream: *const Stream) bool {
         return stream.id & 0x2 != 0;
     }
@@ -430,15 +313,10 @@ pub const Server = struct {
         if (has_clipboard) if (client.answerOn(stream)) |answer| return client.onAnswerData(answer, bytes, fin);
         if (client.stream != stream) return stream.consume(bytes.len);
 
-        // Credit is returned at once while the session's channel keeps up,
-        // and once it drains otherwise.
         if (client.upstream != null and client.upstream.?.congested()) {
             client.held += bytes.len;
         } else stream.consume(bytes.len);
 
-        // Once the server has sent `Error` or `Exit` and finished its side,
-        // what the client sends is dropped, with what was left of the
-        // chunk then.
         if (stream.fin) {
             if (fin) stream.conn.close(0);
             return;
@@ -448,17 +326,12 @@ pub const Server = struct {
         while (true) {
             const message = client.decoder.next() catch return client.fail(.protocol, "malformed message");
             client.handle(message orelse break);
-            // `handle` may have closed the connection, or sent `Error` and
-            // finished the stream.
             if (stream.conn.closing != null or stream.fin) return;
         }
 
-        // The client finished its side: it is gone.
         if (fin) stream.conn.close(0);
     }
 
-    /// The client's stream drained. Read the session's channel again once
-    /// it is below `low_water`.
     fn onAcked(_: ?*anyopaque, stream: *Stream) void {
         const client = Client.of(stream.conn) orelse return;
         if (client.exec) |e| if (e.owns(stream)) return e.acked(stream);
@@ -473,28 +346,21 @@ pub const Server = struct {
         if (has_clipboard) if (client.answerOn(stream)) |answer| client.endAnswer(answer, null);
     }
 
-    /// The session, if any, keeps running detached.
     fn onClosed(_: ?*anyopaque, conn: *Conn, reason: transport.endpoint.CloseReason) void {
         const client = Client.of(conn) orelse return;
-        // A client that closes its connection left on purpose. One that
-        // went silent may resume.
         client.destroy(reason == .peer);
         conn.context = null;
     }
 
-    /// A client that hasn't logged in in time. The endpoint closes the
-    /// connection shortly after.
     fn onPendingExpired(_: ?*anyopaque, conn: *Conn) void {
         const client = Client.of(conn) orelse return;
         log.info("{f} didn't log in in time", .{conn.remote});
         client.fail(.auth, "login timed out");
     }
 
-    /// Whether `key_blob` may log in as `user`.
     fn accepts(self: *Server, user: []const u8, key_blob: []const u8) bool {
         if (user.len > 0 and !std.mem.eql(u8, user, self.options.user)) return false;
 
-        // Ed25519 and RSA keys.
         const key = auth.ssh.PublicKey.parse(key_blob) catch return false;
 
         const match = auth.authorized_keys.check(self.io, self.gpa, self.options.authorized_keys, &key) catch |err| {
@@ -511,13 +377,10 @@ pub const Server = struct {
         };
     }
 
-    /// The socket of session `id`, in `buf`.
     fn socketPath(self: *const Server, buf: []u8, id: u64) error{NameTooLong}![]const u8 {
         return runtime_dir.socketPath(buf, self.options.runtime_dir, id);
     }
 
-    /// Connects to session `id`. Null if there is no such session; the
-    /// socket of a process that ended is removed.
     fn connectSession(self: *Server, id: u64) ?posix.fd_t {
         var buf: [std.fs.max_path_bytes]u8 = undefined;
         const path = self.socketPath(&buf, id) catch return null;
@@ -531,14 +394,10 @@ pub const Server = struct {
         };
     }
 
-    /// The sessions in the runtime directory, in order of ID. Owned by the
-    /// caller.
     fn sessionIds(self: *Server) ![]u64 {
         return runtime_dir.ids(self.gpa, self.io, self.options.runtime_dir);
     }
 
-    /// An ID no session in the runtime directory has, above those this
-    /// server started.
     fn newId(self: *Server) !u64 {
         const ids = try self.sessionIds();
         defer self.gpa.free(ids);
@@ -548,13 +407,9 @@ pub const Server = struct {
         return id;
     }
 
-    /// The server's environment, with the client's locale variables in
-    /// place of the server's, and the clipboard server. Items that aren't
-    /// a locale variable are left out.
     fn clientEnviron(self: *Server, arena: Allocator, hello: *const Hello) !std.process.Environ.Map {
         var environ = try self.options.environ.clone(arena);
         if (self.clipboard != null) {
-            // An absolute WAYLAND_DISPLAY is the socket's path.
             try environ.put("WAYLAND_DISPLAY", self.options.wayland_socket.?);
             for (display_defaults) |entry| {
                 const name, const value = entry;
@@ -572,8 +427,6 @@ pub const Server = struct {
         return environ;
     }
 
-    /// Starts a session process for the client that said `hello`, and
-    /// returns the channel to it, with `Start` sent.
     fn startSession(self: *Server, hello: *const Hello, new: NewSession, handler: session.channel.Handler) !*Channel {
         const command = new.command;
         const id = try self.newId();
@@ -581,15 +434,11 @@ pub const Server = struct {
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
-        // The client's environment, plus what describes its terminal and
-        // the session's ID.
         var environ = try self.clientEnviron(arena, hello);
         try environ.put("TERM", hello.term.items);
         if (hello.colorterm.items.len > 0) try environ.put("COLORTERM", hello.colorterm.items);
         try environ.put("TX_SESSION_ID", try std.fmt.allocPrint(arena, "{d}", .{id}));
 
-        // The client's terminfo entry, which the host may lack. Without it,
-        // an entry every host has, in place of the client's.
         if (new.terminfo) |source| if (self.options.terminfo_dir) |base| {
             if (terminfo.install(arena, self.io, base, source)) |dir| {
                 try environ.put("TERMINFO", dir);
@@ -599,7 +448,6 @@ pub const Server = struct {
             }
         };
 
-        // Lists of NUL-terminated items.
         var environ_list: std.ArrayList(u8) = .empty;
         var it = environ.iterator();
         while (it.next()) |entry| try environ_list.print(arena, "{s}={s}\x00", .{ entry.key_ptr.*, entry.value_ptr.* });
@@ -642,16 +490,11 @@ pub const Server = struct {
     }
 };
 
-/// What a new session runs, past what its client said in `Hello`.
 const NewSession = struct {
-    /// Runs with the shell's `-c`, in place of the login shell.
     command: ?[]const u8 = null,
-    /// See `proto.Attach.terminfo`.
     terminfo: ?[]const u8 = null,
 };
 
-/// The colors from a client's `Attach`, copied out of the decoder's
-/// buffer.
 const Colors = struct {
     foreground: ?u32 = null,
     background: ?u32 = null,
@@ -667,7 +510,6 @@ const Colors = struct {
         return colors;
     }
 
-    /// `m` with these colors. It points into `colors`.
     fn in(colors: *const Colors, m: proto.Attach) proto.Attach {
         var with = m;
         with.foreground = colors.foreground;
@@ -678,21 +520,16 @@ const Colors = struct {
     }
 };
 
-/// The `TERM` of a session whose client's terminfo entry can't be used.
 const fallback_term = "xterm-256color";
 
-/// macOS's Terminal sets `LC_CTYPE=UTF-8`, which names no locale on Linux.
-/// There, it is `C.UTF-8`.
 fn localeValue(value: []const u8) []const u8 {
     if (builtin.os.tag == .linux and std.mem.eql(u8, value, "UTF-8")) return "C.UTF-8";
     return value;
 }
 
-/// What a client said in `Hello`, copied out of the decoder's buffer.
 const Hello = struct {
     term: std.ArrayList(u8) = .empty,
     colorterm: std.ArrayList(u8) = .empty,
-    /// See `proto.Hello.locale`.
     locale: std.ArrayList(u8) = .empty,
     size: term.log.Resize = undefined,
 
@@ -709,21 +546,14 @@ const Hello = struct {
     }
 };
 
-/// One connection's state.
-/// A client's answer to a clipboard read, as it arrives: `ClipboardData`,
-/// then the data.
 const ClipboardAnswer = struct {
     stream: *Stream,
-    /// The header and the data so far.
     bytes: std.ArrayList(u8) = .empty,
-    /// From the header, once it's whole.
     id: ?u64 = null,
     refused: bool = false,
-    /// Where the data starts in `bytes`.
     data_start: usize = 0,
 };
 
-/// The longest `ClipboardData` header.
 const max_answer_header = 64;
 
 const Client = struct {
@@ -733,56 +563,36 @@ const Client = struct {
     decoder: proto.Decoder,
     hello: ?Hello = null,
     logged_in: bool = false,
-    /// Probes and signatures received.
     login_attempts: u32 = 0,
-    /// The channel to the session the client attached to, or is attaching
-    /// to.
     upstream: ?*Channel = null,
-    /// From the session's `Attached`.
     session_id: ?u64 = null,
-    /// A `List`, or an `Attach` with `reuse`, waiting for the sessions'
-    /// answers.
     query: ?*Query = null,
-    /// The command the client runs, until it frees itself.
     exec: ?*Exec = null,
-    /// From `Attach`, for the session it starts. Empty without one.
     terminfo: std.ArrayList(u8) = .empty,
-    /// From `Attach`, for every `Attach` sent to a session.
     colors: Colors = .{},
     hangup: bool = false,
-    /// Stream bytes not yet consumed. The client's input waits while the
-    /// session's channel is congested.
     held: usize = 0,
-    /// The highest seq the client reported written to its terminal.
     acked: ?u64 = null,
-    /// The client, as the clipboard sees it.
     peer: clipboard.Peer = .{ .request = sendClipboardRequest, .copy = sendClipboardCopy },
-    /// Clipboard answers arriving on the client's streams.
     answers: std.ArrayList(*ClipboardAnswer) = .empty,
 
     fn of(conn: *Conn) ?*Client {
         return @ptrCast(@alignCast(conn.context orelse return null));
     }
 
-    /// `left`: the client left on purpose, which the session is told.
     fn destroy(client: *Client, left: bool) void {
         const gpa = client.server.gpa;
-        // The session sees its channel close, and detaches.
         if (client.upstream) |u| {
             if (left) {
-                // Written before the channel closes. No handler call
-                // follows: the client is gone.
                 u.handler = null;
                 u.send(.{ .detach = .{} });
                 u.finish();
             } else u.close();
         }
         if (client.query) |q| q.abandon();
-        // The command keeps running, without its streams.
         if (client.exec) |e| e.detach();
         if (has_clipboard) {
             if (client.server.clipboard) |cb| cb.gone(&client.peer);
-            // Left if the clipboard stopped first.
             client.peer.dropOffer(gpa);
             for (client.answers.items) |answer| {
                 answer.bytes.deinit(gpa);
@@ -796,11 +606,7 @@ const Client = struct {
         gpa.destroy(client);
     }
 
-    /// Hello, then the login, then Attach, then Input, Resize, Ack and
-    /// Detach. Unknown message types are ignored, for newer clients. txd's
-    /// own messages are refused.
     fn handle(client: *Client, message: proto.Message) void {
-        // Before login, a client can say hello, log in and leave.
         if (!client.logged_in) switch (message) {
             .hello, .auth_probe, .auth_signature, .@"resume", .detach, .unknown => {},
             else => return client.fail(.protocol, "not logged in"),
@@ -827,13 +633,11 @@ const Client = struct {
         }
     }
 
-    /// An attached client's clipboard changed.
     fn onClipboardOffer(client: *Client, m: proto.ClipboardOffer) void {
         if (!has_clipboard) return;
         const cb = client.server.clipboard orelse return;
         if (client.upstream == null) return;
 
-        // The types are NUL-terminated, at most `max_mimes` of them.
         var mimes: [wayland.server.max_mimes][]const u8 = undefined;
         var count: usize = 0;
         var it = std.mem.splitScalar(u8, m.mimes, 0);
@@ -853,8 +657,6 @@ const Client = struct {
         fromPeer(peer).send(.{ .clipboard_request = m });
     }
 
-    /// A program's copy, on a stream of its own, so that it doesn't hold up
-    /// the session's output.
     fn sendClipboardCopy(peer: *clipboard.Peer, mimes: []const []const u8, data: []const *wayland.pipe.Blob) void {
         const client = fromPeer(peer);
         const gpa = client.server.gpa;
@@ -900,7 +702,6 @@ const Client = struct {
             return client.endAnswer(answer, null);
         };
 
-        // The header first. It says which read this answers.
         if (answer.id == null) {
             const m, const len = (proto.frame.firstMessage(answer.bytes.items, max_answer_header) catch {
                 answer.stream.reset(0);
@@ -924,8 +725,6 @@ const Client = struct {
         client.endAnswer(answer, data);
     }
 
-    /// The answer is done, with its data, which this takes, or none. Every
-    /// answer ends here once, at its end, a failure or its stream closing.
     fn endAnswer(client: *Client, answer: *ClipboardAnswer, data: ?[]u8) void {
         const gpa = client.server.gpa;
         const index = std.mem.indexOfScalar(*ClipboardAnswer, client.answers.items, answer) orelse return;
@@ -941,7 +740,6 @@ const Client = struct {
         if (client.hello != null) return client.fail(.protocol, "second hello");
         if (m.revision != proto.revision) return client.fail(.revision, "unsupported protocol revision");
 
-        // Copied: the decoder's buffer is reused for the next message.
         const gpa = client.server.gpa;
         var hello: Hello = .{ .size = boundedSize(m.cols, m.rows, cellSize(m.cell_width_px, m.cell_height_px)) orelse
             .{ .cols = 80, .rows = 24 } };
@@ -962,13 +760,10 @@ const Client = struct {
         if (!client.startLoginAttempt()) return;
         const server = client.server;
 
-        // `accepts` checked the user name and the key's type.
         if (!server.accepts(m.user, m.key)) return client.fail(.auth, "login refused");
         const key = auth.ssh.PublicKey.parse(m.key) catch unreachable;
         const fingerprint = auth.Fingerprint.ofBlob(key.blob());
 
-        // The transcript as the server sees the connection. A signature
-        // made for another connection or server doesn't match it.
         var transcript: auth.login.Transcript = .{
             .exporter = undefined,
             .host_key = server.options.identity.public_key.toBytes(),
@@ -994,8 +789,6 @@ const Client = struct {
         client.decoder.max_body_len = max_message;
     }
 
-    /// Counts a probe or signature. False if the client has used up its
-    /// attempts, or is logged in already.
     fn startLoginAttempt(client: *Client) bool {
         if (client.hello == null) {
             client.fail(.protocol, "login before hello");
@@ -1061,7 +854,6 @@ const Client = struct {
         if (client.hello == null) return client.fail(.protocol, "attach before hello");
         if (client.upstream != null or client.query != null or client.exec != null) return client.fail(.protocol, "second attach");
 
-        // Copied: a new session may start after the sessions answer.
         client.colors = .of(m);
         client.hangup = m.hangup;
         if (m.terminfo) |source| {
@@ -1069,15 +861,11 @@ const Client = struct {
             client.terminfo.appendSlice(client.server.gpa, source) catch return client.fail(.protocol, "out of memory");
         }
 
-        // A command runs in a new session.
         if (m.command) |command| {
             if (m.session_id != null or m.reuse) return client.fail(.protocol, "a command needs a new session");
             return client.startNew(command);
         }
 
-        // An ID reattaches, and so does `reuse` with one detached session,
-        // once the sessions have answered. Otherwise a new session starts,
-        // and its output goes to the client from the first record.
         if (m.session_id) |id| {
             const fd = client.server.connectSession(id) orelse return client.fail(.no_session, "no such session");
             return client.connectTo(fd, null, .{ .attach = m });
@@ -1099,22 +887,16 @@ const Client = struct {
         client.sendConnect(null, .{ .attach = .{} });
     }
 
-    /// Logs in with a proof of the session's resume key, which the session
-    /// checks.
     fn onResume(client: *Client, m: proto.Resume) void {
         if (!client.startLoginAttempt()) return;
         if (client.upstream != null) return client.fail(.protocol, "second attach");
 
-        // A session that doesn't exist and a proof that doesn't match get
-        // the same answer.
         const fd = client.server.connectSession(m.session_id) orelse return client.fail(.auth, "can't resume the session");
         var exporter: [auth.resume_.exporter_len]u8 = undefined;
         client.conn.quic.exportSecret(&exporter, auth.resume_.exporter_label);
         client.connectTo(fd, &exporter, .{ .@"resume" = m });
     }
 
-    /// Hands the client to the session on `fd`, with `first`. The session
-    /// answers on the channel.
     fn connectTo(client: *Client, fd: posix.fd_t, resume_exporter: ?[]const u8, first: session.session.First) void {
         client.upstream = Channel.create(client.server.gpa, client.server.loop, fd, client.upstreamHandler()) catch {
             unix.close(fd);
@@ -1137,8 +919,6 @@ const Client = struct {
             .resume_exporter = resume_exporter,
             .internal_revision = proto.internal_revision,
         } });
-        // Every `Attach` carries the client's colors and `hangup`, the
-        // server's own for a new session included.
         u.send(switch (first) {
             .attach => |m| attach: {
                 var with = client.colors.in(m);
@@ -1151,7 +931,6 @@ const Client = struct {
 
     fn onKill(client: *Client, m: proto.Kill) void {
         const fd = client.server.connectSession(m.session_id) orelse return client.fail(.no_session, "no such session");
-        // The session's answer isn't needed: it ends.
         const ch = Channel.create(client.server.gpa, client.server.loop, fd, ignored_handler) catch {
             unix.close(fd);
             return client.fail(.protocol, "out of memory");
@@ -1178,12 +957,10 @@ const Client = struct {
             log.warn("listing the sessions failed: {t}", .{err});
             return client.fail(.protocol, "can't list the sessions");
         };
-        // With no session to ask, this reports at once.
         client.query = q;
         q.reportIfDone();
     }
 
-    /// The sessions answered `List`, in order of ID.
     fn onQueryDone(client: *Client, q: *Query) void {
         client.query = null;
         switch (q.purpose) {
@@ -1195,8 +972,6 @@ const Client = struct {
         }
     }
 
-    /// Attaches the detached session if there is exactly one, and starts
-    /// one if there is none. With several, sends `Error` naming them.
     fn reuseDetached(client: *Client, q: *const Query) void {
         var found: ?u64 = null;
         var count: usize = 0;
@@ -1208,7 +983,6 @@ const Client = struct {
             if (info.attached_from != null) continue;
             found = a.id;
             count += 1;
-            // A message too long for the buffer is cut short.
             w.print("{s} {d}", .{ if (count > 1) "," else "", a.id }) catch {};
         }
 
@@ -1229,8 +1003,6 @@ const Client = struct {
         return @ptrCast(@alignCast(context));
     }
 
-    /// A message from the session, forwarded as it is. `Started` is the
-    /// server's alone.
     fn onUpstream(context: *anyopaque, u: *Channel, raw: proto.Decoder.Raw) void {
         const client = fromContext(context);
         switch (raw.type_id) {
@@ -1238,16 +1010,12 @@ const Client = struct {
             proto.Attached.type_id => {
                 const m = proto.Attached.decode(raw.body) catch return client.fail(.protocol, "malformed message from the session");
                 client.session_id = m.session_id;
-                // A resume's login completes when the session accepts its
-                // proof.
                 if (!client.logged_in) client.completeLogin();
             },
             else => {},
         }
         client.forward(raw.bytes);
 
-        // Nothing follows `Exit` or `Error`. The client leaves once it has
-        // read it.
         if (raw.type_id == proto.Exit.type_id or raw.type_id == proto.Error.type_id) {
             client.upstream = null;
             u.close();
@@ -1255,13 +1023,9 @@ const Client = struct {
             return;
         }
 
-        // The stream copies what it's given. A client that doesn't take it
-        // would grow it without bound. The session stops when its channel
-        // backs up.
         if (client.stream) |stream| if (stream.buffered() > high_water) u.pauseReading();
     }
 
-    /// The session's channel has room. The client may send more input.
     fn onUpstreamDrained(context: *anyopaque, _: *Channel) void {
         const client = fromContext(context);
         const stream = client.stream orelse return;
@@ -1269,7 +1033,6 @@ const Client = struct {
         client.held = 0;
     }
 
-    /// The session's process ended before the program did.
     fn onUpstreamClosed(context: *anyopaque, _: *Channel) void {
         const client = fromContext(context);
         client.upstream = null;
@@ -1277,17 +1040,12 @@ const Client = struct {
         client.fail(.session_lost, "the session's process ended");
     }
 
-    /// Writes encoded messages to the stream, which copies them. A failure
-    /// closes the connection.
     fn forward(client: *Client, bytes: []const u8) void {
         const stream = client.stream orelse return;
-        // Nothing follows `Error` or `Exit`.
         if (stream.fin) return;
         stream.write(bytes) catch client.conn.close(0);
     }
 
-    /// Encodes `message` onto the stream, which copies it. A failure closes
-    /// the connection.
     fn send(client: *Client, message: proto.Message) void {
         const stream = client.stream orelse return;
         if (stream.fin) return;
@@ -1299,25 +1057,17 @@ const Client = struct {
         stream.write(buf) catch client.conn.close(0);
     }
 
-    /// Sends `Error` and finishes the stream. The client closes the
-    /// connection after reading it.
     fn fail(client: *Client, code: ErrorCode, message: []const u8) void {
         client.send(.{ .@"error" = .{ .code = @backingInt(code), .message = message } });
         if (client.stream) |stream| stream.finish();
     }
 };
 
-/// A `List` sent to every session, and their answers. Sessions that don't
-/// answer within `query_timeout_ms` are left out. The query frees itself
-/// once it has reported and its timer, if any, has ended.
 const Query = struct {
     server: *Server,
-    /// Null once the client has gone.
     client: ?*Client,
     purpose: Purpose,
-    /// One for each session, in order of ID.
     answers: std.ArrayList(Answer) = .empty,
-    /// Answers still to come.
     waiting: usize = 0,
     reported: bool = false,
     timer: xev.Timer,
@@ -1329,10 +1079,7 @@ const Query = struct {
     const Answer = struct {
         query: *Query,
         id: u64,
-        /// Null once answered.
         channel: ?*Channel,
-        /// The `SessionInfo`, as the session sent it, and where its body
-        /// starts.
         reply: ?[]u8 = null,
         body_start: usize = 0,
 
@@ -1342,7 +1089,6 @@ const Query = struct {
         }
     };
 
-    /// Asks the sessions. Call `reportIfDone` next.
     fn start(client: *Client, purpose: Purpose) !*Query {
         const server = client.server;
         const ids = try server.sessionIds();
@@ -1350,7 +1096,6 @@ const Query = struct {
 
         const q = try server.gpa.create(Query);
         q.* = .{ .server = server, .client = client, .purpose = purpose, .timer = try .init() };
-        // `Answer`s point to their query, so the list doesn't grow after.
         try q.answers.ensureTotalCapacity(server.gpa, ids.len);
         for (ids) |id| {
             const fd = server.connectSession(id) orelse continue;
@@ -1365,8 +1110,6 @@ const Query = struct {
             q.waiting += 1;
         }
 
-        // With no session to wait for, the query reports and ends at once.
-        // A timer canceled as soon as it is added can still fire on kqueue.
         if (q.waiting > 0) q.timer.run(server.loop, &q.timer_c, query_timeout_ms, Query, q, onTimer);
         return q;
     }
@@ -1401,12 +1144,9 @@ const Query = struct {
         if (q.waiting > 0 or q.reported) return;
         q.report();
         if (q.timer_c.state() == .dead) return q.destroy();
-        // The timer's callback frees the query.
         q.timer.cancel(q.server.loop, &q.timer_c, &q.cancel_c, Query, q, onCanceled);
     }
 
-    /// Hands the answers to the client, and closes the channels of the
-    /// sessions that haven't answered.
     fn report(q: *Query) void {
         q.reported = true;
         for (q.answers.items) |*a| if (a.channel) |ch| {
@@ -1416,7 +1156,6 @@ const Query = struct {
         if (q.client) |client| client.onQueryDone(q);
     }
 
-    /// The client went away.
     fn abandon(q: *Query) void {
         q.client = null;
         if (!q.reported) q.report();
@@ -1448,6 +1187,5 @@ test {
     _ = addresses;
     _ = exec;
     _ = terminfo;
-    // Analyzes the crypto module, whose exports the linked C code needs.
     _ = &transport.crypto.init;
 }

@@ -1,9 +1,5 @@
 name: Nightly
 
-# Publishes main as the GitHub release 0.0.0-nightly.YYYYMMDD (the version
-# in build.zig.zon, then the date), each night that main has changed and
-# passed CI. install.sh installs the latest release.
-
 on:
   schedule:
     - cron: "0 4 * * *"
@@ -21,7 +17,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # The tags, to tell whether main moved since the last release.
           fetch-depth: 0
       - id: plan
         run: |
@@ -39,7 +34,6 @@ jobs:
           echo "version=$base-nightly.$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
       - if: steps.plan.outputs.version
         uses: mlugg/setup-zig@v2
-      # The packages build.zig.zon names, which zig fetches into zig-pkg.
       - if: steps.plan.outputs.version
         uses: actions/cache@v4
         with:
@@ -54,7 +48,6 @@ jobs:
           cd zig-out/release
           sha256sum tx-*.tar.gz > SHA256SUMS
           cp ../../install.sh .
-          # A second run on one day replaces that day's release.
           gh release delete "v$VERSION" --cleanup-tag --yes 2>/dev/null || true
           gh release create "v$VERSION" --target "$GITHUB_SHA" --latest \
             --title "tx $VERSION" --notes "Nightly build of $GITHUB_SHA." \

@@ -1,15 +1,3 @@
-//! Limits on a server's connections that the app hasn't admitted, such as
-//! connections that haven't logged in. All of a server's endpoints share
-//! one `Pending`.
-//!
-//! A connection counts from its first packet until `Conn.admit`, or until
-//! it closes. A new connection is dropped while the server has
-//! `Limits.max` of them, or `Limits.max_per_source` from the client's IPv4
-//! address or IPv6 /64. From `Limits.retry_from` on, a new connection must
-//! first show it receives at its address. The endpoint answers its first
-//! Initial packet with a Retry, and accepts only an Initial that returns
-//! the Retry's token. A connection that isn't admitted within
-//! `Limits.timeout_ns` is closed.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const IpAddress = std.Io.net.IpAddress;
@@ -22,8 +10,6 @@ pub const Limits = struct {
     timeout_ns: u64 = 60 * std.time.ns_per_s,
 };
 
-/// An IPv4 address, or the /64 of an IPv6 address. One host often has a
-/// whole IPv6 /64.
 pub const Source = struct {
     family: enum(u8) { ip4, ip6 },
     prefix: [8]u8,
@@ -33,7 +19,6 @@ pub const Source = struct {
         switch (address) {
             .ip4 => |a| @memcpy(source.prefix[0..4], &a.bytes),
             .ip6 => |a| {
-                // An IPv4 address on a dual-stack socket, as ::ffff:a.b.c.d.
                 const mapped = [12]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
                 if (std.mem.eql(u8, a.bytes[0..12], &mapped)) {
                     @memcpy(source.prefix[0..4], a.bytes[12..16]);
@@ -52,9 +37,7 @@ pub const Pending = struct {
     limits: Limits,
     total: u32 = 0,
     sources: std.AutoHashMapUnmanaged(Source, u32) = .empty,
-    /// Keys the Retry tokens. A token from before a restart doesn't verify.
     retry_secret: [32]u8,
-    /// Retry packets sent, for tests.
     retries: u64 = 0,
 
     pub const Admission = enum { accept, retry, drop };
@@ -69,8 +52,6 @@ pub const Pending = struct {
         p.sources.deinit(p.gpa);
     }
 
-    /// What to do with a new connection from `source`. `validated` means
-    /// its Initial returned a Retry token.
     pub fn check(p: *const Pending, source: Source, validated: bool) Admission {
         if (p.total >= p.limits.max) return .drop;
         if ((p.sources.get(source) orelse 0) >= p.limits.max_per_source) return .drop;

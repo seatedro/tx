@@ -1,5 +1,3 @@
-//! Builds ngtcp2 (QUIC) from its upstream sources, replacing the CMake
-//! configure step with Zig config headers.
 const std = @import("std");
 
 const version = "1.25.0";
@@ -37,16 +35,10 @@ pub fn core(
 }
 
 pub const CryptoOptions = struct {
-    /// picotls's public headers.
     picotls_include: std.Build.LazyPath,
-    /// Directory containing tx's `picotls/openssl.h`, which maps the OpenSSL
-    /// backend names used by ngtcp2's picotls adapter onto tx's backend.
-    /// Searched before `picotls_include`.
     backend_include: std.Build.LazyPath,
 };
 
-/// ngtcp2's picotls adapter (`crypto/picotls/picotls.c`) and the crypto
-/// helpers it shares with the other adapters.
 pub fn cryptoPicotls(
     b: *std.Build,
     dep: *std.Build.Dependency,
@@ -82,7 +74,6 @@ pub fn cryptoPicotls(
     return lib;
 }
 
-/// Replaces CMake's `config.h`.
 fn configHeader(b: *std.Build, target: std.Build.ResolvedTarget) *std.Build.Step.ConfigHeader {
     const options: std.Build.Step.ConfigHeader.Options = .{ .style = .blank, .include_path = "config.h" };
     if (target.result.os.tag.isDarwin()) return b.addConfigHeader(options, .{

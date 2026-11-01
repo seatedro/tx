@@ -1,5 +1,3 @@
-//! Messages on a byte stream. Each message is `type varint, length varint,
-//! body`, where the length counts the body bytes.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
@@ -8,10 +6,8 @@ const messages = @import("messages.zig");
 const Message = messages.Message;
 const DecodeError = wire.DecodeError;
 
-/// The type and length varints.
 pub const max_header_len = 2 * wire.max_varint_len;
 
-/// The encoded size of `m`, header included.
 pub fn encodedLen(m: Message) usize {
     const body_len = m.encodedLen();
     return wire.varintLen(m.typeId()) + wire.varintLen(body_len) + body_len;
@@ -26,17 +22,13 @@ pub fn encode(w: *Writer, m: Message) Writer.Error!void {
 const Header = struct {
     type_id: u64,
     body_len: usize,
-    /// Bytes taken by the type and length.
     len: usize,
 };
 
-/// Returns error.Truncated if `bytes` ends inside the header.
 fn readHeader(bytes: []const u8, max_body_len: usize) DecodeError!Header {
     const type_id = try wire.readVarint(bytes);
     const body_len = try wire.readVarint(bytes[type_id.len..]);
 
-    // Checked before the body arrives. An oversized message is not
-    // buffered.
     if (body_len.value > max_body_len) return error.Oversize;
 
     return .{
@@ -46,9 +38,6 @@ fn readHeader(bytes: []const u8, max_body_len: usize) DecodeError!Header {
     };
 }
 
-/// The first message in `bytes`, whole, and the bytes it takes. Null if
-/// `bytes` ends inside it. For a stream that starts with a message and
-/// goes on with raw bytes.
 pub fn firstMessage(bytes: []const u8, max_body_len: usize) DecodeError!?struct { Message, usize } {
     const header = readHeader(bytes, max_body_len) catch |err| switch (err) {
         error.Truncated => return null,
@@ -59,33 +48,15 @@ pub fn firstMessage(bytes: []const u8, max_body_len: usize) DecodeError!?struct 
     return .{ try Message.decode(header.type_id, bytes[header.len..len]), len };
 }
 
-/// Splits a byte stream into messages. Feed it chunks of any size with
-/// `feed`, then call `next` until it returns null.
-///
-/// A message from `next` points into the chunk given to the last `feed` or
-/// into the decoder's buffers. It is valid until the next `feed` or
-/// `deinit`, provided the chunk is not modified or freed before then.
-///
-/// A message split across chunks is copied into a buffer that grows to at
-/// most `max_header_len + max_body_len` bytes. A message contained in one
-/// chunk is not copied.
-///
-/// After `next` returns an error other than `error.OutOfMemory`, the stream
-/// is unusable.
 pub const Decoder = struct {
     gpa: Allocator,
     max_body_len: usize,
-    /// The unread part of the last chunk.
     input: []const u8 = &.{},
-    /// The received bytes of a message split across chunks.
     pending: std.ArrayList(u8) = .empty,
-    /// The bytes of the message last completed in `pending`. Kept until
-    /// the next `feed`.
     completed: std.ArrayList(u8) = .empty,
 
     pub const Error = DecodeError || Allocator.Error;
 
-    /// `max_body_len` limits the body length of a message in bytes.
     pub fn init(gpa: Allocator, max_body_len: usize) Decoder {
         return .{ .gpa = gpa, .max_body_len = max_body_len };
     }
@@ -96,32 +67,25 @@ pub const Decoder = struct {
         d.* = undefined;
     }
 
-    /// Drops what was fed and a message received in part, for a new
-    /// stream.
     pub fn reset(d: *Decoder) void {
         d.input = &.{};
         d.pending.clearRetainingCapacity();
         d.completed.clearRetainingCapacity();
     }
 
-    /// Asserts that `next` returned null or an error since the last feed.
     pub fn feed(d: *Decoder, chunk: []const u8) void {
         std.debug.assert(d.input.len == 0);
         d.completed.clearRetainingCapacity();
         d.input = chunk;
     }
 
-    /// Returns the next complete message, or null when the fed bytes are
-    /// used up.
     pub fn next(d: *Decoder) Error!?Message {
         const raw = (try d.nextRaw()) orelse return null;
         return try raw.decode();
     }
 
-    /// A message as it arrived, for forwarding it unchanged.
     pub const Raw = struct {
         type_id: u64,
-        /// The whole message, header included.
         bytes: []const u8,
         body: []const u8,
 
@@ -130,19 +94,15 @@ pub const Decoder = struct {
         }
     };
 
-    /// As `next`, without decoding the body.
     pub fn nextRaw(d: *Decoder) Error!?Raw {
         const header, const bytes = (try d.nextFrame()) orelse return null;
         return .{ .type_id = header.type_id, .bytes = bytes, .body = bytes[header.len..][0..header.body_len] };
     }
 
-    /// Returns the next message's header and its bytes, header included.
     fn nextFrame(d: *Decoder) Error!?struct { Header, []const u8 } {
-        // A message started in an earlier chunk is finished first.
         if (d.pending.items.len > 0) return d.continuePending();
         if (d.input.len == 0) return null;
 
-        // The chunk ends inside a header: keep what there is.
         const header = readHeader(d.input, d.max_body_len) catch |err| switch (err) {
             error.Truncated => {
                 try d.pending.appendSlice(d.gpa, d.input);
@@ -152,7 +112,6 @@ pub const Decoder = struct {
             else => return err,
         };
 
-        // The whole message is in the chunk: return it without copying.
         const total = header.len + header.body_len;
         if (d.input.len >= total) {
             const bytes = d.input[0..total];
@@ -160,8 +119,6 @@ pub const Decoder = struct {
             return .{ header, bytes };
         }
 
-        // The chunk ends inside the body. The rest of the chunk belongs to
-        // this message.
         try d.pending.ensureTotalCapacity(d.gpa, total);
         d.pending.appendSliceAssumeCapacity(d.input);
         d.input = &.{};
@@ -169,8 +126,6 @@ pub const Decoder = struct {
     }
 
     fn continuePending(d: *Decoder) Error!?struct { Header, []const u8 } {
-        // The header is read a byte at a time so that `pending` never holds
-        // bytes past the end of its message.
         const header = while (true) {
             if (readHeader(d.pending.items, d.max_body_len)) |header| {
                 break header;
@@ -183,7 +138,6 @@ pub const Decoder = struct {
             d.input = d.input[1..];
         };
 
-        // Take as much of the body as this chunk has, and no more.
         const total = header.len + header.body_len;
         try d.pending.ensureTotalCapacity(d.gpa, total);
         const n = @min(total - d.pending.items.len, d.input.len);
@@ -191,12 +145,8 @@ pub const Decoder = struct {
         d.input = d.input[n..];
         if (d.pending.items.len < total) return null;
 
-        // `pending` completes at most one message per feed. After it does,
-        // bytes go to `pending` only from the end of the chunk.
         std.debug.assert(d.completed.items.len == 0);
 
-        // The message moves to `completed`, which stays valid until the
-        // next `feed`, and `pending` is free for the next split message.
         std.mem.swap(std.ArrayList(u8), &d.pending, &d.completed);
         return .{ header, d.completed.items };
     }
@@ -230,8 +180,6 @@ fn sampleStream(gpa: Allocator) ![]u8 {
     return out.toOwnedSlice();
 }
 
-/// Feeds `stream` in chunks ending at each offset in `splits` and checks
-/// that the decoder yields `samples`.
 fn expectSamples(stream: []const u8, splits: []const usize) !void {
     var d: Decoder = .init(testing.allocator, 1024);
     defer d.deinit();
@@ -322,8 +270,6 @@ test "messages split across chunks stay valid until the next feed" {
     defer d.deinit();
     d.feed(stream[0..3]);
     try testing.expectEqual(null, try d.next());
-    // Completes "first" in the buffer, holds "second" whole, and ends
-    // inside "third".
     d.feed(stream[3 .. stream.len - 2]);
     const first = (try d.next()).?;
     const second = (try d.next()).?;
@@ -372,7 +318,6 @@ test "a message at the size limit decodes" {
 }
 
 test "a truncated body is an error" {
-    // An Output whose length covers a field with a longer value.
     var d: Decoder = .init(testing.allocator, 1024);
     defer d.deinit();
     d.feed(&.{ 0x05, 0x03, 0x02, 0x05, 'a' });
@@ -397,17 +342,12 @@ test "fuzz: a stream decodes the same whole and in chunks, and its messages enco
     try fuzz.run({}, fuzzStream, .{});
 }
 
-/// One input: a stream from `writeFuzzStream`, given whole to one decoder
-/// and in fuzzed chunks to another. Both must yield the same frames, then
-/// stop the same way: out of input, or with the same error. Each frame
-/// that decodes must decode the same after it is encoded again.
 fn fuzzStream(_: void, in: fuzz.Input) !void {
     var out: Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
     try writeFuzzStream(in, &out.writer);
     const stream = out.written();
 
-    // Whole. Its frames point into `stream`.
     var whole: Decoder = .init(testing.allocator, fuzz_max_body);
     defer whole.deinit();
     var frames: std.ArrayList(Decoder.Raw) = .empty;
@@ -419,7 +359,6 @@ fn fuzzStream(_: void, in: fuzz.Input) !void {
         if (raw.decode()) |m| try expectEncodesBack(m) else |_| {}
     };
 
-    // In chunks of 1 to 64 bytes.
     var split: Decoder = .init(testing.allocator, fuzz_max_body);
     defer split.deinit();
     var n: usize = 0;
@@ -441,10 +380,8 @@ fn fuzzStream(_: void, in: fuzz.Input) !void {
     try testing.expectEqual(whole_end, split_end);
 }
 
-/// The longest body the fuzz decoders take.
 const fuzz_max_body = 512;
 
-/// The type of every message this revision defines.
 const fuzz_type_ids = ids: {
     var ids: []const u64 = &.{};
     for (@typeInfo(Message).@"union".field_types) |T| {
@@ -453,9 +390,6 @@ const fuzz_type_ids = ids: {
     break :ids ids[0..ids.len].*;
 };
 
-/// Writes up to 32 frames: mostly of defined types, with bodies of fields
-/// with the small tags messages use, and true lengths. The rest of the
-/// types, bodies and lengths are anything.
 fn writeFuzzStream(in: fuzz.Input, w: *Writer) !void {
     var body_buf: [fuzz_max_body + 64]u8 = undefined;
     for (0..32) |_| {
@@ -488,7 +422,6 @@ fn writeFuzzStream(in: fuzz.Input, w: *Writer) !void {
     }
 }
 
-/// `m` encodes to `encodedLen(m)` bytes, which decode to `m`.
 fn expectEncodesBack(m: Message) !void {
     var out: Writer.Allocating = .init(testing.allocator);
     defer out.deinit();

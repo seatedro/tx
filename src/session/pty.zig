@@ -1,10 +1,3 @@
-//! A program running on a pseudo-terminal (`Pty`), or with its stdin,
-//! stdout and stderr on sockets (`Pipes`).
-//!
-//! The master, or the parent's ends of the pipes, are non-blocking and
-//! public, for the caller to poll in its own event loop. The caller reaps
-//! the child (see `Pty.wait`). Uses libc only; supports Linux (glibc and
-//! musl) and macOS.
 const std = @import("std");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
@@ -13,12 +6,8 @@ const posix = std.posix;
 const c = std.c;
 const native_os = builtin.os.tag;
 
-/// How the child ended, as `std.process.Child.wait` reports it.
 pub const Term = std.process.Child.Term;
 
-/// A terminal size in cells. `width_px` and `height_px` are the size of the
-/// grid in pixels, used by programs that draw images (sixel, kitty
-/// graphics). 0 means unknown.
 pub const Size = struct {
     cols: u16,
     rows: u16,
@@ -31,27 +20,14 @@ pub const Size = struct {
 };
 
 pub const Options = struct {
-    /// argv[0] is the program's name and, if `program` is null, the program
-    /// to run.
     argv: []const []const u8,
-    /// The program to run if it differs from argv[0], as for a login shell
-    /// ("/bin/zsh" with argv[0] "-zsh"). A name without a slash is looked
-    /// up in the PATH of `environ`.
-    ///
-    /// Must be a binary or a script with a `#!` line. Unlike execvp, ENOEXEC
-    /// is not retried with /bin/sh.
     program: ?[]const u8 = null,
-    /// The program's environment. Nothing is inherited from the host.
     environ: *const std.process.Environ.Map,
     cwd: std.process.Child.Cwd = .inherit,
-    /// Applied before exec.
     size: Size,
-    /// Set when the child fails before or in exec.
     diagnostic: ?*Diagnostic = null,
 };
 
-/// The step and errno of a child that failed to start. chdir and exec can
-/// both fail with ENOENT, for example.
 pub const Diagnostic = struct {
     step: Step,
     errno: posix.E,
@@ -67,41 +43,31 @@ pub const Diagnostic = struct {
 
 pub const SpawnError = error{
     OutOfMemory,
-    /// Out of processes, ptys or kernel memory.
     SystemResources,
     ProcessFdQuotaExceeded,
     SystemFdQuotaExceeded,
-    /// The program does not exist, or is not on PATH.
     FileNotFound,
-    /// The program, or `cwd`, is not accessible.
     AccessDenied,
-    /// The program is not in a format the kernel can execute.
     InvalidExe,
     NameTooLong,
-    /// `cwd` does not exist or is not a directory.
     WorkingDirectoryNotFound,
     Unexpected,
 };
 
 pub const ReadError = error{
-    /// No data yet; poll the master for reading.
     WouldBlock,
     SystemResources,
     Unexpected,
 };
 
 pub const WriteError = error{
-    /// The terminal's input queue is full; poll the master for writing.
     WouldBlock,
-    /// All processes have closed the slave.
     BrokenPipe,
     SystemResources,
     Unexpected,
 };
 
 pub const WaitError = error{
-    /// The child was reaped elsewhere, e.g. because SIGCHLD is set to
-    /// SIG_IGN or the host called `waitpid(-1)`. Its status is lost.
     ProcessNotFound,
     Unexpected,
 };
@@ -110,40 +76,15 @@ pub const KillError = posix.KillError;
 
 pub const ResizeError = error{Unexpected};
 
-/// The master side of a pseudo-terminal and the child process running on
-/// its slave side.
-///
-/// Reap the child with `wait` or `tryWait` only. The kernel may reuse a
-/// reaped pid, and `kill` would then signal the new process.
 pub const Pty = struct {
-    /// Non-blocking, because a program blocked writing output stops reading
-    /// input and a blocking write to it would not return. Close-on-exec, so
-    /// the host's other children don't hold the terminal open. -1 after
-    /// `hangup`.
     master: posix.fd_t,
-    /// Null once the child is reaped.
     pid: ?posix.pid_t,
-    /// Set when the child is reaped.
     term: ?Term,
     tty_name_buf: [128]u8,
     tty_name_len: u8,
-    /// macOS discards what the master hasn't read when the slave's last fd
-    /// closes, which loses the output of a program that exits at once. So
-    /// there, the parent keeps a slave fd until the child has exited and
-    /// `read` has taken its output. -1 elsewhere, and once closed.
     held_slave: posix.fd_t = -1,
-    /// With `held_slave`, a kqueue that turns readable when the child
-    /// exits, as the master won't then. Poll it with the master, and `read`
-    /// when either is ready. -1 elsewhere, and once closed.
     exit_fd: posix.fd_t = -1,
 
-    /// Opens a pty and starts a program on it. Returns after the program
-    /// has been exec'd. If the child fails before exec, it is reaped and its
-    /// errno is mapped to the returned error.
-    ///
-    /// Between fork and exec the child makes only async-signal-safe calls
-    /// and does not allocate, since a malloc lock held by another thread at
-    /// fork would deadlock it.
     pub fn spawn(gpa: Allocator, options: Options) SpawnError!Pty {
         var self: Pty = .{
             .master = try openMaster(),
@@ -156,9 +97,6 @@ pub const Pty = struct {
 
         if (libc.grantpt(self.master) != 0) return openError(posix.errno(-1));
         if (libc.unlockpt(self.master) != 0) return openError(posix.errno(-1));
-        // Don't use ptsname: its static buffer races with other threads. On
-        // error, glibc and musl return the error number; macOS returns -1
-        // and sets errno.
         switch (libc.ptsname_r(self.master, &self.tty_name_buf, self.tty_name_buf.len)) {
             0 => {},
             -1 => return openError(posix.errno(-1)),
@@ -166,22 +104,15 @@ pub const Pty = struct {
         }
         self.tty_name_len = @intCast(std.mem.indexOfScalar(u8, &self.tty_name_buf, 0).?);
 
-        // Without O_NOCTTY, a host with no controlling terminal would
-        // acquire this one.
         const slave = try aboveStdio(try openFd(self.tty_name_buf[0..self.tty_name_len :0], .{
             .ACCMODE = .RDWR,
             .NOCTTY = true,
             .CLOEXEC = true,
         }));
-        // The parent closes the slave so that reads from the master see end
-        // of file when the child's side is closed. On macOS, `read` closes
-        // it once the child has exited (see `held_slave`).
         const hold = native_os.isDarwin();
         defer if (!hold) closeFd(slave);
         errdefer if (hold) closeFd(slave);
 
-        // Canonical mode erases whole UTF-8 characters only with IUTF8,
-        // which neither Linux nor macOS sets by default.
         var attrs: posix.termios = undefined;
         try getAttrs(slave, &attrs);
         attrs.iflag.IUTF8 = true;
@@ -200,7 +131,6 @@ pub const Pty = struct {
         if (hold) {
             self.held_slave = slave;
             self.exit_fd = watchExit(self.pid.?) catch |err| {
-                // The child runs, and is reaped by `deinit`.
                 closeFd(slave);
                 self.held_slave = -1;
                 return err;
@@ -209,9 +139,6 @@ pub const Pty = struct {
         return self;
     }
 
-    /// Returns 0 at end of file, when all processes have closed the slave.
-    /// That can be after the child exits if background jobs hold it open.
-    /// Use `wait` to detect the exit.
     pub fn read(self: *Pty, buf: []u8) ReadError!usize {
         while (true) {
             const rc = c.read(self.master, buf.ptr, buf.len);
@@ -219,16 +146,12 @@ pub const Pty = struct {
                 .SUCCESS => return @intCast(rc),
                 .INTR => continue,
                 .AGAIN => {
-                    // The child has exited and its output is read: the
-                    // slave closes losing nothing, and end of file follows.
                     if (self.held_slave != -1 and childExited(self.exit_fd)) {
                         self.releaseSlave();
                         continue;
                     }
                     return error.WouldBlock;
                 },
-                // Linux returns EIO once the slave has no open fds; macOS
-                // returns 0.
                 .IO => return 0,
                 .NOMEM, .NOBUFS => return error.SystemResources,
                 else => |err| return posix.unexpectedErrno(err),
@@ -236,7 +159,6 @@ pub const Pty = struct {
         }
     }
 
-    /// Writes as much of `bytes` as the terminal's input queue accepts.
     pub fn write(self: *Pty, bytes: []const u8) WriteError!usize {
         while (true) {
             const rc = c.write(self.master, bytes.ptr, bytes.len);
@@ -251,8 +173,6 @@ pub const Pty = struct {
         }
     }
 
-    /// Writes all of `bytes`, blocking in poll while the input queue is
-    /// full. Event loops should use `write`.
     pub fn writeAll(self: *Pty, bytes: []const u8) error{ BrokenPipe, SystemResources, Unexpected }!void {
         var rest = bytes;
         while (rest.len > 0) {
@@ -272,48 +192,31 @@ pub const Pty = struct {
         }
     }
 
-    /// The kernel sends SIGWINCH to the foreground process group if the
-    /// size changes.
     pub fn resize(self: *Pty, size: Size) ResizeError!void {
         var ws = size.winsize();
         if (ioctl(self.master, tiocswinsz, @intFromPtr(&ws)) == -1) return posix.unexpectedErrno(posix.errno(-1));
     }
 
-    /// The slave's path.
     pub fn ttyName(self: *const Pty) [:0]const u8 {
         return self.tty_name_buf[0..self.tty_name_len :0];
     }
 
-    /// Sends `sig` to the child process. Jobs it started in other process
-    /// groups don't receive it; `hangup` also reaches the foreground job.
-    /// Returns error.ProcessNotFound once the child is reaped.
     pub fn kill(self: *Pty, sig: posix.SIG) KillError!void {
         return posix.kill(self.pid orelse return error.ProcessNotFound, sig);
     }
 
-    /// Sends `sig` to the child's process group: the child, which leads
-    /// it, and the commands a non-interactive shell runs. An interactive
-    /// shell's jobs are in groups of their own.
     pub fn killGroup(self: *Pty, sig: posix.SIG) KillError!void {
         return posix.kill(-(self.pid orelse return error.ProcessNotFound), sig);
     }
 
-    /// Blocks until the child exits and reaps it. After that, returns the
-    /// saved Term.
     pub fn wait(self: *Pty) WaitError!Term {
         return (try self.reapChild(0)).?;
     }
 
-    /// Reaps the child if it has exited, without blocking. Call on SIGCHLD
-    /// or end of file on the master. After the child is reaped, returns the
-    /// saved Term.
     pub fn tryWait(self: *Pty) WaitError!?Term {
         return self.reapChild(posix.W.NOHANG);
     }
 
-    /// Blocks until the child has exited, without reaping it. `kill` stays
-    /// safe to call from another thread meanwhile, since the pid can't be
-    /// reused before the child is reaped. Reap it with `tryWait` afterwards.
     pub fn waitExited(self: *const Pty) WaitError!void {
         return waitExitedPid(self.pid orelse return);
     }
@@ -331,10 +234,6 @@ pub const Pty = struct {
         return term;
     }
 
-    /// Closes the master. The kernel sends SIGHUP to the child (the session
-    /// leader) and the foreground process group; shells forward it to their
-    /// other jobs. Programs save state on SIGHUP (shell history, vim swap
-    /// files). `wait` for the child afterwards.
     pub fn hangup(self: *Pty) void {
         if (self.master == -1) return;
         closeFd(self.master);
@@ -350,8 +249,6 @@ pub const Pty = struct {
         self.exit_fd = -1;
     }
 
-    /// Hangs up, then sends SIGKILL to the child and reaps it if it hasn't
-    /// been reaped. Call `hangup` and `wait` first for a clean exit.
     pub fn deinit(self: *Pty) void {
         self.hangup();
         if (self.pid) |pid| {
@@ -363,7 +260,6 @@ pub const Pty = struct {
 };
 
 pub const PipesOptions = struct {
-    /// As in `Options`.
     argv: []const []const u8,
     program: ?[]const u8 = null,
     environ: *const std.process.Environ.Map,
@@ -371,27 +267,14 @@ pub const PipesOptions = struct {
     diagnostic: ?*Diagnostic = null,
 };
 
-/// A child process whose stdin, stdout and stderr are Unix stream socket
-/// pairs, as sshd uses for a command without a terminal. To the child they
-/// work as pipes do. Unlike a pipe, the parent's end can be shut down,
-/// which ends a read in flight on it. The child runs in a session of its
-/// own, with no controlling terminal.
-///
-/// Reap the child with `wait` or `tryWait` only, as for `Pty`.
 pub const Pipes = struct {
-    /// The parent's ends, non-blocking and close-on-exec. -1 once closed.
     stdin: posix.fd_t,
     stdout: posix.fd_t,
     stderr: posix.fd_t,
-    /// Null once the child is reaped.
     pid: ?posix.pid_t,
-    /// Set when the child is reaped.
     term: ?Term = null,
 
-    /// Starts a program on new socket pairs. Returns after the program has
-    /// been exec'd, as `Pty.spawn` does.
     pub fn spawn(gpa: Allocator, options: PipesOptions) SpawnError!Pipes {
-        // The child's ends close here once it has them.
         const stdin = try socketPair();
         defer closeFd(stdin[0]);
         errdefer closeFd(stdin[1]);
@@ -413,8 +296,6 @@ pub const Pipes = struct {
         return .{ .stdin = stdin[1], .stdout = stdout[0], .stderr = stderr[0], .pid = pid };
     }
 
-    /// Closes one of the parent's ends: the child's stdin sees end of file,
-    /// and a write to its stdout or stderr fails with EPIPE.
     pub fn close(self: *Pipes, fd: *posix.fd_t) void {
         _ = self;
         if (fd.* == -1) return;
@@ -422,17 +303,14 @@ pub const Pipes = struct {
         fd.* = -1;
     }
 
-    /// As `Pty.kill`.
     pub fn kill(self: *Pipes, sig: posix.SIG) KillError!void {
         return posix.kill(self.pid orelse return error.ProcessNotFound, sig);
     }
 
-    /// As `Pty.waitExited`.
     pub fn waitExited(self: *const Pipes) WaitError!void {
         return waitExitedPid(self.pid orelse return);
     }
 
-    /// As `Pty.tryWait`.
     pub fn tryWait(self: *Pipes) WaitError!?Term {
         const pid = self.pid orelse return self.term orelse error.ProcessNotFound;
         const term = reap(pid, posix.W.NOHANG) catch |err| {
@@ -446,8 +324,6 @@ pub const Pipes = struct {
         return term;
     }
 
-    /// Closes the parent's ends, then sends SIGKILL to the child and reaps
-    /// it if it hasn't been reaped.
     pub fn deinit(self: *Pipes) void {
         self.close(&self.stdin);
         self.close(&self.stdout);
@@ -460,7 +336,6 @@ pub const Pipes = struct {
     }
 };
 
-/// What `startChild` runs: `Options` without the terminal.
 const Program = struct {
     argv: []const []const u8,
     program: ?[]const u8,
@@ -469,13 +344,6 @@ const Program = struct {
     diagnostic: ?*Diagnostic,
 };
 
-/// Forks a child that runs `program` on `stdio`, and returns its pid once it
-/// has exec'd. If the child fails before exec, it is reaped and its errno
-/// is mapped to the returned error.
-///
-/// Between fork and exec the child makes only async-signal-safe calls and
-/// does not allocate, since a malloc lock held by another thread at fork
-/// would deadlock it.
 fn startChild(gpa: Allocator, program: Program, stdio: Child.Stdio) SpawnError!posix.pid_t {
     assert(program.argv.len > 0);
     var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -509,13 +377,9 @@ fn startChild(gpa: Allocator, program: Program, stdio: Child.Stdio) SpawnError!p
     _ = c.sigemptyset(&child.default_action.mask);
     _ = c.sigemptyset(&child.empty_mask);
 
-    // The child writes a ChildError here if it fails before exec. A
-    // successful exec closes the pipe unwritten.
     const err_pipe = try pipe();
     child.err_fd = err_pipe[1];
 
-    // Block all signals across fork so the child can't run a host handler
-    // before resetting dispositions to the default.
     var all_signals: posix.sigset_t = undefined;
     _ = c.sigfillset(&all_signals);
     var old_mask: posix.sigset_t = undefined;
@@ -531,8 +395,6 @@ fn startChild(gpa: Allocator, program: Program, stdio: Child.Stdio) SpawnError!p
         else => |err| posix.unexpectedErrno(err),
     };
     if (readChildError(err_pipe[0])) |failure| {
-        // If reading the pipe failed, the child may have exec'd and still be
-        // running.
         _ = c.kill(pid, .KILL);
         _ = reap(pid, 0) catch {};
         if (program.diagnostic) |diagnostic| diagnostic.* = .{ .step = failure.step, .errno = failure.errno };
@@ -541,29 +403,19 @@ fn startChild(gpa: Allocator, program: Program, stdio: Child.Stdio) SpawnError!p
     return pid;
 }
 
-/// What execvp uses when PATH is unset.
 const default_path = "/usr/bin:/bin";
 
-/// Upper bound on fds closed one by one when close_range is unavailable
-/// (macOS, Linux before 5.9). There, an inheritable fd at or above the lower
-/// of this and the RLIMIT_NOFILE soft limit leaks into the child. Finding it
-/// would mean listing fds, which allocates.
 const max_fd_limit = 1 << 16;
 
-// glibc and macOS declare the request as unsigned long, musl as int.
-// std.c uses c_int, which can't hold macOS's TIOCSWINSZ. musl reads only
-// the low 32 bits of the unsigned long.
 extern "c" fn ioctl(fd: posix.fd_t, request: c_ulong, ...) c_int;
 
 const tiocsctty: c_ulong = if (native_os.isDarwin()) 0x20007461 else c.T.IOCSCTTY;
 const tiocswinsz: c_ulong = if (native_os.isDarwin()) 0x80087467 else c.T.IOCSWINSZ;
 
-/// Runs in the child between fork and exec.
 const Child = struct {
     argv: [*:null]const ?[*:0]const u8,
     envp: [*:null]const ?[*:0]const u8,
     program: [:0]const u8,
-    /// PATH to search for `program`, or null if it contains a slash.
     search_path: ?[]const u8,
     cwd: union(enum) {
         inherit,
@@ -571,18 +423,13 @@ const Child = struct {
         path: [*:0]const u8,
     },
     stdio: Stdio,
-    /// Above 2, as the fds of `stdio` are, so dup2 onto stdio doesn't
-    /// clobber it.
     err_fd: posix.fd_t,
     max_fd: posix.fd_t,
     default_action: posix.Sigaction,
     empty_mask: posix.sigset_t,
 
-    /// What the child's stdin, stdout and stderr become.
     const Stdio = union(enum) {
-        /// A pty's slave, which becomes the controlling terminal.
         pty: posix.fd_t,
-        /// The child's ends of the sockets for stdin, stdout and stderr.
         pipes: [3]posix.fd_t,
     };
 
@@ -593,10 +440,6 @@ const Child = struct {
             .path => |path| if (c.chdir(path) != 0) fail(child.err_fd, .chdir, posix.errno(-1)),
         }
 
-        // A new session has no controlling terminal, so TIOCSCTTY can make
-        // the slave this one's. The child becomes the foreground process
-        // group, which receives ^C and SIGWINCH. On pipes, it keeps none of
-        // the host's.
         if (c.setsid() == -1) fail(child.err_fd, .setsid, posix.errno(-1));
         switch (child.stdio) {
             .pty => |slave| {
@@ -610,16 +453,12 @@ const Child = struct {
                 if (c.dup2(from, @intCast(to)) == -1) fail(child.err_fd, .stdio, posix.errno(-1));
             },
         }
-        // Close inherited fds other than the error pipe, moved to 3.
         const err_fd: posix.fd_t = 3;
         if (c.dup2(child.err_fd, err_fd) == -1) fail(child.err_fd, .stdio, posix.errno(-1));
         if (c.fcntl(err_fd, posix.F.SETFD, @as(c_int, posix.FD_CLOEXEC)) == -1)
             fail(err_fd, .stdio, posix.errno(-1));
         closeFrom(err_fd + 1, child.max_fd);
 
-        // exec preserves ignored signals and the signal mask; the host
-        // likely ignores SIGPIPE. sigaction fails on signals that can't be
-        // changed (KILL, STOP, libc's internal ones).
         var sig: u32 = 1;
         while (sig < posix.NSIG) : (sig += 1) {
             _ = c.sigaction(@fromBackingInt(sig), &child.default_action, null);
@@ -629,14 +468,11 @@ const Child = struct {
         fail(err_fd, .exec, child.exec());
     }
 
-    /// Returns the errno if exec fails.
     fn exec(child: *const Child) posix.E {
         const search_path = child.search_path orelse {
             _ = c.execve(child.program, child.argv, child.envp);
             return posix.errno(-1);
         };
-        // Like execvp: try each PATH entry, and return EACCES if any entry
-        // failed with it.
         var path_buf: [posix.PATH_MAX]u8 = undefined;
         var denied = false;
         var dirs = std.mem.splitScalar(u8, search_path, ':');
@@ -660,14 +496,11 @@ const Child = struct {
     fn fail(fd: posix.fd_t, step: Diagnostic.Step, err: posix.E) noreturn {
         const child_err: ChildError = .{ .step = @backingInt(step), .errno = @intCast(@backingInt(err)) };
         const bytes = std.mem.asBytes(&child_err);
-        // Smaller than PIPE_BUF, so the write is atomic.
         while (posix.errno(c.write(fd, bytes, bytes.len)) == .INTR) {}
-        // Don't call exit: atexit handlers belong to the host.
         c._exit(127);
     }
 };
 
-/// Written by a child that fails before exec.
 const ChildError = extern struct {
     step: u32,
     errno: u32,
@@ -700,7 +533,6 @@ const ChildError = extern struct {
     };
 };
 
-/// Returns null if the child exec'd.
 fn readChildError(fd: posix.fd_t) ?ChildError.Failure {
     var child_err: ChildError = undefined;
     const bytes = std.mem.asBytes(&child_err);
@@ -720,8 +552,6 @@ fn readChildError(fd: posix.fd_t) ?ChildError.Failure {
     };
 }
 
-/// A kqueue that turns readable when `pid` exits. A child that exited
-/// before it is watched triggers a user event, which reads the same.
 fn watchExit(pid: posix.pid_t) SpawnError!posix.fd_t {
     if (comptime !native_os.isDarwin()) unreachable;
     const kq = c.kqueue();
@@ -738,7 +568,6 @@ fn watchExit(pid: posix.pid_t) SpawnError!posix.fd_t {
     return kq;
 }
 
-/// Whether the kqueue from `watchExit` says the child exited.
 fn childExited(kq: posix.fd_t) bool {
     if (comptime !native_os.isDarwin()) return false;
     var event: c.Kevent = undefined;
@@ -746,13 +575,9 @@ fn childExited(kq: posix.fd_t) bool {
     return c.kevent(kq, (&event)[0..0], 0, (&event)[0..1], 1, &zero) > 0;
 }
 
-/// Blocks until `pid` has exited, and leaves it unreaped.
 fn waitExitedPid(pid: posix.pid_t) WaitError!void {
-    // Larger than siginfo_t on every supported platform. Only the return
-    // value is used.
     var info: [128]u8 align(8) = undefined;
 
-    // WNOWAIT leaves the child a zombie. Its pid stays reserved.
     while (libc.waitid(p_pid, @intCast(pid), &info, w_exited | w_nowait) == -1) switch (posix.errno(-1)) {
         .INTR => {},
         .CHILD => return error.ProcessNotFound,
@@ -785,10 +610,6 @@ fn statusToTerm(status: u32) Term {
 }
 
 fn openMaster() SpawnError!posix.fd_t {
-    // glibc and musl pass the flags to open(2), which sets O_CLOEXEC
-    // atomically. macOS rejects flags other than O_RDWR and O_NOCTTY; there,
-    // a thread that forks between posix_openpt and fcntl leaks the master
-    // into its child.
     var flags: posix.O = .{ .ACCMODE = .RDWR, .NOCTTY = true };
     if (native_os == .linux) flags.CLOEXEC = true;
     const fd = libc.posix_openpt(flags);
@@ -802,10 +623,6 @@ fn openMaster() SpawnError!posix.fd_t {
     return fd;
 }
 
-// Don't use tcgetattr on Linux: glibc's struct termios is 16 bytes larger
-// than the kernel's, which std.c's termios matches, and tcgetattr would
-// write past its end. TCGETS and TCSETS use the kernel's layout. macOS's
-// tcgetattr matches std.c's termios.
 fn getAttrs(fd: posix.fd_t, attrs: *posix.termios) SpawnError!void {
     const rc = if (native_os == .linux)
         ioctl(fd, std.os.linux.T.CGETS, @intFromPtr(attrs))
@@ -835,7 +652,6 @@ fn openFd(path: [*:0]const u8, flags: posix.O) SpawnError!posix.fd_t {
 
 fn openError(err: posix.E) SpawnError {
     return switch (err) {
-        // Out of ptys: ENOSPC on Linux (kernel.pty.max), EAGAIN on macOS.
         .AGAIN, .NOSPC, .NOMEM => error.SystemResources,
         .MFILE => error.ProcessFdQuotaExceeded,
         .NFILE => error.SystemFdQuotaExceeded,
@@ -844,8 +660,6 @@ fn openError(err: posix.E) SpawnError {
     };
 }
 
-/// A close-on-exec pipe with both ends above 2. macOS has no pipe2; there,
-/// a thread that forks between pipe and fcntl inherits the pipe.
 fn setNonblocking(fd: posix.fd_t) SpawnError!void {
     const flags = c.fcntl(fd, posix.F.GETFL);
     if (flags == -1) return posix.unexpectedErrno(posix.errno(-1));
@@ -853,7 +667,6 @@ fn setNonblocking(fd: posix.fd_t) SpawnError!void {
     if (c.fcntl(fd, posix.F.SETFL, flags | nonblock) == -1) return posix.unexpectedErrno(posix.errno(-1));
 }
 
-/// A connected pair of Unix stream sockets, close-on-exec and above 2.
 fn socketPair() SpawnError![2]posix.fd_t {
     var fds: [2]posix.fd_t = undefined;
     const cloexec: u32 = if (native_os == .linux) posix.SOCK.CLOEXEC else 0;
@@ -893,8 +706,6 @@ fn pipe() SpawnError![2]posix.fd_t {
     return fds;
 }
 
-/// Moves a close-on-exec fd above 2, out of reach of the child's dup2 onto
-/// stdio. A host that closed its stdio gets new fds there.
 fn aboveStdio(fd: posix.fd_t) SpawnError!posix.fd_t {
     if (fd > 2) return fd;
     defer closeFd(fd);
@@ -903,15 +714,12 @@ fn aboveStdio(fd: posix.fd_t) SpawnError!posix.fd_t {
     return new;
 }
 
-/// One past the highest fd the child may have inherited, for closeFrom's
-/// fallback.
 pub fn maxFd() posix.fd_t {
     var limit: posix.rlimit = undefined;
     if (c.getrlimit(.NOFILE, &limit) != 0) return max_fd_limit;
     return @intCast(@min(limit.cur, max_fd_limit));
 }
 
-/// Async-signal-safe. Listing /proc/self/fd or /dev/fd would allocate.
 pub fn closeFrom(first: posix.fd_t, max_fd: posix.fd_t) void {
     if (native_os == .linux) {
         const linux = std.os.linux;
@@ -922,13 +730,9 @@ pub fn closeFrom(first: posix.fd_t, max_fd: posix.fd_t) void {
 }
 
 fn closeFd(fd: posix.fd_t) void {
-    // Don't retry on EINTR: the fd may already be closed and reused by
-    // another thread.
     _ = c.close(fd);
 }
 
-// Missing from std.c. All are in libc on glibc, musl and macOS; openpty
-// is in libutil before glibc 2.34.
 const libc = struct {
     extern "c" fn posix_openpt(flags: posix.O) c_int;
     extern "c" fn grantpt(fd: posix.fd_t) c_int;
@@ -939,8 +743,6 @@ const libc = struct {
     extern "c" fn waitid(idtype: c_int, id: c_uint, info: *anyopaque, options: c_int) c_int;
 };
 
-// waitid's arguments. P_PID is 1 on Linux, macOS and the BSDs. std.c has no
-// WEXITED or WNOWAIT for macOS; these are from XNU's sys/wait.h.
 const p_pid = 1;
 const w_exited: c_int = if (native_os.isDarwin()) 0x4 else c.W.EXITED;
 const w_nowait: c_int = if (native_os.isDarwin()) 0x20 else c.W.NOWAIT;
@@ -962,15 +764,12 @@ fn spawnTest(environ: *const std.process.Environ.Map, argv: []const []const u8) 
     return Pty.spawn(testing.allocator, .{ .argv = argv, .environ = environ, .size = test_size });
 }
 
-/// `Pty.wait` with a deadline. Output is read and dropped meanwhile: on
-/// macOS a program's exit waits until its terminal's output has been read.
 fn waitTest(pty: *Pty) !Term {
     const io = testing.io;
     const deadline = std.Io.Clock.awake.now(io).toMilliseconds() + test_timeout_ms;
     while (std.Io.Clock.awake.now(io).toMilliseconds() < deadline) {
         if (try pty.tryWait()) |term| return term;
 
-        // The master is nonblocking, and -1 after `hangup`.
         var buf: [1024]u8 = undefined;
         if (pty.master != -1) while (c.read(pty.master, &buf, buf.len) > 0) {};
         try io.sleep(.fromMilliseconds(10), .awake);
@@ -979,7 +778,6 @@ fn waitTest(pty: *Pty) !Term {
     return error.Timeout;
 }
 
-/// A test program's output, read with a deadline.
 const Output = struct {
     buf: [16 * 1024]u8 = undefined,
     len: usize = 0,
@@ -1040,15 +838,12 @@ test "output and exit status are reported" {
         try out.readToEnd(&pty);
         try testing.expectEqualStrings("hello", out.bytes());
         try testing.expectEqual(Term{ .exited = status }, try waitTest(&pty));
-        // After reaping, both return the saved Term.
         try testing.expectEqual(Term{ .exited = status }, try pty.tryWait());
         try testing.expectEqual(Term{ .exited = status }, try pty.wait());
     }
 }
 
 test "output of a program that exits at once is read in full" {
-    // macOS discarded it when the slave's last fd closed before the master
-    // read it.
     var environ = try testEnviron();
     defer environ.deinit();
     for (0..200) |_| {
@@ -1102,12 +897,10 @@ test "input goes through the line discipline" {
         try pty.writeAll("hi there\n");
         var out: Output = .{};
         try out.readToEnd(&pty);
-        // The tty's echo, then head's output, both with \r from ONLCR.
         try testing.expectEqualStrings("hi there\r\nhi there\r\n", out.bytes());
         try testing.expectEqual(Term{ .exited = 0 }, try waitTest(&pty));
     }
     {
-        // ^C reaches the foreground process group as SIGINT.
         var pty = try spawnTest(&environ, &.{"cat"});
         defer pty.deinit();
         try pty.writeAll("\x03");
@@ -1118,7 +911,6 @@ test "input goes through the line discipline" {
 test "program starts with default signal dispositions and an empty mask" {
     var environ = try testEnviron();
     defer environ.deinit();
-    // Ignore SIGINT and block SIGTERM in the host.
     var ignore: posix.Sigaction = .{ .handler = .{ .handler = posix.SIG.IGN }, .mask = undefined, .flags = 0 };
     _ = c.sigemptyset(&ignore.mask);
     var old_action: posix.Sigaction = undefined;
@@ -1144,7 +936,6 @@ test "program starts with default signal dispositions and an empty mask" {
         try testing.expectEqual(Term{ .signal = .TERM }, try waitTest(&pty));
     }
 
-    // spawn restores the host's mask.
     var mask: posix.sigset_t = undefined;
     _ = c.sigemptyset(&block);
     _ = c.pthread_sigmask(posix.SIG.BLOCK, &block, &mask);
@@ -1160,7 +951,6 @@ test "getAttrs doesn't overrun termios and IUTF8 is set" {
     const slave = try openFd(pty.ttyName(), .{ .ACCMODE = .RDWR, .NOCTTY = true, .CLOEXEC = true });
     defer closeFd(slave);
 
-    // glibc's tcgetattr would overwrite the start of the canary.
     var guarded: extern struct { attrs: posix.termios, canary: [64]u8 } = .{ .attrs = undefined, .canary = @splat(0xaa) };
     try getAttrs(slave, &guarded.attrs);
     try testing.expectEqualSlices(u8, &@as([64]u8, @splat(0xaa)), &guarded.canary);
@@ -1170,8 +960,6 @@ test "getAttrs doesn't overrun termios and IUTF8 is set" {
 test "program is a session leader with the pty as controlling terminal" {
     var environ = try testEnviron();
     defer environ.deinit();
-    // The newline is printf's: on Ubuntu 26.04, `tty` printed the name
-    // with none after it.
     var pty = try spawnTest(&environ, &.{
         "/bin/sh", "-c",
         \\printf '%s\n' "$(tty)"
@@ -1223,7 +1011,6 @@ test "spawn failures report the child's errno" {
         try testing.expectError(expected_error, Pty.spawn(testing.allocator, options));
         try testing.expectEqual(expected_diagnostic, diagnostic);
     }
-    // The failed children were reaped.
     try testing.expectEqual(-1, c.waitpid(-1, null, posix.W.NOHANG));
     try testing.expectEqual(posix.E.CHILD, posix.errno(-1));
 }
@@ -1251,7 +1038,6 @@ test "killed program reports the signal" {
     var pty = try spawnTest(&environ, &.{ "sleep", "30" });
     defer pty.deinit();
     try pty.kill(.KILL);
-    // SIGKILL can't be caught, so `wait` won't hang.
     try testing.expectEqual(Term{ .signal = .KILL }, try pty.wait());
     try testing.expectError(error.ProcessNotFound, pty.kill(.TERM));
 }
@@ -1259,15 +1045,11 @@ test "killed program reports the signal" {
 test "no fds leak into the program" {
     var environ = try testEnviron();
     defer environ.deinit();
-    // Inheritable fds, one low and one high.
     const null_fd = try openFd("/dev/null", .{ .ACCMODE = .RDWR });
     defer closeFd(null_fd);
     try testing.expectEqual(100, c.dup2(null_fd, 100));
     defer closeFd(100);
 
-    // The shell's own redirections open no fds, where `ls /dev/fd` can open
-    // more than its directory on some macOS versions. Shells keep their
-    // private fds at 10 and up.
     var pty = try spawnTest(&environ, &.{ "/bin/sh", "-c", "for fd in 3 4 5 6 7 8 9 100; do if (: <&$fd) 2>/dev/null; then echo $fd; fi; done; echo end" });
     defer pty.deinit();
     var out: Output = .{};
@@ -1276,7 +1058,6 @@ test "no fds leak into the program" {
     try testing.expectEqualStrings("end\r\n", out.bytes());
 }
 
-/// Reads `fd`, a nonblocking pipe, to end of file.
 fn readPipeToEnd(fd: posix.fd_t, out: *std.ArrayList(u8)) !void {
     var buf: [1024]u8 = undefined;
     while (true) {
@@ -1319,7 +1100,6 @@ test "a program on pipes reads its stdin, and writes stdout and stderr apart" {
 }
 
 test "a program on pipes gets SIGPIPE once its stdout is closed" {
-    // The host ignores SIGPIPE, as txd does; the child mustn't.
     const ignore: posix.Sigaction = .{ .handler = .{ .handler = posix.SIG.IGN }, .mask = posix.sigemptyset(), .flags = 0 };
     var old: posix.Sigaction = undefined;
     _ = c.sigaction(.PIPE, &ignore, &old);

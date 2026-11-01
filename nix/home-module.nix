@@ -1,9 +1,3 @@
-# services.txd for home-manager: txd as a systemd user service on Linux and
-# a LaunchAgent on macOS, as `txd --install` sets it up.
-#
-# The service runs only while the user's service manager does. On Linux,
-# that is from boot only with lingering on: `users.users.NAME.linger` on
-# NixOS, or `loginctl enable-linger` elsewhere.
 self:
 {
   config,
@@ -56,8 +50,6 @@ in
           Service = {
             ExecStart = lib.escapeShellArgs args;
             Restart = "on-failure";
-            # Each session runs in a process of its own, which a restart or
-            # upgrade of txd leaves running.
             KillMode = "process";
           };
           Install.WantedBy = [ "default.target" ];
@@ -72,7 +64,6 @@ in
             RunAtLoad = true;
             KeepAlive.SuccessfulExit = false;
             ProcessType = "Interactive";
-            # So that launchd doesn't end the sessions when txd exits.
             AbandonProcessGroup = true;
             StandardErrorPath = "${config.home.homeDirectory}/Library/Logs/txd.log";
           };

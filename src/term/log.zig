@@ -1,10 +1,3 @@
-//! The ordered records of what the primary terminal consumed: output bytes,
-//! and events outside the byte stream that change terminal state. The client
-//! stream is built from them.
-//!
-//! Seqs number records from 0 without gaps. A reader whose next seq has
-//! been dropped from the ring gets `error.Trimmed`, and a client then needs
-//! a repaint.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const vt = @import("ghostty-vt");
@@ -14,22 +7,15 @@ pub const Record = struct {
     payload: Payload,
 };
 
-/// Default colors from the host will be added as another variant.
 pub const Payload = union(enum) {
-    /// Bytes fed to the primary terminal's stream. Where output is split
-    /// into records does not affect terminal state.
     output: []const u8,
 
-    /// Applied at this point in the stream on both ends.
     resize: Resize,
 };
 
-/// The arguments to libghostty-vt's `Terminal.resize`.
 pub const Resize = struct {
     cols: u16,
     rows: u16,
-    /// Null if the host doesn't know it. Images and pixel size reports
-    /// depend on it.
     cell_size_px: ?CellSize = null,
 
     pub const CellSize = struct {
@@ -47,31 +33,21 @@ pub const Resize = struct {
 };
 
 pub const AppendError = Allocator.Error || error{
-    /// The record alone would exceed the log's capacity. Split output into
-    /// records of at most `maxOutputLen` bytes.
     RecordTooLarge,
 };
 
 pub const ReadError = error{
-    /// The seq was dropped from the ring.
     Trimmed,
-    /// The seq has not been appended yet.
     Ahead,
 };
 
-/// A bounded ring of records that owns copies of their payloads. When an
-/// append would exceed the capacity, the oldest records are dropped.
 pub const Log = struct {
     gpa: Allocator,
     capacity: usize,
-    /// Bytes charged against `capacity`.
     used: usize = 0,
     entries: std.Deque(Entry) = .empty,
-    /// The seq of `entries.at(0)`, or of the next append when empty.
     first_seq: u64 = 0,
 
-    /// Charged per record on top of its payload bytes, so records without
-    /// bytes still count against the capacity.
     pub const record_overhead = @sizeOf(Entry);
 
     const Entry = struct {
@@ -95,7 +71,6 @@ pub const Log = struct {
         self.* = undefined;
     }
 
-    /// The largest `output` payload a record can carry.
     pub fn maxOutputLen(self: *const Log) usize {
         return self.capacity -| record_overhead;
     }
@@ -104,14 +79,10 @@ pub const Log = struct {
         return self.first_seq + self.entries.len;
     }
 
-    /// Equals `nextSeq` when the log is empty.
     pub fn firstSeq(self: *const Log) u64 {
         return self.first_seq;
     }
 
-    /// Copies `payload` into the log, dropping the oldest records to make
-    /// room, and returns its seq. Invalidates all `Record`s and `Iterator`s
-    /// obtained earlier.
     pub fn append(self: *Log, payload: Payload) AppendError!u64 {
         const owned: Payload = switch (payload) {
             .output => |bytes| owned: {
@@ -131,15 +102,12 @@ pub const Log = struct {
         return self.nextSeq() - 1;
     }
 
-    /// The record with this seq. Its payload is valid until the next append.
     pub fn get(self: *const Log, seq: u64) ReadError!Record {
         try self.check(seq);
         if (seq == self.nextSeq()) return error.Ahead;
         return .{ .seq = seq, .payload = self.entries.at(@intCast(seq - self.first_seq)).payload };
     }
 
-    /// `seq` may equal `nextSeq`, which yields nothing. Invalidated by the
-    /// next append.
     pub fn iterator(self: *const Log, seq: u64) ReadError!Iterator {
         try self.check(seq);
         return .{ .log = self, .seq = seq };
@@ -223,14 +191,12 @@ test "a full log drops its oldest records" {
     for (0..3) |_| _ = try log.append(.{ .output = "0123456789" });
     try testing.expectEqual(0, log.firstSeq());
 
-    // A fourth record of the same size drops one.
     try testing.expectEqual(3, try log.append(.{ .output = "abcdefghij" }));
     try testing.expectEqual(1, log.firstSeq());
     try testing.expectError(error.Trimmed, log.iterator(0));
     try testing.expectError(error.Trimmed, log.get(0));
     try testing.expectEqualStrings("abcdefghij", (try log.get(3)).payload.output);
 
-    // A record twice as big drops two.
     _ = try log.append(.{ .output = "0123456789" ++ "0123456789" });
     try testing.expectEqual(3, log.firstSeq());
     var it = try log.iterator(3);
@@ -238,7 +204,6 @@ test "a full log drops its oldest records" {
     try testing.expectEqual(4, it.next().?.seq);
     try testing.expectEqual(null, it.next());
 
-    // Records without bytes still count against the capacity.
     for (0..10) |_| _ = try log.append(.{ .resize = .{ .cols = 1, .rows = 1 } });
     try testing.expectEqual(15, log.nextSeq());
     try testing.expectEqual(capacity / Log.record_overhead, log.nextSeq() - log.firstSeq());

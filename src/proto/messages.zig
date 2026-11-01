@@ -1,12 +1,3 @@
-//! The messages of protocol revision 0.
-//!
-//! Each message type declares `type_id`, its numeric message type, and
-//! `tags`, the field tag of each struct field. A struct field with a default
-//! is optional on the wire; one without is required. A null optional field
-//! is left out when encoding. When a tag appears more than once in a body,
-//! the last occurrence is used.
-//!
-//! Decoded `[]const u8` fields point into the bytes passed to `decode`.
 const std = @import("std");
 const Writer = std.Io.Writer;
 const wire = @import("wire.zig");
@@ -14,20 +5,14 @@ const DecodeError = wire.DecodeError;
 
 pub const revision: u32 = 0;
 
-/// The first message from the client.
 pub const Hello = struct {
     revision: u32,
-    /// The client's `TERM`.
     term: []const u8,
-    /// The client's `COLORTERM`, null if unset.
     colorterm: ?[]const u8 = null,
     cols: u16,
     rows: u16,
-    /// Null if the client's terminal doesn't report it.
     cell_width_px: ?u32 = null,
     cell_height_px: ?u32 = null,
-    /// The client's `LANG` and `LC_*` variables (see `isLocaleName`), as
-    /// `NAME=value` items that each end in NUL. Null if it has none.
     locale: ?[]const u8 = null,
 
     pub const type_id = 1;
@@ -55,8 +40,6 @@ pub const Hello = struct {
     }
 };
 
-/// Whether `name` is a variable `Hello.locale` carries: `LANG`, or `LC_`
-/// followed by capital letters and underscores, such as `LC_CTYPE`.
 pub fn isLocaleName(name: []const u8) bool {
     if (std.mem.eql(u8, name, "LANG")) return true;
     if (!std.mem.startsWith(u8, name, "LC_") or name.len == "LC_".len) return false;
@@ -64,7 +47,6 @@ pub fn isLocaleName(name: []const u8) bool {
     return true;
 }
 
-/// The server's answer to `Hello`.
 pub const HelloReply = struct {
     revision: u32,
 
@@ -85,33 +67,14 @@ pub const HelloReply = struct {
 };
 
 pub const Attach = struct {
-    /// Null starts a new session running the user's shell, unless `reuse`
-    /// is set.
     session_id: ?u64 = null,
-    /// With no `session_id`, attaches the detached session if there is
-    /// exactly one, and starts one if there is none. With several, the
-    /// server answers `Error` with `several_detached`.
     reuse: bool = false,
-    /// A new session runs this with the user's shell's `-c`, in place of
-    /// the shell, as `tx -t HOST COMMAND` does. Only without `session_id`
-    /// and `reuse`.
     command: ?[]const u8 = null,
-    /// The terminfo source for the client's `TERM`, as `infocmp -x` prints
-    /// it, for a new session on a host that may lack the entry.
     terminfo: ?[]const u8 = null,
-    /// The client's terminal's colors, as `0xRRGGBB`, which the session's
-    /// terminal answers queries with while no client is attached. Null
-    /// where the terminal didn't say.
     foreground: ?u32 = null,
     background: ?u32 = null,
-    /// The base colors it reported, each as 4 bytes: index, red, green,
-    /// blue.
     palette: ?[]const u8 = null,
-    /// Its color scheme is dark, or light.
     dark: ?bool = null,
-    /// With `command`, the program gets SIGHUP when its client goes, as
-    /// under ssh: when the client closes its connection, or doesn't resume
-    /// within a grace period after losing it.
     hangup: bool = false,
 
     pub const type_id = 3;
@@ -142,12 +105,7 @@ pub const Attach = struct {
 
 pub const Attached = struct {
     session_id: u64,
-    /// The key that resumes the session on a new connection (see
-    /// `auth.resume_`). Replaced at each attach.
     resume_key: []const u8,
-    /// The bytes of input the session got from the client since it
-    /// attached, counted across resumes. The client sends again the input
-    /// that follows them.
     input_offset: u64 = 0,
 
     pub const type_id = 4;
@@ -166,7 +124,6 @@ pub const Attached = struct {
     }
 };
 
-/// Bytes for the client's terminal.
 pub const Output = struct {
     seq: u64,
     bytes: []const u8,
@@ -188,7 +145,6 @@ pub const Output = struct {
 };
 
 pub const Ack = struct {
-    /// The highest `Output.seq` written to the user's terminal.
     seq: u64,
 
     pub const type_id = 6;
@@ -207,7 +163,6 @@ pub const Ack = struct {
     }
 };
 
-/// Bytes from the user's terminal.
 pub const Input = struct {
     bytes: []const u8,
 
@@ -230,7 +185,6 @@ pub const Input = struct {
 pub const Resize = struct {
     cols: u16,
     rows: u16,
-    /// Null if the client's terminal doesn't report it.
     cell_width_px: ?u32 = null,
     cell_height_px: ?u32 = null,
 
@@ -272,13 +226,8 @@ pub const Detach = struct {
     }
 };
 
-/// The session's program ended.
 pub const Exit = struct {
-    /// The exit status. 0 when `signal` is set.
     status: u8 = 0,
-    /// The name of the signal that terminated the program, without the
-    /// "SIG" prefix, as in RFC 4254 §6.10. Signal numbers differ between
-    /// platforms.
     signal: ?[]const u8 = null,
 
     pub const type_id = 10;
@@ -297,20 +246,15 @@ pub const Exit = struct {
     }
 };
 
-/// The codes of `Error`.
 pub const ErrorCode = enum(u32) {
     protocol = 1,
     revision = 2,
     no_session = 3,
     log_trimmed = 4,
     spawn = 5,
-    /// The login failed. The message doesn't say why.
     auth = 6,
-    /// Another client attached to the session.
     attached_elsewhere = 7,
-    /// `Attach` with `reuse` found more than one detached session.
     several_detached = 8,
-    /// The session's process ended without the program exiting.
     session_lost = 9,
 };
 
@@ -334,12 +278,8 @@ pub const Error = struct {
     }
 };
 
-/// Asks whether the server would accept `key` for `user`. The client probes
-/// before it signs: a signature can cost the user a touch or a prompt.
 pub const AuthProbe = struct {
-    /// Empty for the account the server serves.
     user: []const u8,
-    /// An SSH public key blob.
     key: []const u8,
 
     pub const type_id = 12;
@@ -359,7 +299,6 @@ pub const AuthProbe = struct {
 };
 
 pub const AuthProbeReply = struct {
-    /// The probed key.
     key: []const u8,
     accepted: bool,
 
@@ -379,14 +318,9 @@ pub const AuthProbeReply = struct {
     }
 };
 
-/// Logs in as `user` with a signature over the connection's login
-/// transcript (see `auth.login`).
 pub const AuthSignature = struct {
-    /// Empty for the account the server serves.
     user: []const u8,
-    /// An SSH public key blob.
     key: []const u8,
-    /// An SSH signature blob.
     signature: []const u8,
 
     pub const type_id = 14;
@@ -405,7 +339,6 @@ pub const AuthSignature = struct {
     }
 };
 
-/// The login succeeded.
 pub const AuthOk = struct {
     pub const type_id = 15;
     pub const tags = .{};
@@ -423,12 +356,7 @@ pub const AuthOk = struct {
     }
 };
 
-/// Bytes that bring the client's terminal, at the size the client gave,
-/// to the session's state (see `term.rebuild`). Sent on attach, and on a
-/// resume that can't continue from the client's seq. A rebuild longer
-/// than a message is sent in parts.
 pub const Rebuild = struct {
-    /// The seq of the first `Output` after the rebuild.
     seq: u64,
     bytes: []const u8,
 
@@ -448,13 +376,8 @@ pub const Rebuild = struct {
     }
 };
 
-/// Logs in and attaches to a session on a new connection, for a client
-/// that was attached to it (see `auth.resume_`). The server answers with
-/// `Attached`, or `Error`.
 pub const Resume = struct {
     session_id: u64,
-    /// The seq of the first `Output` the client hasn't written. Null, or a
-    /// seq the log no longer holds, gets a repaint.
     next_seq: ?u64 = null,
     proof: []const u8,
 
@@ -474,8 +397,6 @@ pub const Resume = struct {
     }
 };
 
-/// Asks for the server's sessions. The server answers with a
-/// `SessionInfo` for each, in order of ID, then `ListEnd`.
 pub const List = struct {
     pub const type_id = 18;
     pub const tags = .{};
@@ -497,13 +418,9 @@ pub const SessionInfo = struct {
     session_id: u64,
     cols: u16,
     rows: u16,
-    /// Seconds since the session started.
     running_s: u64,
-    /// The attached client's address. Null while detached.
     attached_from: ?[]const u8 = null,
-    /// The title the program set, if any.
     title: ?[]const u8 = null,
-    /// The session process's pid.
     pid: ?u64 = null,
 
     pub const type_id = 19;
@@ -539,8 +456,6 @@ pub const ListEnd = struct {
     }
 };
 
-/// Ends a session. Its program gets SIGHUP, and SIGKILL if it hasn't
-/// exited a second later. The server answers with `Killed`, or `Error`.
 pub const Kill = struct {
     session_id: u64,
 
@@ -560,7 +475,6 @@ pub const Kill = struct {
     }
 };
 
-/// The session's program was sent SIGHUP.
 pub const Killed = struct {
     session_id: u64,
 
@@ -580,15 +494,6 @@ pub const Killed = struct {
     }
 };
 
-/// Runs a command, as `tx HOST COMMAND` does: the user's shell runs
-/// `command` with `-c`, with no terminal. Sent after the login only.
-///
-/// Once the command starts, the server opens three streams: two
-/// unidirectional ones, the command's stdout and then its stderr, and a
-/// bidirectional one whose client side carries its stdin. The end of a
-/// stream is the end of file. The server answers with `Exit` when the
-/// command exits, or with `Error` if it doesn't start. A client is done
-/// once it has `Exit` and the end of both output streams.
 pub const Exec = struct {
     command: []const u8,
 
@@ -608,16 +513,8 @@ pub const Exec = struct {
     }
 };
 
-/// What the user's clipboard holds, from a client that's attached: its
-/// MIME types, and a number that changes whenever the clipboard does.
-/// Sent after `Attached` and at each change. An empty `mimes` is an empty
-/// clipboard.
-///
-/// Programs on the host read the clipboard of the attached client that
-/// sent input last. The server asks it for data with `ClipboardRequest`.
 pub const ClipboardOffer = struct {
     change: u64,
-    /// The MIME types, each followed by NUL.
     mimes: []const u8,
 
     pub const type_id = 24;
@@ -636,9 +533,6 @@ pub const ClipboardOffer = struct {
     }
 };
 
-/// A program reads the clipboard the client offered as `change`. The client
-/// answers on a unidirectional stream of its own: `ClipboardData`, then the
-/// data, then the stream's end.
 pub const ClipboardRequest = struct {
     id: u64,
     change: u64,
@@ -660,9 +554,6 @@ pub const ClipboardRequest = struct {
     }
 };
 
-/// The start of a client's answer to `ClipboardRequest` `id`. A refused
-/// answer, because the user didn't paste or the clipboard changed, ends
-/// with it.
 pub const ClipboardData = struct {
     id: u64,
     refused: bool = false,
@@ -683,13 +574,8 @@ pub const ClipboardData = struct {
     }
 };
 
-/// A program on the host copied, for the user's clipboard. The start of a
-/// unidirectional stream the server opens. The data follows: each type's
-/// bytes in `mimes`' order, `lens` long, then the stream's end.
 pub const ClipboardCopy = struct {
-    /// The MIME types, each followed by NUL.
     mimes: []const u8,
-    /// Each type's length, as 8 bytes, big-endian.
     lens: []const u8,
 
     pub const type_id = 27;
@@ -708,25 +594,14 @@ pub const ClipboardCopy = struct {
     }
 };
 
-/// The revision of the messages between txd and its session processes,
-/// from `Connect` on. A session process refuses `Start` and `Connect` from
-/// another revision. `List` and `Kill` stay as they are, so that any txd
-/// can list and end any session.
 pub const internal_revision: u32 = 0;
 
-/// Describes the client about to attach. txd sends it to a session before
-/// the client's `Attach` or `Resume`. Message types from 1000 on are txd's
-/// own, and txd refuses them from clients.
 pub const Connect = struct {
-    /// The client's address, for `SessionInfo.attached_from`.
     remote: []const u8,
-    /// The client's terminal size, from its `Hello`.
     cols: u16,
     rows: u16,
     cell_width_px: ?u32 = null,
     cell_height_px: ?u32 = null,
-    /// The client connection's TLS exporter value for `auth.resume_`,
-    /// which a `Resume` proof is checked against.
     resume_exporter: ?[]const u8 = null,
     internal_revision: u32 = 0,
 
@@ -746,24 +621,17 @@ pub const Connect = struct {
     }
 };
 
-/// Starts a session. txd sends it first, on the socket a new session
-/// process inherits. Lists are NUL-terminated items, one after another.
 pub const Start = struct {
     session_id: u64,
-    /// Where the session process listens (see `server.runtime_dir`).
     socket_path: []const u8,
-    /// The program's argv.
     argv: []const u8,
-    /// See `session.pty.Options`.
     program: ?[]const u8 = null,
     cwd: ?[]const u8 = null,
-    /// The program's environment, as `NAME=value` items.
     environ: []const u8,
     cols: u16,
     rows: u16,
     cell_width_px: ?u32 = null,
     cell_height_px: ?u32 = null,
-    /// See `session.host.Options.TerminalOptions`. Null is no limit.
     max_scrollback_bytes: ?u64 = null,
     max_scrollback_lines: ?u64 = null,
     kitty_image_storage_limit: u64,
@@ -802,8 +670,6 @@ pub const Start = struct {
     }
 };
 
-/// The session process is running its program. A process that can't start
-/// it answers `Start` with `Error` instead.
 pub const Started = struct {
     pid: u64,
 
@@ -823,7 +689,6 @@ pub const Started = struct {
     }
 };
 
-/// Asks a session for its primary terminal's state, for tests.
 pub const Dump = struct {
     pub const type_id = 1003;
     pub const tags = .{};
@@ -842,9 +707,7 @@ pub const Dump = struct {
 };
 
 pub const DumpReply = struct {
-    /// See `term.state.dump`.
     state: []const u8,
-    /// The visible text.
     text: []const u8,
     cols: u16,
     rows: u16,
@@ -865,8 +728,6 @@ pub const DumpReply = struct {
     }
 };
 
-/// Bytes for a session's program, as if an attached client had typed them,
-/// for tests.
 pub const Inject = struct {
     bytes: []const u8,
 
@@ -920,7 +781,6 @@ pub const Message = union(enum) {
     dump: Dump,
     dump_reply: DumpReply,
     inject: Inject,
-    /// A message type this revision does not define.
     unknown: Unknown,
 
     pub const Unknown = struct {
@@ -928,7 +788,6 @@ pub const Message = union(enum) {
         body: []const u8,
     };
 
-    // Two messages with one type ID would decode as whichever comes first.
     comptime {
         const types = @typeInfo(Message).@"union".field_types;
         for (types, 0..) |T, i| {
@@ -947,7 +806,6 @@ pub const Message = union(enum) {
         };
     }
 
-    /// The length of the encoded body.
     pub fn encodedLen(m: Message) usize {
         return switch (m) {
             .unknown => |u| u.body.len,
@@ -955,7 +813,6 @@ pub const Message = union(enum) {
         };
     }
 
-    /// Writes the body.
     pub fn encode(m: Message, w: *Writer) Writer.Error!void {
         return switch (m) {
             .unknown => |u| w.writeAll(u.body),
@@ -963,9 +820,7 @@ pub const Message = union(enum) {
         };
     }
 
-    /// Decodes a body. An unknown `type_id` gives `.unknown`.
     pub fn decode(type_id: u64, body: []const u8) DecodeError!Message {
-        // Unrolled at compile time into one comparison per message type.
         inline for (@typeInfo(Message).@"union".field_names, @typeInfo(Message).@"union".field_types) |name, T| {
             if (T != Unknown and type_id == T.type_id)
                 return @unionInit(Message, name, try T.decode(body));
@@ -974,7 +829,6 @@ pub const Message = union(enum) {
     }
 };
 
-/// Checks a message type's declarations at compile time.
 fn checkSchema(comptime M: type) void {
     comptime {
         const info = @typeInfo(M).@"struct";
@@ -983,7 +837,6 @@ fn checkSchema(comptime M: type) void {
         if (tag_names.len != info.field_names.len)
             @compileError(@typeName(M) ++ ".tags must name each field once");
 
-        // `decodeBody` tracks the fields it has seen in a u64.
         if (info.field_names.len > 64)
             @compileError(@typeName(M) ++ " has more than 64 fields");
 
@@ -991,7 +844,6 @@ fn checkSchema(comptime M: type) void {
             if (!@hasField(Tags, name))
                 @compileError(@typeName(M) ++ "." ++ name ++ " has no tag");
 
-            // Tags are written as varints.
             const tag = @field(M.tags, name);
             if (tag < 0 or tag > wire.max_varint)
                 @compileError(@typeName(M) ++ "." ++ name ++ " has an invalid tag");
@@ -1001,8 +853,6 @@ fn checkSchema(comptime M: type) void {
                     @compileError(@typeName(M) ++ "." ++ name ++ " reuses a tag");
             }
 
-            // Fields are byte strings, bools or unsigned integers of up to
-            // 64 bits, optional or not.
             const V = switch (@typeInfo(T)) {
                 .optional => |o| o.child,
                 else => T,
@@ -1014,7 +864,6 @@ fn checkSchema(comptime M: type) void {
     }
 }
 
-/// The encoded size of one field. `T` is a field type without the optional.
 fn valueLen(comptime T: type, tag: u64, value: T) usize {
     if (T == []const u8) return wire.fieldLen(tag, value.len);
     if (T == bool) return wire.uintFieldLen(tag, @intFromBool(value));
@@ -1030,12 +879,10 @@ fn writeValue(comptime T: type, w: *Writer, tag: u64, value: T) Writer.Error!voi
 fn readValue(comptime T: type, bytes: []const u8) DecodeError!T {
     if (@typeInfo(T) == .optional) return try readValue(@typeInfo(T).optional.child, bytes);
     if (T == []const u8) return bytes;
-    // A bool is the integer 0 or 1.
     if (T == bool) return try wire.readUint(u1, bytes) == 1;
     return wire.readUint(T, bytes);
 }
 
-/// The encoded size of `m`'s fields. Null optional fields take no bytes.
 fn bodyLen(comptime M: type, m: M) usize {
     comptime checkSchema(M);
     const info = @typeInfo(M).@"struct";
@@ -1053,7 +900,6 @@ fn bodyLen(comptime M: type, m: M) usize {
     return len;
 }
 
-/// Writes `m`'s fields in declaration order, leaving out null optionals.
 fn encodeBody(comptime M: type, m: M, w: *Writer) Writer.Error!void {
     comptime checkSchema(M);
     const info = @typeInfo(M).@"struct";
@@ -1072,11 +918,8 @@ fn decodeBody(comptime M: type, bytes: []const u8) DecodeError!M {
     const info = @typeInfo(M).@"struct";
     var m: M = undefined;
 
-    // Bit i is set once struct field i has been read.
     var seen: u64 = 0;
 
-    // Fields can come in any order. A tag no struct field has is skipped,
-    // and a repeated tag overwrites the earlier value.
     var it: wire.FieldIterator = .init(bytes);
     while (try it.next()) |field| {
         inline for (info.field_names, info.field_types, 0..) |name, T, i| {
@@ -1087,7 +930,6 @@ fn decodeBody(comptime M: type, bytes: []const u8) DecodeError!M {
         }
     }
 
-    // Absent fields take their defaults. A field without one is required.
     inline for (info.field_names, info.field_types, info.field_attrs, 0..) |name, T, attrs, i| {
         if (seen & (@as(u64, 1) << i) == 0)
             @field(m, name) = attrs.defaultValue(T) orelse return error.MissingField;
@@ -1097,7 +939,6 @@ fn decodeBody(comptime M: type, bytes: []const u8) DecodeError!M {
 
 const testing = std.testing;
 
-/// The result points into `buf`.
 fn roundTrip(buf: []u8, m: Message) !Message {
     var w: Writer = .fixed(buf);
     try m.encode(&w);
@@ -1200,9 +1041,7 @@ test "a missing required field is an error" {
 }
 
 test "a field value of the wrong type is an error" {
-    // cols = 70000 overflows u16.
     try testing.expectError(error.WrongType, Resize.decode(&.{ 0x01, 0x03, 0x01, 0x11, 0x70, 0x02, 0x00 }));
-    // A nine-byte integer.
     try testing.expectError(error.WrongType, Ack.decode(&.{ 0x01, 0x09, 1, 0, 0, 0, 0, 0, 0, 0, 0 }));
     try testing.expectError(error.NonMinimal, Ack.decode(&.{ 0x01, 0x01, 0x00 }));
 }

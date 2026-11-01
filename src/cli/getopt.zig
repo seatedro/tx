@@ -1,23 +1,7 @@
-//! Command-line options with POSIX getopt's rules, as ssh and most Unix
-//! commands read them, plus long options.
-//!
-//! The spec lists the option letters, and a letter followed by `:` takes a
-//! value. ssh's, for example, starts `1246ab:c:`: `-1` takes no value, and
-//! `-b` takes one.
-//!
-//! - Letters group: `-tv` is `-t -v`.
-//! - A value is the rest of its argument or, if there is none, the next
-//!   argument: `-p22` and `-p 22` are the same.
-//! - The first argument that isn't an option ends the options. So does
-//!   `--`, which is skipped. A lone `-` isn't an option.
-//! - `--name` is a long option. Its value, if it takes one, is the next
-//!   argument (see `Parser.value`).
 const std = @import("std");
 
 pub const Item = union(enum) {
-    /// `-x`, with its value if its letter takes one.
     short: Short,
-    /// `--name`, without the dashes.
     long: []const u8,
 
     pub const Short = struct {
@@ -27,26 +11,18 @@ pub const Item = union(enum) {
 };
 
 pub const Error = error{
-    /// A letter the spec doesn't list. It is in `Parser.letter`.
     UnknownOption,
-    /// An option that takes a value came last.
     MissingValue,
 };
 
 pub const Parser = struct {
     spec: []const u8,
     args: []const []const u8,
-    /// The argument being read, or after the options, the first operand.
     index: usize = 0,
-    /// In a group of letters, the next one's offset. 0 between arguments.
     offset: usize = 0,
-    /// `--` ended the options.
     ended: bool = false,
-    /// The letter of the last `error.UnknownOption` or
-    /// `error.MissingValue`.
     letter: u8 = 0,
 
-    /// The next option, or null at the end of the options.
     pub fn next(p: *Parser) Error!?Item {
         if (p.offset == 0) {
             if (p.index == p.args.len) return null;
@@ -70,7 +46,6 @@ pub const Parser = struct {
         p.letter = letter;
         const at = std.mem.indexOfScalar(u8, p.spec, letter);
 
-        // `:` marks values, and isn't a letter.
         if (at == null or letter == ':') {
             p.endGroupIfDone();
             return error.UnknownOption;
@@ -81,7 +56,6 @@ pub const Parser = struct {
             return .{ .short = .{ .letter = letter } };
         }
 
-        // The rest of the group, or else the next argument.
         const joined = arg[p.offset..];
         p.offset = 0;
         p.index += 1;
@@ -89,20 +63,16 @@ pub const Parser = struct {
         return .{ .short = .{ .letter = letter, .value = try p.value() } };
     }
 
-    /// Takes the next argument as the value of the option just read, as a
-    /// long option's.
     pub fn value(p: *Parser) Error![]const u8 {
         if (p.index == p.args.len) return error.MissingValue;
         defer p.index += 1;
         return p.args[p.index];
     }
 
-    /// The arguments after the options.
     pub fn rest(p: *const Parser) []const []const u8 {
         return p.args[p.index..];
     }
 
-    /// Moves to the next argument after the last letter of a group.
     fn endGroupIfDone(p: *Parser) void {
         if (p.offset < p.args[p.index].len) return;
         p.offset = 0;
@@ -112,7 +82,6 @@ pub const Parser = struct {
 
 const testing = std.testing;
 
-/// The items `args` gives, as `-x`, `-x=value` and `--name`, then `| rest`.
 fn expectItems(args: []const []const u8, want: []const u8) !void {
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();

@@ -1,27 +1,3 @@
-//! The settings tx connects to a destination with, from tx's config and
-//! ssh's, read as ssh reads ssh_config(5).
-//!
-//! tx's config, `~/.config/tx/config`, is read first, then ssh's,
-//! `~/.ssh/config` or the file given with `-F`. As in ssh, the first value
-//! obtained for a keyword wins, and each `IdentityFile` adds to a list. The
-//! keywords read are `Host`, `Match`, `Include`, `HostName`, `User`,
-//! `IdentityFile`, `IdentitiesOnly`, `IdentityAgent` and `ProxyJump`, and
-//! `Port` in tx's config only, since the port in ssh's is sshd's. Other
-//! keywords are ignored.
-//!
-//! `Match` takes `all`, `host`, `originalhost`, `user`, `localuser`, `exec`,
-//! `canonical` and `final`. tx reads the files once, so `final` matches and
-//! `canonical` doesn't. A block under another criterion doesn't apply, with
-//! a warning. `Match exec` runs its command with `/bin/sh -c`, and is the
-//! only thing here that runs a program.
-//!
-//! `Include` paths take `~`, tokens, `${VAR}`, and `*` and `?`, with the
-//! matches in byte order. A relative path is under `~/.ssh` in ssh's config,
-//! and under tx's config directory in tx's. Includes nest 16 deep, as in
-//! ssh. An Include in a block that doesn't apply isn't read.
-//!
-//! As ssh does, tx refuses a config file that others can write, or that
-//! someone other than the user or root owns, except a file given with `-F`.
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
@@ -30,66 +6,40 @@ const Environ = std.process.Environ;
 const paths = @import("paths.zig");
 
 pub const Options = struct {
-    /// The destination's host, as given.
     host: []const u8,
-    /// `-l`, `user@` or `-o User`, which wins over the config's.
     user: ?[]const u8 = null,
-    /// `-p` or `-o Port`, which wins over the config's.
     port: ?u16 = null,
-    /// The port when neither the command line nor the config gives one.
     default_port: u16,
-    /// `-i` and `-o IdentityFile`, which come before the config's.
     identity_files: []const []const u8 = &.{},
-    /// The key files when neither the command line nor the config names
-    /// one.
     default_identity_files: []const []const u8 = &.{},
-    /// `-F`: ssh's config file, which must exist, or `none`. Null is
-    /// `~/.ssh/config`.
     ssh_config: ?[]const u8 = null,
     environ: *const Environ.Map,
-    /// The signal mask a `Match exec` command starts with. Null leaves the
-    /// current one.
     signal_mask: ?std.posix.sigset_t = null,
 };
 
 pub const Resolved = struct {
-    /// `HostName`, or the host as given. Lowercase, unless it's an address.
     hostname: []const u8,
-    /// Null when neither the command line nor the config gives one, for the
-    /// local user's name.
     user: ?[]const u8,
     port: u16,
-    /// The command line's, then the config's, or else the defaults, with
-    /// `~`, tokens and variables expanded. `IdentityFile none` adds none.
     identity_files: []const []const u8,
-    /// Only the identity files' keys are used, and the agent's keys that
-    /// match them.
     identities_only: bool,
-    /// Null when the config doesn't set it, and `SSH_AUTH_SOCK` applies.
     identity_agent: ?IdentityAgent,
-    /// Null for none.
     proxy_jump: ?[]const u8,
-    /// Lines for stderr.
     warnings: []const []const u8,
 };
 
 pub const IdentityAgent = union(enum) {
-    /// `none`, or a variable that isn't set or is empty.
     none,
-    /// The agent's socket.
     path: []const u8,
 };
 
 pub const Result = union(enum) {
     ok: Resolved,
-    /// What's wrong, after the file and line.
     bad: []const u8,
 };
 
 pub const Error = Allocator.Error || Io.Cancelable;
 
-/// Reads tx's config and ssh's for `options.host`. The result points into
-/// `options` and `arena`.
 pub fn resolve(arena: Allocator, io: Io, options: Options) Error!Result {
     var p: Parser = .{
         .arena = arena,
@@ -104,28 +54,18 @@ pub fn resolve(arena: Allocator, io: Io, options: Options) Error!Result {
     return .{ .ok = resolved };
 }
 
-/// How deep Includes nest, as in ssh.
 const max_include_depth = 16;
 
-/// The largest config file tx reads.
 const max_file_size = 1 << 20;
 
-/// The tokens of `HostName`, besides `%%`.
 const hostname_tokens = "h";
-/// The tokens of `IdentityFile`, `IdentityAgent`, `Include` and
-/// `Match exec`, besides `%%`.
 const path_tokens = "dhilLnpru";
-/// The tokens of `User`, which can't refer to itself.
 const user_tokens = "dhilLnpu";
 
-/// Whose config a file is part of.
 const Kind = enum { tx, ssh };
 
-/// Where a value came from, for messages.
 const Origin = struct {
-    /// A file's path, or a description such as `-i`.
     name: []const u8,
-    /// The line, in a file.
     line: ?usize = null,
 
     pub fn format(o: Origin, w: *Io.Writer) Io.Writer.Error!void {
@@ -134,32 +74,23 @@ const Origin = struct {
     }
 };
 
-/// A value whose tokens are expanded once all the files are read.
 const Setting = struct {
     value: []const u8,
     origin: Origin,
 };
 
-/// What `%` tokens stand for, besides what `Local` holds.
 const Context = struct {
-    /// `%h`.
     host: []const u8,
-    /// `%r`.
     user: []const u8 = "",
 };
 
-/// The local side, for tokens and `~`.
 const Local = struct {
     user: ?[]const u8,
-    /// `HOME`, or the password database's.
     home: ?[]const u8,
     uid: []const u8,
-    /// With its domain, as `%l` gives it.
     hostname: ?[]const u8,
 
     fn init(arena: Allocator, environ: *const Environ.Map) Allocator.Error!Local {
-        // The password database's strings are overwritten by the next
-        // lookup, so they're copied.
         var local: Local = .{
             .user = null,
             .home = environ.get("HOME"),
@@ -187,8 +118,6 @@ const Parser = struct {
     options: Options,
     local: Local,
 
-    // The values found so far. The first one found wins.
-    /// `HostName`, with its tokens expanded.
     hostname: ?[]const u8 = null,
     user: ?Setting = null,
     port: ?u16 = null,
@@ -198,9 +127,7 @@ const Parser = struct {
     proxy_jump: ?[]const u8 = null,
 
     warnings: std.ArrayList([]const u8) = .empty,
-    /// The Match criteria warned about.
     warned: std.ArrayList([]const u8) = .empty,
-    /// For `error.BadConfig`.
     problem: []const u8 = "",
 
     const ParseError = Error || error{BadConfig};
@@ -210,7 +137,6 @@ const Parser = struct {
             try p.identity_files.append(p.arena, .{ .value = file, .origin = .{ .name = "-i" } });
         }
 
-        // tx's config, then ssh's.
         if (try p.txConfigPath()) |path| try p.readFile(path, .tx, .{});
         if (p.options.ssh_config) |path| {
             if (!eqlIgnoreCase(path, "none")) try p.readFile(path, .ssh, .{ .required = true, .check_owner = false });
@@ -228,12 +154,9 @@ const Parser = struct {
         };
     }
 
-    /// The values once every file is read, with their tokens expanded.
     fn finish(p: *Parser) ParseError!Resolved {
         const hostname = try lowerHost(p.arena, p.hostname orelse p.options.host);
 
-        // The command line's user, or the config's, whose tokens are
-        // expanded.
         var user = p.options.user;
         if (user == null) {
             if (p.user) |setting| user = try p.expand(setting.origin, setting.value, user_tokens, .{ .host = hostname }, true);
@@ -266,7 +189,6 @@ const Parser = struct {
         };
     }
 
-    /// The identity files given, or else the defaults.
     fn identityFileSettings(p: *Parser) Allocator.Error![]const Setting {
         if (p.identity_files.items.len > 0) return p.identity_files.items;
         const defaults = try p.arena.alloc(Setting, p.options.default_identity_files.len);
@@ -276,8 +198,6 @@ const Parser = struct {
         return defaults;
     }
 
-    /// `IdentityAgent`: `none`, `SSH_AUTH_SOCK` for that variable, `$VAR`
-    /// for another, or a path.
     fn agent(p: *Parser, setting: Setting, context: Context) ParseError!IdentityAgent {
         const value = setting.value;
         if (std.mem.eql(u8, value, "none")) return .none;
@@ -292,28 +212,21 @@ const Parser = struct {
         return if (path.len == 0) .none else .{ .path = path };
     }
 
-    /// An agent named by a variable. Without the variable, or with it
-    /// empty, there's none, as in ssh.
     fn agentVariable(p: *Parser, name: []const u8) IdentityAgent {
         const path = p.options.environ.get(name) orelse return .none;
         return if (path.len == 0) .none else .{ .path = path };
     }
 
     const ReadOptions = struct {
-        /// A missing file is an error.
         required: bool = false,
-        /// Refuses a file that others could have written.
         check_owner: bool = true,
-        /// How many Includes led to the file.
         depth: usize = 0,
     };
 
-    /// Reads a config file, if it exists, from its first line to its last.
     fn readFile(p: *Parser, path: []const u8, kind: Kind, how: ReadOptions) ParseError!void {
         const origin: Origin = .{ .name = path };
         const file = Io.Dir.cwd().openFile(p.io, path, .{ .allow_directory = false }) catch |err| switch (err) {
             error.FileNotFound => if (how.required) return p.fail(origin, "no such file", .{}) else return,
-            // An Include's pattern can match a directory.
             error.IsDir => return,
             error.Canceled => |e| return e,
             else => return p.fail(origin, "can't open it: {t}", .{err}),
@@ -334,8 +247,6 @@ const Parser = struct {
             },
         };
 
-        // Lines before the first Host or Match apply, as the block of the
-        // Include that read the file does.
         var active = true;
         var lines = std.mem.splitScalar(u8, text, '\n');
         var number: usize = 0;
@@ -346,7 +257,6 @@ const Parser = struct {
         }
     }
 
-    /// One line. `active` is whether the block it's in applies.
     fn readLine(p: *Parser, at: Origin, kind: Kind, depth: usize, text: []const u8, active: *bool) ParseError!void {
         const line = (splitLine(p.arena, text) catch |err| switch (err) {
             error.NoArgument => return p.fail(at, "no argument after the keyword", .{}),
@@ -363,7 +273,6 @@ const Parser = struct {
         } else if (eqlIgnoreCase(keyword, "Include")) {
             if (active.*) try p.include(at, kind, depth, args);
         } else if (eqlIgnoreCase(keyword, "HostName")) {
-            // `%h` is the host as given.
             const value = try p.single(at, keyword, args);
             if (active.* and p.hostname == null) {
                 p.hostname = try p.expand(at, value, hostname_tokens, .{ .host = p.options.host }, false);
@@ -372,7 +281,6 @@ const Parser = struct {
             const value = try p.single(at, keyword, args);
             if (active.* and p.user == null) p.user = .{ .value = value, .origin = at };
         } else if (eqlIgnoreCase(keyword, "Port")) {
-            // ssh's port is sshd's.
             if (kind == .ssh) return;
             const value = try p.single(at, keyword, args);
             const port = std.fmt.parseInt(u16, value, 10) catch 0;
@@ -394,15 +302,12 @@ const Parser = struct {
         }
     }
 
-    /// The argument of a keyword that takes one.
     fn single(p: *Parser, at: Origin, keyword: []const u8, args: []const []const u8) ParseError![]const u8 {
         if (args.len == 0 or args[0].len == 0) return p.fail(at, "{s} needs an argument", .{keyword});
         if (args.len > 1) return p.fail(at, "{s} takes one argument", .{keyword});
         return args[0];
     }
 
-    /// Whether a Host line's patterns match the host as given: one must,
-    /// and no negated one may.
     fn hostLine(p: *Parser, at: Origin, patterns: []const []const u8) ParseError!bool {
         var matched = false;
         for (patterns) |pattern| {
@@ -416,7 +321,6 @@ const Parser = struct {
         return matched;
     }
 
-    /// Whether every criterion of a Match line holds.
     fn matchLine(p: *Parser, at: Origin, words: []const []const u8) ParseError!bool {
         var result = true;
         var criteria: usize = 0;
@@ -427,22 +331,18 @@ const Parser = struct {
             const negate = std.mem.startsWith(u8, name, "!");
             if (negate) name = name[1..];
 
-            // `all` stands alone, or after `canonical` or `final`.
             if (eqlIgnoreCase(name, "all")) {
                 if (criteria > 1 or i < words.len) return p.fail(at, "Match all can't be combined with other criteria", .{});
                 return result and !negate;
             }
             criteria += 1;
 
-            // tx's one pass over the files is the final one, and isn't
-            // after canonicalization.
             if (eqlIgnoreCase(name, "final") or eqlIgnoreCase(name, "canonical")) {
                 const holds = eqlIgnoreCase(name, "final");
                 if (holds == negate) result = false;
                 continue;
             }
 
-            // The other criteria take an argument: `NAME ARG` or `NAME=ARG`.
             var arg: []const u8 = undefined;
             if (std.mem.indexOfScalar(u8, name, '=')) |eq| {
                 arg = name[eq + 1 ..];
@@ -467,8 +367,6 @@ const Parser = struct {
             else if (eqlIgnoreCase(name, "localuser"))
                 matchPatternList(p.local.user orelse "", arg, .sensitive)
             else if (eqlIgnoreCase(name, "exec")) holds: {
-                // As in ssh, the command doesn't run once another
-                // criterion has failed.
                 const command = try p.expand(at, arg, path_tokens, p.parseContext(), false);
                 if (!result) continue;
                 break :holds try p.exec(at, command);
@@ -484,18 +382,13 @@ const Parser = struct {
         return result;
     }
 
-    /// Notes a Match criterion tx doesn't support, the first time it
-    /// appears.
     fn warnOnce(p: *Parser, at: Origin, name: []const u8) Allocator.Error!void {
         for (p.warned.items) |warned| if (eqlIgnoreCase(warned, name)) return;
         try p.warned.append(p.arena, name);
         try p.warnings.append(p.arena, try std.fmt.allocPrint(p.arena, "{f}: Match {s} isn't supported; its block doesn't apply", .{ at, name }));
     }
 
-    /// Runs a `Match exec` command as ssh does: `/bin/sh -c`, with stdin and
-    /// stdout on /dev/null. It holds when the command exits with 0.
     fn exec(p: *Parser, at: Origin, command: []const u8) ParseError!bool {
-        // A child inherits the signal mask.
         var blocked: std.posix.sigset_t = undefined;
         if (p.options.signal_mask) |*mask| _ = std.c.pthread_sigmask(std.posix.SIG.SETMASK, mask, &blocked);
         const spawned = std.process.spawn(p.io, .{
@@ -524,7 +417,6 @@ const Parser = struct {
         };
     }
 
-    /// Reads the files an Include line names, in order.
     fn include(p: *Parser, at: Origin, kind: Kind, depth: usize, patterns: []const []const u8) ParseError!void {
         for (patterns) |pattern| {
             if (pattern.len == 0) return p.fail(at, "empty Include path", .{});
@@ -537,8 +429,6 @@ const Parser = struct {
         }
     }
 
-    /// An Include path, with `~` expanded, and a relative one under
-    /// `~/.ssh` or tx's config directory.
     fn anchor(p: *Parser, at: Origin, path: []const u8, kind: Kind) ParseError![]const u8 {
         const expanded = try p.expandTilde(at, path);
         if (std.fs.path.isAbsolute(expanded)) return expanded;
@@ -550,8 +440,6 @@ const Parser = struct {
         return std.fs.path.join(p.arena, &.{ dir, expanded });
     }
 
-    /// The files that match `path`, whose components may hold `*` and `?`,
-    /// in byte order. A path without them is returned as it is.
     fn glob(p: *Parser, at: Origin, path: []const u8) ParseError![]const []const u8 {
         var found: std.ArrayList([]const u8) = .empty;
         if (!hasWildcard(path)) {
@@ -565,7 +453,6 @@ const Parser = struct {
         return found.items;
     }
 
-    /// Adds to `found` the paths under `dir` that match `rest`.
     fn globFrom(p: *Parser, at: Origin, found: *std.ArrayList([]const u8), dir: []const u8, rest: []const u8) ParseError!void {
         const trimmed = std.mem.trimStart(u8, rest, "/");
         if (trimmed.len == 0) return found.append(p.arena, dir);
@@ -577,7 +464,6 @@ const Parser = struct {
             return p.globFrom(at, found, try std.fs.path.join(p.arena, &.{ dir, component }), after);
         }
 
-        // A directory that can't be listed holds no matches.
         var d = Io.Dir.cwd().openDir(p.io, dir, .{ .iterate = true }) catch |err| switch (err) {
             error.Canceled => |e| return e,
             else => return,
@@ -593,7 +479,6 @@ const Parser = struct {
         }
     }
 
-    /// A path's tokens and variables, then `~` or `~USER` at its start.
     fn expandPath(p: *Parser, at: Origin, path: []const u8, context: Context) ParseError![]const u8 {
         return p.expandTilde(at, try p.expand(at, path, path_tokens, context, true));
     }
@@ -617,8 +502,6 @@ const Parser = struct {
         return p.local.home orelse p.fail(at, "can't tell the home directory", .{});
     }
 
-    /// Expands `%` tokens, and `${VAR}` with `variables`. `letters` are the
-    /// tokens allowed besides `%%`.
     fn expand(p: *Parser, at: Origin, text: []const u8, letters: []const u8, context: Context, variables: bool) ParseError![]const u8 {
         var out: std.ArrayList(u8) = .empty;
         var i: usize = 0;
@@ -638,7 +521,6 @@ const Parser = struct {
                 continue;
             }
 
-            // `%` and a letter.
             if (i + 1 == text.len) return p.fail(at, "a lone % ends {s}", .{text});
             const letter = text[i + 1];
             i += 2;
@@ -666,14 +548,12 @@ const Parser = struct {
                 const name = p.local.hostname orelse return p.fail(at, "can't tell the local host name, for %{c}", .{letter});
                 if (letter == 'l') return name;
 
-                // Up to the first dot.
                 return name[0 .. std.mem.indexOfScalar(u8, name, '.') orelse name.len];
             },
             else => unreachable,
         }
     }
 
-    /// `%h` and `%r` while the files are read, as ssh has them then.
     fn parseContext(p: *Parser) Context {
         return .{ .host = p.currentHost(), .user = p.currentUser() };
     }
@@ -703,13 +583,10 @@ const Line = struct {
     args: []const []const u8,
 };
 
-/// Splits a line into its keyword and arguments, as ssh does. Null for a
-/// blank line or a comment.
 fn splitLine(arena: Allocator, text: []const u8) error{ NoArgument, InvalidQuotes, OutOfMemory }!?Line {
     const line = std.mem.trim(u8, text, " \t\r\n\x0c");
     if (line.len == 0 or line[0] == '#') return null;
 
-    // Spaces, or one `=` with spaces around it, end the keyword.
     const end = std.mem.indexOfAny(u8, line, " \t=") orelse line.len;
     var rest = line[end..];
     if (std.mem.startsWith(u8, rest, "=")) {
@@ -723,10 +600,6 @@ fn splitLine(arena: Allocator, text: []const u8) error{ NoArgument, InvalidQuote
     return .{ .keyword = line[0..end], .args = try splitArgs(arena, rest) };
 }
 
-/// Splits arguments at spaces and tabs, as ssh's argv_split does. Double or
-/// single quotes keep spaces in an argument. A backslash escapes a quote, a
-/// backslash, or outside quotes, a space. An argument that starts with `#`
-/// starts a comment.
 fn splitArgs(arena: Allocator, text: []const u8) error{ InvalidQuotes, OutOfMemory }![]const []const u8 {
     var args: std.ArrayList([]const u8) = .empty;
     var i: usize = 0;
@@ -757,20 +630,15 @@ fn splitArgs(arena: Allocator, text: []const u8) error{ InvalidQuotes, OutOfMemo
     return args.items;
 }
 
-/// Whether a backslash before `c` escapes it.
 fn escapes(c: u8, quote: ?u8) bool {
     return c == '"' or c == '\'' or c == '\\' or (c == ' ' and quote == null);
 }
 
 const Case = enum { sensitive, insensitive };
 
-/// Whether `s` matches `pattern`, in which `*` matches any run of
-/// characters and `?` any one.
 fn matchPattern(s: []const u8, pattern: []const u8, case: Case) bool {
     var si: usize = 0;
     var pi: usize = 0;
-    // The last `*` seen, and the end of what it matches so far. On a
-    // mismatch, it takes one more character, and matching resumes after it.
     var star: ?usize = null;
     var star_end: usize = 0;
     while (si < s.len) {
@@ -790,7 +658,6 @@ fn matchPattern(s: []const u8, pattern: []const u8, case: Case) bool {
         }
     }
 
-    // What's left of the pattern must match nothing.
     while (pi < pattern.len and pattern[pi] == '*') pi += 1;
     return pi == pattern.len;
 }
@@ -802,8 +669,6 @@ fn sameChar(a: u8, b: u8, case: Case) bool {
     };
 }
 
-/// Whether `s` matches a comma-separated list of patterns: one must, and
-/// no negated one, such as `!*.example.com`, may.
 fn matchPatternList(s: []const u8, list: []const u8, case: Case) bool {
     var matched = false;
     var patterns = std.mem.splitScalar(u8, list, ',');
@@ -817,8 +682,6 @@ fn matchPatternList(s: []const u8, list: []const u8, case: Case) bool {
     return matched;
 }
 
-/// A path component's match, as glob(7) has it: a leading `.` matches only
-/// a `.`.
 fn matchComponent(name: []const u8, pattern: []const u8) bool {
     if (std.mem.startsWith(u8, name, ".") and !std.mem.startsWith(u8, pattern, ".")) return false;
     return matchPattern(name, pattern, .sensitive);
@@ -832,7 +695,6 @@ fn lessThan(_: void, a: []const u8, b: []const u8) bool {
     return std.mem.order(u8, a, b) == .lt;
 }
 
-/// `yes` or `no`, or `true` or `false`, as ssh takes them.
 fn parseFlag(value: []const u8) ?bool {
     if (eqlIgnoreCase(value, "yes") or eqlIgnoreCase(value, "true")) return true;
     if (eqlIgnoreCase(value, "no") or eqlIgnoreCase(value, "false")) return false;
@@ -845,17 +707,13 @@ fn validVariableName(name: []const u8) bool {
     return true;
 }
 
-/// The host in lowercase, as ssh has it, unless it's an address.
 fn lowerHost(arena: Allocator, host: []const u8) Allocator.Error![]const u8 {
     if (Io.net.IpAddress.parse(host, 0)) |_| return host else |_| {}
     return std.ascii.allocLowerString(arena, host);
 }
 
-/// Whether a config file is safe to take commands from: the user's or
-/// root's, and not writable by others.
 fn safelyOwned(file: Io.File) error{Unexpected}!bool {
     const uid = std.c.getuid();
-    // std.c has no fstat on Linux.
     if (builtin.os.tag == .linux) {
         const linux = std.os.linux;
         var st: linux.Statx = undefined;
@@ -876,8 +734,6 @@ const eqlIgnoreCase = std.ascii.eqlIgnoreCase;
 
 const testing = std.testing;
 
-/// A temporary home, for config files, and an environment that finds them
-/// there: `~/.ssh/config`, and tx's config at `~/config/tx/config`.
 const TestHome = struct {
     tmp: testing.TmpDir,
     arena: std.heap.ArenaAllocator,
@@ -892,7 +748,6 @@ const TestHome = struct {
         h.environ = .init(testing.allocator);
         try h.environ.put("HOME", h.dir);
         try h.environ.put("XDG_CONFIG_HOME", try h.path("config"));
-        // For Match exec.
         try h.environ.put("PATH", testing.environ.getPosix("PATH") orelse "/usr/bin:/bin");
     }
 
@@ -906,7 +761,6 @@ const TestHome = struct {
         return std.fs.path.join(h.arena.allocator(), &.{ h.dir, sub_path });
     }
 
-    /// Writes a file that only the user may read or write.
     fn write(h: *TestHome, sub_path: []const u8, text: []const u8) !void {
         if (std.fs.path.dirname(sub_path)) |dir| try h.tmp.dir.createDirPath(testing.io, dir);
         try h.tmp.dir.writeFile(testing.io, .{
@@ -930,7 +784,6 @@ const TestHome = struct {
         };
     }
 
-    /// The problem with the config, which must be bad.
     fn badConfig(h: *TestHome, options: Options) ![]const u8 {
         return switch (try ssh_config.resolve(h.arena.allocator(), testing.io, options)) {
             .ok => error.TestUnexpectedResult,
@@ -938,19 +791,16 @@ const TestHome = struct {
         };
     }
 
-    /// The problem with `text` as ssh's config, which must be bad.
     fn badSshConfig(h: *TestHome, text: []const u8) ![]const u8 {
         try h.write(".ssh/config", text);
         return h.badConfig(h.optionsFor("example.com"));
     }
 
-    /// Expects a problem with a file under the home.
     fn expectProblem(h: *TestHome, expected: []const u8, problem: []const u8) !void {
         try testing.expectEqualStrings(try std.mem.concat(h.arena.allocator(), u8, &.{ h.dir, "/", expected }), problem);
     }
 };
 
-// `TestHome.resolve` hides the file's `resolve`.
 const ssh_config = @This();
 
 fn expectFiles(expected: []const []const u8, actual: []const []const u8) !void {
@@ -1050,7 +900,6 @@ test "Host patterns take * and ?, and a negated match rules the line out" {
     try testing.expectEqualStrings("one-character", (try h.resolve(h.optionsFor("db1"))).hostname);
     try testing.expectEqualStrings("one-character", (try h.resolve(h.optionsFor("other"))).hostname);
     try testing.expectEqualStrings("fallback", (try h.resolve(h.optionsFor("db12"))).hostname);
-    // Host patterns are case-sensitive.
     try testing.expectEqualStrings("fallback", (try h.resolve(h.optionsFor("WWW.EXAMPLE.COM"))).hostname);
 }
 
@@ -1168,7 +1017,6 @@ test "Include reads globs in byte order, relative to ~/.ssh or tx's config direc
         \\  Include ~/vms/*/ssh_config ~/missing
         \\
     );
-    // A Host in an included file ends with the file.
     try h.write(".ssh/config.d/b", "IdentityFile /keys/b\nHost nomatch\n");
     try h.write(".ssh/config.d/a", "IdentityFile /keys/a\n");
     try h.write(".ssh/config.d/.hidden", "IdentityFile /keys/hidden\n");
@@ -1186,7 +1034,6 @@ test "Includes nest 16 deep" {
     defer h.deinit();
     const a = h.arena.allocator();
 
-    // ssh's config includes ~/n1, which includes ~/n2, and so on.
     try h.write(".ssh/config", "Include ~/n1\n");
     for (1..16) |n| try h.write(try std.fmt.allocPrint(a, "n{d}", .{n}), try std.fmt.allocPrint(a, "Include ~/n{d}\n", .{n + 1}));
     try h.write("n16", "IdentityFile /keys/deep\n");
@@ -1242,7 +1089,6 @@ test "IdentityFile, IdentityAgent and User take ~, tokens and variables" {
     }, r.identity_files);
     try testing.expectEqualStrings(try std.fmt.allocPrint(a, "/agents/{s}.sock", .{short}), r.identity_agent.?.path);
 
-    // The command line's files, too.
     var options = h.optionsFor("alias");
     options.identity_files = &.{"~/%h"};
     try testing.expectEqualStrings(try h.path("real.example.com"), (try h.resolve(options)).identity_files[0]);
@@ -1308,10 +1154,8 @@ test "bad lines and unknown tokens are errors with the file and line" {
     try h.expectProblem(".ssh/config line 1: Match all can't be combined with other criteria", try h.badSshConfig("Match all host x\n"));
     try h.expectProblem(".ssh/config line 1: Match host needs an argument", try h.badSshConfig("Match host\n"));
     try h.expectProblem(".ssh/config line 1: UNSET isn't set, for ${UNSET}/key", try h.badSshConfig("IdentityFile ${UNSET}/key\n"));
-    // Keywords tx doesn't read still need an argument.
     try h.expectProblem(".ssh/config line 1: no argument after the keyword", try h.badSshConfig("ForwardAgent\n"));
 
-    // Only active values are expanded, as in ssh.
     try h.write(".ssh/config", "Host other\n  IdentityFile ~/%C\n");
     _ = try h.resolve(h.optionsFor("example.com"));
 
@@ -1351,7 +1195,6 @@ test "a config file others can write is refused" {
     try h.tmp.dir.setFilePermissions(testing.io, ".ssh/config", .fromMode(0o620), .{});
     try h.expectProblem(".ssh/config: bad owner or permissions: it must be yours or root's, and only its owner may write it", try h.badConfig(h.optionsFor("example.com")));
 
-    // A file given with -F isn't checked, as in ssh.
     var options = h.optionsFor("example.com");
     options.ssh_config = try h.path(".ssh/config");
     try testing.expectEqualStrings("real.example.com", (try h.resolve(options)).hostname);

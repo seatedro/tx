@@ -1,15 +1,3 @@
-//! A canonical text dump of a Terminal's state, for checking that a terminal
-//! fed the client stream matches the primary.
-//!
-//! Terminals in the same state produce the same dump however their pages
-//! are laid out. Styles and hyperlinks are numbered by first appearance,
-//! rows from the top of scrollback, and Kitty images are sorted by ID.
-//! Process-local stamps (image generations, dirty counters) and client-side
-//! presentation (viewport, animation clocks) are omitted.
-//!
-//! libghostty-vt's formatter covers only the active screen, skips Kitty
-//! images, and numbers hyperlinks per page, so the same cells split across
-//! pages differently format differently.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
@@ -29,7 +17,6 @@ pub fn dump(gpa: Allocator, w: *Writer, t: *const Terminal) Error!void {
     try d.terminal(t);
 }
 
-/// Caller owns the returned memory.
 pub fn dumpAlloc(gpa: Allocator, t: *const Terminal) Error![]u8 {
     var out: Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -53,7 +40,6 @@ const Dumper = struct {
     gpa: Allocator,
     arena: Allocator,
     w: *Writer,
-    /// Numbered by first appearance.
     styles: std.ArrayHashMapUnmanaged(Style, void, StyleContext, true) = .empty,
     links: std.StringArrayHashMapUnmanaged(void) = .empty,
 
@@ -61,8 +47,6 @@ const Dumper = struct {
         try d.w.print(fmt, args);
     }
 
-    /// For types without pointers or allocated lists. Addresses and
-    /// capacities aren't state.
     fn any(d: *Dumper, value: anytype) Error!void {
         try d.w.printValue("any", .{}, value, 16);
     }
@@ -113,8 +97,6 @@ const Dumper = struct {
     }
 
     fn flags(d: *Dumper, t: *const Terminal) Error!void {
-        // `dirty` and `search_viewport_dirty` are scratch flags for Ghostty's
-        // renderer and search thread, which set and clear them between frames.
         const f = t.flags;
         try d.print("flags", .{});
         inline for (@typeInfo(@TypeOf(f)).@"struct".field_names) |name| {
@@ -130,8 +112,6 @@ const Dumper = struct {
         try d.line("background", t.colors.background);
         try d.line("foreground", t.colors.foreground);
         try d.line("cursor_color", t.colors.cursor);
-        // The 256-entry tables are hashed to keep the dump short. Bytes
-        // change the overridden entries, which are listed.
         const palette = &t.colors.palette;
         try d.print("palette original {x} current {x} overridden", .{
             paletteHash(palette.original),
@@ -151,7 +131,6 @@ const Dumper = struct {
         return h.final();
     }
 
-    /// Glyph Protocol registrations, in their eviction order.
     fn glossary(d: *Dumper, t: *const Terminal) Error!void {
         const entries = &t.glyph_glossary.entries;
         for (entries.keys(), entries.values()) |cp, entry| {
@@ -161,7 +140,6 @@ const Dumper = struct {
         }
     }
 
-    /// Kitty drag and drop (OSC 72) registration.
     fn dnd(d: *Dumper, t: *const Terminal) Error!void {
         const state = t.kitty_dnd orelse return d.print("dnd none\n", .{});
         const drop = &state.drop;
@@ -207,7 +185,6 @@ const Dumper = struct {
         try d.line("  charset", s.charset);
         try d.line("  protected_mode", s.protected_mode);
         try d.line("  kitty_keyboard", s.kitty_keyboard);
-        // `semantic_prompt.seen` is omitted. libghostty-vt never reads it.
         try d.line("  semantic_click", s.semantic_prompt.click);
         if (s.selection) |sel| {
             try d.print("  selection rectangle={} ", .{sel.rectangle});
@@ -243,7 +220,6 @@ const Dumper = struct {
     }
 
     fn row(d: *Dumper, page: *const Page, r: *vt.page.Row, y: usize) Error!void {
-        // Blank rows are skipped.
         var started = false;
         if (r.wrap or r.wrap_continuation or r.semantic_prompt != .none or r.kitty_virtual_placeholder) {
             try d.print("  y{d} wrap={} cont={} prompt={t} placeholder={}", .{
@@ -367,7 +343,6 @@ const Dumper = struct {
             try d.print(" response ", .{});
             try d.any(loading.response);
             try d.print(" frame ", .{});
-            // The frame load's image generation is a process-local stamp.
             try d.any(if (loading.frame) |f| f.cmd else null);
             try d.w.writeByte('\n');
         }
@@ -389,7 +364,6 @@ const Dumper = struct {
             .pending => |len| try d.print(" data pending {d}", .{len}),
         }
         if (img.animation) |a| {
-            // Omits when the shown frame last changed, which is client state.
             try d.print(" animation state={t} loops={d}/{d} frame={d} root_gap={d}", .{
                 a.state,
                 a.current_loop,
@@ -413,11 +387,8 @@ fn testDump(t: *const Terminal) ![]u8 {
     return dumpAlloc(testing.allocator, t);
 }
 
-/// What a terminal is fed before each of `changes`.
 pub const changes_base = "ab\r\n";
 
-/// Each entry changes one piece of state of a terminal that has been fed
-/// `changes_base`. Used by the rebuild tests too.
 pub const changes = [_]struct { []const u8, []const u8 }{
     .{ "primary text", "x" },
     .{ "a wide character", "\u{4E2D}" },
@@ -522,8 +493,6 @@ test "a resize and a cell pixel size show in the dump" {
 }
 
 test "freed styles and hyperlinks in a page don't show in the dump" {
-    // `b` erases and reprints the row, leaving a freed style and hyperlink
-    // in the page.
     var a: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 20, .rows = 5 });
     defer a.deinit(testing.allocator);
     var a_stream = a.vtStream();

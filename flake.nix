@@ -5,7 +5,6 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
 
-    # Zig 0.17, which Ghostty main requires. nixpkgs only has 0.16.
     zig = {
       url = "github:mitchellh/zig-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -21,7 +20,6 @@
       ...
     }:
     let
-      # build.zig.zon's version, then the commit, as `0.0.0-dev+965921b`.
       zonVersion = builtins.head (
         builtins.match ''.*[.]version = "([^"]+)".*'' (builtins.readFile ./build.zig.zon)
       );
@@ -42,9 +40,8 @@
         devShells.default = pkgs.mkShell {
           packages = [
             zig'
-            pkgs.clang-tools # clang-format for src/**/*.{c,h}
+            pkgs.clang-tools
           ]
-          # wl-copy and wl-paste, which the clipboard server's tests run.
           ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.wl-clipboard ];
         };
       }
@@ -52,7 +49,6 @@
     // {
       overlays.default = final: _: { tx = self.packages.${final.stdenv.hostPlatform.system}.default; };
 
-      # services.txd; see nix/home-module.nix.
       homeModules.default = import ./nix/home-module.nix self;
     };
 }

@@ -1,11 +1,7 @@
-//! Builds picotls (h2o/picotls) from its upstream sources. tx supplies the
-//! cryptography (src/crypto). The minicrypto backend is built for the tests
-//! that compare tx's backend against it.
 const std = @import("std");
 
 const flags = &[_][]const u8{ "-std=gnu99", "-fno-sanitize=undefined" };
 
-/// The TLS 1.3 core, with no cryptography.
 pub fn core(
     b: *std.Build,
     dep: *std.Build.Dependency,
@@ -30,7 +26,6 @@ pub fn core(
     return lib;
 }
 
-/// The bundled minicrypto backend (cifra and micro-ecc), for tests.
 pub fn minicrypto(
     b: *std.Build,
     dep: *std.Build.Dependency,

@@ -1,33 +1,3 @@
-//! txd: serves the user's sessions over QUIC.
-//!
-//! Usage: txd [--listen ADDRESS:PORT | --listen tailnet[:PORT]] [--key PATH]
-//!            [--print-host-key] [--install]
-//!        txd [--listen ...] --uninstall
-//!        txd --version
-//!        txd --session --fd N
-//!
-//! Personal mode: clients log in as the user running txd, with a key
-//! from `~/.config/tx/authorized_keys` if that file exists, or else from
-//! `~/.ssh/authorized_keys`.
-//!
-//! `--listen tailnet` listens only on Tailscale's addresses and loopback,
-//! so that only the tailnet's members and this machine reach txd (see
-//! `server.addresses`). It is the default on a machine where Tailscale is
-//! up. Elsewhere the default is every address.
-//!
-//! `--print-host-key` prints the public host key as `ssh-ed25519 AAAA...`
-//! and exits, creating the key if there is none.
-//!
-//! `--install` sets up a service that keeps txd running with the given
-//! `--listen` and `--key`, starts it if it isn't running, prints the host
-//! key's fingerprint, and exits; see `install.zig`. Without `--listen`,
-//! the service gets the default as it is when `--install` runs, so that
-//! it doesn't depend on whether Tailscale is up when the service starts.
-//! `--uninstall` stops txd, ends its sessions, and removes the service and
-//! txd's files.
-//!
-//! `--session` runs one session, on the socket txd passes as fd N. txd
-//! starts it; see `session.process`.
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
@@ -42,10 +12,8 @@ const keyfile = @import("keyfile.zig");
 const paths = @import("paths.zig");
 const Scope = server_pkg.addresses.Scope;
 
-/// Below the ephemeral port ranges of Linux and macOS.
 pub const default_port = 8739;
 
-/// Variables a session inherits from txd's environment.
 const inherited = [_][]const u8{ "HOME", "USER", "LOGNAME", "SHELL", "PATH", "TZ", "LANG" };
 
 pub fn main(init: std.process.Init) !u8 {
@@ -53,21 +21,17 @@ pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
-    // A session process, started by txd.
     if (args.len == 4 and std.mem.eql(u8, args[1], "--session") and std.mem.eql(u8, args[2], "--fd")) {
         const fd = std.fmt.parseInt(std.posix.fd_t, args[3], 10) catch return usage("invalid fd");
         return session.process.run(gpa, io, fd);
     }
 
-    // Options. `::` covers every IPv4 and IPv6 address.
     var listen: Io.net.IpAddress = try .parseIp6("::", default_port);
-    // Null until `--listen` picks.
     var scope: ?Scope = null;
     var key_path: ?[]const u8 = null;
     var print_host_key = false;
     var install_service = false;
     var uninstall = false;
-    // `--listen` and `--key` as given, for the service.
     var listen_arg: ?[]const u8 = null;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -102,7 +66,6 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     };
 
-    // Before the keys, which it removes.
     if (uninstall) {
         if (install_service or print_host_key or key_path != null) return usage("--uninstall goes with --listen only");
         install.uninstall(gpa, io, init.environ_map, user, listen) catch |err| {
@@ -114,7 +77,6 @@ pub fn main(init: std.process.Init) !u8 {
 
     transport.crypto.init(io);
 
-    // The first run creates the key.
     const path = key_path orelse try paths.state(gpa, init.environ_map, "host_key");
     defer if (key_path == null) gpa.free(path);
     const identity = try keyfile.loadOrCreate(io, path);
@@ -128,14 +90,12 @@ pub fn main(init: std.process.Init) !u8 {
         if (!install_service) return 0;
     }
 
-    // Without `--listen`, the tailnet if Tailscale is up.
     const listen_scope = scope orelse if (server_pkg.addresses.hasTailnet(gpa) catch false) Scope.tailnet else Scope.all;
 
     if (install_service) {
         const arena = init.arena.allocator();
         const exe = try install.exePath(arena, io, init.environ_map, args[0]);
 
-        // The scope as it is now, which the service keeps.
         var service_args: std.ArrayList([]const u8) = .empty;
         const listen_text = listen_arg orelse switch (listen_scope) {
             .tailnet => "tailnet",
@@ -143,7 +103,6 @@ pub fn main(init: std.process.Init) !u8 {
         };
         try service_args.appendSlice(arena, &.{ "--listen", listen_text });
         if (key_path) |p| {
-            // The service may start in another directory.
             const cwd = try std.process.currentPathAlloc(io, arena);
             try service_args.appendSlice(arena, &.{ "--key", try std.fs.path.resolve(arena, &.{ cwd, p }) });
         }
@@ -169,10 +128,6 @@ pub fn main(init: std.process.Init) !u8 {
     const ssh_authorized_keys = try paths.home(gpa, init.environ_map, ".ssh/authorized_keys");
     defer gpa.free(ssh_authorized_keys);
 
-    // Sessions get a small environment, like the one sshd gives: the
-    // allowlist, the locale, and TX_SESSION. Each session adds TERM and
-    // COLORTERM from its client, and the client's LANG and LC_* in place of
-    // txd's.
     var environ: std.process.Environ.Map = .init(gpa);
     defer environ.deinit();
     for (inherited) |name| if (init.environ_map.get(name)) |value| try environ.put(name, value);
@@ -182,23 +137,17 @@ pub fn main(init: std.process.Init) !u8 {
     }
     try environ.put("TX_SESSION", "1");
 
-    // Next to txd's own builds, which `--uninstall` removes.
     const terminfo_dir = try paths.home(gpa, init.environ_map, ".local/share/tx/terminfo");
     defer gpa.free(terminfo_dir);
 
-    // A login shell: argv[0] is the shell's name with a leading "-".
     const shell = init.environ_map.get("SHELL") orelse "/bin/sh";
     const login_name = try std.fmt.allocPrint(gpa, "-{s}", .{std.fs.path.basename(shell)});
     defer gpa.free(login_name);
 
     const runtime_dir = try paths.runtime(gpa, init.environ_map);
     defer gpa.free(runtime_dir);
-    // The clipboard server's, beside the sessions'. Never `wayland-0`, the
-    // name a desktop's compositor takes in the directory above.
     const wayland_socket = try std.fs.path.join(gpa, &.{ runtime_dir, "wayland-1" });
     defer gpa.free(wayland_socket);
-    // On Linux, the binary this process runs even once it has been
-    // replaced, so that the sessions it starts speak its revision.
     const session_exe = if (builtin.os.tag == .linux)
         try gpa.dupe(u8, "/proc/self/exe")
     else
@@ -242,8 +191,6 @@ pub fn main(init: std.process.Init) !u8 {
     return 0;
 }
 
-/// The port of `tailnet` or `tailnet:PORT`, null in it if the port is
-/// invalid. Null for any other text.
 fn parseTailnet(text: []const u8) ?(?u16) {
     if (std.mem.eql(u8, text, "tailnet")) return default_port;
     if (!std.mem.startsWith(u8, text, "tailnet:")) return null;
