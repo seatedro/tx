@@ -31,7 +31,7 @@ pub fn prepare(io: Io, path: []const u8) Error!void {
 }
 
 fn secure(path: [*:0]const u8) Error!bool {
-    // std.c has no Stat on Linux.
+    // std.c.Stat is void on Linux.
     if (builtin.os.tag == .linux) {
         const linux = std.os.linux;
         var st: linux.Statx = undefined;

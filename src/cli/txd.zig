@@ -30,7 +30,7 @@ pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
-    // session/spawn.zig execs session processes with exactly these arguments.
+    // session/spawn.zig execs session processes with these arguments.
     if (args.len == 4 and std.mem.eql(u8, args[1], "--session") and std.mem.eql(u8, args[2], "--fd")) {
         const fd = std.fmt.parseInt(std.posix.fd_t, args[3], 10) catch return usage("invalid fd");
         return session.process.run(gpa, io, fd);

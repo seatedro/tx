@@ -46,9 +46,8 @@ const install_command = "curl -fsSL https://github.com/seatedro/tx/releases/late
 const default_key_files = [_][]const u8{"~/.ssh/id_ed25519"};
 
 pub fn main(init: std.process.Init) !u8 {
-    // Blocks the signals tty.Signals takes with sigwait. Threads started later
-    // inherit the blocked mask. signal_mask is the mask from before, for
-    // Match exec's shell.
+    // Blocks the signals tty.Signals takes with sigwait, before any thread
+    // starts. signal_mask is the mask from before, for Match exec's shell.
     const signal_mask = client.tty.blockSignals();
 
     const gpa = init.gpa;

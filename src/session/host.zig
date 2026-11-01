@@ -222,9 +222,7 @@ pub const Host = struct {
     }
 
     /// Takes the default colors, palette and dark preference of a client's
-    /// Attach, which the Primary uses to answer color queries. client/report.zig
-    /// packs them: colors as 0xRRGGBB, the palette as {index, r, g, b} entries
-    /// for indexes below 16.
+    /// Attach, which the Primary uses to answer color queries.
     pub fn setColors(self: *Host, m: proto.Attach) void {
         const colors = &self.primary.terminal.colors;
         if (m.foreground) |rgb| colors.foreground.default = toRgb(rgb);

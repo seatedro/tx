@@ -642,9 +642,6 @@ const Run = struct {
     fn startSigning(r: *Run) void {
         const conn = r.conn orelse return;
 
-        // The signature binds the login to this connection's TLS exporter
-        // and to the host key the server presented. The server builds the
-        // same transcript with its own key to verify it.
         var transcript: auth.login.Transcript = .{
             .exporter = undefined,
             .host_key = r.racer.presentedKey().?,
@@ -765,9 +762,8 @@ const Run = struct {
                     .background = report.packRgb(r.options.colors.background),
                     .palette = report.paletteBytes(&r.options.colors, &palette_buf),
                     .dark = r.options.colors.dark,
-                    // A session made for a command sends SIGHUP to it when
-                    // this client leaves, or hangup_grace_ms after the
-                    // client is lost.
+                    // The command gets SIGHUP once this client leaves or
+                    // stays lost (Attach.hangup).
                     .hangup = r.options.session_command != null,
                 },
             },
@@ -1209,9 +1205,8 @@ const Run = struct {
         if (m != .clipboard_copy) return error.WrongType;
         const copy = m.clipboard_copy;
 
-        // mimes is NUL-separated, and lens holds an 8-byte big-endian length
-        // for each. The data follow the header back to back. The server
-        // sends at most server/clipboard.zig's max_copy_types (16) types.
+        // The server sends at most server/clipboard.zig's max_copy_types (16)
+        // types.
         var items: [16]clipboard.Item = undefined;
         var count: usize = 0;
         var data = bytes[header_len..];

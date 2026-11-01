@@ -48,9 +48,9 @@ jobs:
           key: zig-pkg-${{ github.job }}-${{ runner.os }}-${{ hashFiles('build.zig.zon') }}
       - if: steps.plan.outputs.version
         run: zig build release -Dversion=${{ steps.plan.outputs.version }}
-      # install.sh finds its tarball and checksum in SHA256SUMS. tx's install
-      # command downloads install.sh from the latest release. A second run on
-      # one day replaces that day's release.
+      # install.sh finds its tarball and checksum in SHA256SUMS. The
+      # install_command tx prints downloads install.sh from the latest release.
+      # A second run on one day replaces that day's release.
       - if: steps.plan.outputs.version
         env:
           VERSION: ${{ steps.plan.outputs.version }}

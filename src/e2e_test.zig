@@ -2039,7 +2039,7 @@ fn fuzzLogin(_: void, in: fuzz.Input) !void {
     if (!rc.closed) rc.conn.?.close(0);
     try rc.waitClosed();
 
-    // The server's endpoint releases the connection's pending slot when it
+    // The server's endpoint gives up the connection's pending place when it
     // frees the connection.
     const deadline = nowMs() + timeout_ms;
     while (@atomicLoad(u32, &st.server.pending.total, .monotonic) > 0) {

@@ -145,7 +145,7 @@ pub const Exec = struct {
     }
 
     /// Sends SIGKILL to the command's process group. The command leads a
-    /// session of its own.
+    /// POSIX session of its own.
     pub fn kill(e: *Exec) void {
         if (e.pipes.pid) |pid| _ = std.c.kill(-pid, .KILL);
     }

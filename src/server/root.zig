@@ -362,7 +362,7 @@ pub const Server = struct {
         stream.reset(0);
     }
 
-    // Bit 1 of a QUIC stream ID marks a unidirectional stream (RFC 9000,
+    // Bit 0x2 of a QUIC stream ID marks a unidirectional stream (RFC 9000
     // section 2.1).
     fn isUni(stream: *const Stream) bool {
         return stream.id & 0x2 != 0;
@@ -426,7 +426,7 @@ pub const Server = struct {
         client.fail(.auth, "login timed out");
     }
 
-    // A login that names no user is for txd's own account.
+    // A login that names no user is for the account txd runs as.
     fn accepts(self: *Server, user: []const u8, key_blob: []const u8) bool {
         if (user.len > 0 and !std.mem.eql(u8, user, self.options.user)) return false;
 
@@ -680,9 +680,7 @@ const Client = struct {
     }
 
     // left is true when the client closed the connection itself. The session
-    // then gets Detach, and one started with hangup sends its program SIGHUP
-    // at once. A hangup session waits hangup_grace_ms for a lost client to
-    // come back.
+    // then gets Detach.
     fn destroy(client: *Client, left: bool) void {
         const gpa = client.server.gpa;
         if (client.upstream) |u| {
@@ -728,7 +726,6 @@ const Client = struct {
             .exec => |m| client.onExec(m),
             .input, .resize => if (client.upstream) |u| {
                 u.send(message);
-                // The client that typed last provides the clipboard.
                 if (has_clipboard and message == .input) if (client.server.clipboard) |cb| cb.input(&client.peer);
             },
             .clipboard_offer => |m| client.onClipboardOffer(m),
@@ -763,9 +760,8 @@ const Client = struct {
         fromPeer(peer).send(.{ .clipboard_request = m });
     }
 
-    // Sends a program's copy on a uni stream of its own. The stream carries a
-    // ClipboardCopy frame, with the types NUL-separated and each one's length
-    // as a big-endian u64, then the data of every type back to back.
+    // Sends a program's copy on a uni stream of its own, a ClipboardCopy frame
+    // and then the data.
     fn sendClipboardCopy(peer: *clipboard.Peer, mimes: []const []const u8, data: []const *wayland.pipe.Blob) void {
         const client = fromPeer(peer);
         const gpa = client.server.gpa;
@@ -875,8 +871,6 @@ const Client = struct {
         const key = auth.ssh.PublicKey.parse(m.key) catch unreachable;
         const fingerprint = auth.Fingerprint.ofBlob(key.blob());
 
-        // The client signed the same transcript, with the host key it was shown.
-        // The exporter ties the signature to this connection.
         var transcript: auth.login.Transcript = .{
             .exporter = undefined,
             .host_key = server.options.identity.public_key.toBytes(),
@@ -1001,8 +995,8 @@ const Client = struct {
         client.sendConnect(null, .{ .attach = .{} });
     }
 
-    // A resume is a login. The session process checks the proof against this
-    // connection's exporter, and its Attached completes the login.
+    // The session process checks the proof against this connection's
+    // exporter.
     fn onResume(client: *Client, m: proto.Resume) void {
         if (!client.startLoginAttempt()) return;
         if (client.upstream != null) return client.fail(.protocol, "second attach");

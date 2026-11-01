@@ -299,7 +299,7 @@ pub const ErrorCode = enum(u32) {
     revision = 2,
     /// The session doesn't exist or has ended.
     no_session = 3,
-    /// The session's log no longer holds the output the client needs next.
+    /// The session's log has dropped the output the client needs next.
     log_trimmed = 4,
     /// A session or command didn't start.
     spawn = 5,
@@ -421,10 +421,10 @@ pub const AuthOk = struct {
     }
 };
 
-/// Terminal output that redraws the session's screen. A long redraw comes in
-/// several Rebuild messages.
+/// Terminal output that rebuilds the session's screen (term.rebuild). A long
+/// rebuild comes in several Rebuild messages.
 pub const Rebuild = struct {
-    /// The seq of the Output that follows the redraw.
+    /// The seq of the Output that follows the rebuild.
     seq: u64,
     bytes: []const u8,
 
@@ -448,7 +448,7 @@ pub const Rebuild = struct {
 /// The session checks proof, and its Attached completes the login.
 pub const Resume = struct {
     session_id: u64,
-    /// The seq of the next Output the client needs. Null asks for a redraw.
+    /// The seq of the next Output the client needs. Null asks for a Rebuild.
     next_seq: ?u64 = null,
     /// auth.resume_.proof from Attached.resume_key, this connection's resume
     /// exporter secret and session_id.
@@ -695,8 +695,9 @@ pub const ClipboardCopy = struct {
 /// Connect carry it, and a session process refuses a txd with another.
 pub const internal_revision: u32 = 0;
 
-/// The first message on a connection that txd opens to a session's socket for
-/// a client. Attach or Resume follows.
+/// Opens a client's connection to a session process. It is the first message
+/// on a connection to the session's socket, and follows Start on a new
+/// session's inherited socket. Attach or Resume follows.
 pub const Connect = struct {
     /// The client's address.
     remote: []const u8,
