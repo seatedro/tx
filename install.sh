@@ -1,16 +1,7 @@
 #!/bin/sh
-# Installs tx and txd from a release of seatedro/tx:
-#
-#     curl -fsSL https://github.com/seatedro/tx/releases/latest/download/install.sh | sh
-#
-# With --txd, it then runs `txd --install`, which keeps txd running for
-# this user as a service, so tx can connect to this machine. A txd that
-# was already running restarts with the new build; its sessions keep
-# running.
-#
-# TX_VERSION picks a release, such as 0.0.0-nightly.20261031, instead of
-# the latest. TX_INSTALL_DIR is where tx and txd go, ~/.local/bin unless
-# it's set.
+# Installs tx and txd from a release of seatedro/tx into TX_INSTALL_DIR,
+# ~/.local/bin by default. TX_VERSION picks the release; the default is the
+# latest. --txd also runs `txd --install`, and restarts txd if it was running.
 set -eu
 
 releases=https://github.com/seatedro/tx/releases
@@ -29,8 +20,6 @@ main() {
     tmp=$(mktemp -d)
     trap 'rm -rf "$tmp"' EXIT
 
-    # SHA256SUMS names each platform's tarball, and the version is in the
-    # name.
     if [ -n "${TX_VERSION:-}" ]; then
         fetch "$releases/download/v$TX_VERSION/SHA256SUMS" "$tmp/SHA256SUMS"
     else
@@ -39,6 +28,8 @@ main() {
     suffix="-$platform.tar.gz"
     name=$(awk -v suffix="$suffix" 'substr($2, length($2) - length(suffix) + 1) == suffix { print $2 }' "$tmp/SHA256SUMS")
     [ -n "$name" ] || fail "the release has no build for $platform"
+    # The version comes from the asset's name. It names the tarball's top
+    # directory and keeps the download on the release SHA256SUMS came from.
     version=${name#tx-}
     version=${version%"$suffix"}
 
@@ -48,19 +39,20 @@ main() {
     [ "$got" = "$want" ] || fail "$name doesn't have the SHA-256 that SHA256SUMS gives"
     tar -xzf "$tmp/$name" -C "$tmp"
 
-    # Renamed into place: a running txd keeps its own file, and copying
-    # over a running binary fails on Linux.
     mkdir -p "$dir"
     for binary in tx txd; do
+        # cp onto a running txd fails on Linux (ETXTBSY). A rename replaces
+        # it and leaves the running process its old file.
         cp "$tmp/tx-$version-$platform/$binary" "$dir/.$binary.new"
         mv -f "$dir/.$binary.new" "$dir/$binary"
     done
     echo "installed tx and txd $version in $dir"
 
     if [ "$txd" = yes ]; then
+        # txd --install leaves a running server alone. One that was running
+        # before is restarted to run the new binary.
         running=$(service_running)
         "$dir/txd" --install
-        # `txd --install` leaves a running server alone.
         if [ "$running" = yes ]; then restart_service; fi
     fi
 
@@ -70,7 +62,6 @@ main() {
     esac
 }
 
-# The platform's name in release tarballs.
 platform() {
     case $(uname -s) in
     Linux) os=linux ;;
@@ -105,8 +96,8 @@ sha256() {
     fi
 }
 
-# The service `txd --install` sets up: the systemd user unit, or the
-# LaunchAgent, both named txd.
+# txd --install loads its launchd job into gui/UID when that domain exists,
+# else user/UID.
 launchd_target() {
     uid=$(id -u)
     if launchctl print "gui/$uid" >/dev/null 2>&1; then echo "gui/$uid/txd"; else echo "user/$uid/txd"; fi

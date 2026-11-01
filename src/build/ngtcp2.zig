@@ -1,7 +1,7 @@
-//! Builds ngtcp2 (QUIC) from its upstream sources, replacing the CMake
-//! configure step with Zig config headers.
 const std = @import("std");
 
+// The ngtcp2 release build.zig.zon pins, for ngtcp2/version.h. version_num has
+// one byte each for major, minor and patch.
 const version = "1.25.0";
 const version_num = 0x011900;
 
@@ -37,16 +37,12 @@ pub fn core(
 }
 
 pub const CryptoOptions = struct {
-    /// picotls's public headers.
     picotls_include: std.Build.LazyPath,
-    /// Directory containing tx's `picotls/openssl.h`, which maps the OpenSSL
-    /// backend names used by ngtcp2's picotls adapter onto tx's backend.
-    /// Searched before `picotls_include`.
+    /// Holds a picotls/openssl.h that shadows picotls's own, which needs
+    /// OpenSSL. ngtcp2's picotls glue takes its ciphers from that header.
     backend_include: std.Build.LazyPath,
 };
 
-/// ngtcp2's picotls adapter (`crypto/picotls/picotls.c`) and the crypto
-/// helpers it shares with the other adapters.
 pub fn cryptoPicotls(
     b: *std.Build,
     dep: *std.Build.Dependency,
@@ -63,6 +59,8 @@ pub fn cryptoPicotls(
         }),
     });
     const mod = lib.root_module;
+    // Searched before picotls_include, so <picotls/openssl.h> resolves to the
+    // backend's header.
     mod.addIncludePath(options.backend_include);
     mod.addIncludePath(options.picotls_include);
     mod.addConfigHeader(configHeader(b, target));
@@ -82,9 +80,10 @@ pub fn cryptoPicotls(
     return lib;
 }
 
-/// Replaces CMake's `config.h`.
 fn configHeader(b: *std.Build, target: std.Build.ResolvedTarget) *std.Build.Step.ConfigHeader {
     const options: std.Build.Step.ConfigHeader.Options = .{ .style = .blank, .include_path = "config.h" };
+    // macOS has no <endian.h>, <byteswap.h>, be64toh or explicit_bzero.
+    // ngtcp2 swaps bytes with OSSwapInt64 there and clears memory with memset_s.
     if (target.result.os.tag.isDarwin()) return b.addConfigHeader(options, .{
         .HAVE_ARPA_INET_H = 1,
         .HAVE_NETINET_IN_H = 1,

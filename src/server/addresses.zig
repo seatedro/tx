@@ -1,16 +1,3 @@
-//! The addresses a server listens on when told to listen on a wildcard
-//! address.
-//!
-//! A UDP socket bound to a wildcard address sends each reply from the
-//! address the kernel's routing picks, which need not be the address the
-//! client sent to. A QUIC client drops packets from an address it didn't
-//! send to, so the server binds a socket to each address instead.
-//!
-//! With `Scope.tailnet`, only Tailscale's interface's addresses and
-//! loopback addresses count, so that only the tailnet's members and this
-//! machine reach the server. Tailscale's interface is `tailscale0` on
-//! Linux. On macOS it is a `utun`, told apart from other tunnels by its
-//! address in Tailscale's IPv6 range, fd7a:115c:a1e0::/48.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -18,7 +5,8 @@ const IpAddress = Io.net.IpAddress;
 const PosixAddress = Io.Threaded.PosixAddress;
 const c = std.c;
 
-/// `struct ifaddrs`. Linux and macOS lay it out the same way.
+// struct ifaddrs from <ifaddrs.h>, which std.c doesn't declare. Linux and
+// macOS lay it out the same way.
 const Ifaddrs = extern struct {
     next: ?*Ifaddrs,
     name: [*:0]const u8,
@@ -32,10 +20,9 @@ const Ifaddrs = extern struct {
 extern "c" fn getifaddrs(ifap: *?*Ifaddrs) c_int;
 extern "c" fn freeifaddrs(ifa: ?*Ifaddrs) void;
 
-/// IFF_UP on Linux and macOS.
+// IFF_UP from <net/if.h>.
 const iff_up = 0x1;
 
-/// Whether `address` is 0.0.0.0 or `::`.
 pub fn isWildcard(address: IpAddress) bool {
     return switch (address) {
         .ip4 => |a| std.mem.allEqual(u8, &a.bytes, 0),
@@ -43,8 +30,7 @@ pub fn isWildcard(address: IpAddress) bool {
     };
 }
 
-/// The addresses a wildcard covers: 0.0.0.0 covers IPv4, and `::` covers
-/// IPv4 and IPv6, as a dual-stack socket would.
+/// A listen on :: covers IPv4 addresses too. One on 0.0.0.0 covers IPv4 only.
 pub fn covers(wildcard: IpAddress, address: IpAddress) bool {
     return wildcard == .ip6 or address == .ip4;
 }
@@ -56,23 +42,16 @@ pub fn eql(a: IpAddress, b: IpAddress) bool {
     };
 }
 
-/// Which of the interfaces' addresses a wildcard covers.
 pub const Scope = enum {
     all,
-    /// Tailscale's interface's, and loopback.
     tailnet,
 };
 
-/// An address of an interface that is up.
 const Entry = struct {
     interface: []const u8,
     address: IpAddress,
 };
 
-/// The addresses of the interfaces that are up, in `scope`, that
-/// `wildcard` covers, with `wildcard`'s port. IPv6 link-local addresses
-/// are left out: binding one needs its interface, and clients reach a host
-/// by other addresses.
 pub fn interfaces(gpa: Allocator, wildcard: IpAddress, scope: Scope) ![]IpAddress {
     var list: ?*Ifaddrs = null;
     if (getifaddrs(&list) != 0) return error.GetIfaddrsFailed;
@@ -83,7 +62,6 @@ pub fn interfaces(gpa: Allocator, wildcard: IpAddress, scope: Scope) ![]IpAddres
     return select(gpa, entries, wildcard, scope);
 }
 
-/// Whether Tailscale's interface is up.
 pub fn hasTailnet(gpa: Allocator) !bool {
     var list: ?*Ifaddrs = null;
     if (getifaddrs(&list) != 0) return error.GetIfaddrsFailed;
@@ -95,7 +73,7 @@ pub fn hasTailnet(gpa: Allocator) !bool {
     return false;
 }
 
-/// The entries of `list`. They point into it.
+// Each Entry's interface name points into list.
 fn upAddresses(gpa: Allocator, list: ?*Ifaddrs) ![]Entry {
     var out: std.ArrayList(Entry) = .empty;
     errdefer out.deinit(gpa);
@@ -128,7 +106,8 @@ fn select(gpa: Allocator, entries: []const Entry, wildcard: IpAddress, scope: Sc
     return out.toOwnedSlice(gpa);
 }
 
-/// Whether `interface` is Tailscale's.
+// Tailscale's interface is tailscale0 on Linux. On macOS it is a utun
+// interface, told apart from other tunnels by its Tailscale IPv6 address.
 fn isTailnet(entries: []const Entry, interface: []const u8) bool {
     if (std.mem.startsWith(u8, interface, "tailscale")) return true;
     for (entries) |e| {
@@ -137,7 +116,8 @@ fn isTailnet(entries: []const Entry, interface: []const u8) bool {
     return false;
 }
 
-/// fd7a:115c:a1e0::/48.
+// Tailscale's IPv6 range, fd7a:115c:a1e0::/48. isTailnetAddress in
+// src/cli/tailscale.zig repeats the prefix.
 fn inTailscaleIp6(address: IpAddress) bool {
     return switch (address) {
         .ip4 => false,
@@ -145,16 +125,15 @@ fn inTailscaleIp6(address: IpAddress) bool {
     };
 }
 
-/// The loopback addresses the machine's host name resolves to, with
-/// `wildcard`'s port. Debian maps the host name to 127.0.1.1 and NixOS to
-/// 127.0.0.2. Those reach the machine through the 127.0.0.0/8 route
-/// without being an interface's address.
+/// The loopback addresses the host's own name resolves to that wildcard
+/// covers, such as the 127.0.1.1 of Debian's /etc/hosts. getifaddrs gives
+/// lo the address 127.0.0.1. Empty when the name doesn't resolve. The caller
+/// frees the slice.
 pub fn hostLoopback(gpa: Allocator, io: Io, wildcard: IpAddress) ![]IpAddress {
     var name_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
     const name = std.posix.gethostname(&name_buf) catch return &.{};
     const host: Io.net.HostName = Io.net.HostName.init(name) catch return &.{};
 
-    // With room for 16 results, the lookup doesn't block on the queue.
     var buf: [16]Io.net.HostName.LookupResult = undefined;
     var results: Io.Queue(Io.net.HostName.LookupResult) = .init(&buf);
     host.lookup(io, &results, .{ .port = wildcard.getPort() }) catch return &.{};
@@ -176,7 +155,7 @@ fn appendNew(gpa: Allocator, list: *std.ArrayList(IpAddress), address: IpAddress
     try list.append(gpa, address);
 }
 
-/// fe80::/10.
+// fe80::/10.
 fn isLinkLocal(address: IpAddress) bool {
     return switch (address) {
         .ip4 => false,
@@ -184,7 +163,6 @@ fn isLinkLocal(address: IpAddress) bool {
     };
 }
 
-/// 127.0.0.0/8 or ::1.
 fn isLoopback(address: IpAddress) bool {
     return switch (address) {
         .ip4 => |a| a.bytes[0] == 127,
@@ -225,12 +203,9 @@ test "a tailnet scope keeps Tailscale's interface and loopback" {
         .{ .interface = "lo", .address = try ip6("::1", 0) },
         .{ .interface = "eth0", .address = try ip4("16.145.9.171", 0) },
         .{ .interface = "eth0", .address = try ip6("2600:1f14::1", 0) },
-        // Linux, named.
         .{ .interface = "tailscale0", .address = try ip4("100.101.102.103", 0) },
-        // macOS, by its IPv6 address.
         .{ .interface = "utun3", .address = try ip4("100.90.1.2", 0) },
         .{ .interface = "utun3", .address = try ip6("fd7a:115c:a1e0::1", 0) },
-        // Another tunnel in the same IPv4 range isn't Tailscale's.
         .{ .interface = "utun4", .address = try ip4("100.70.0.1", 0) },
     };
     const any: IpAddress = try ip6("::", 8739);

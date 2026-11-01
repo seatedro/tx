@@ -14,23 +14,16 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      # The Zig version is build.zig.zon's minimum_zig_version.
       - uses: mlugg/setup-zig@v2
-      # The packages build.zig.zon names, which zig fetches into zig-pkg.
-      # A fetch from a runner fails now and then.
       - uses: actions/cache@v4
         with:
           path: zig-pkg
           key: zig-pkg-${{ github.job }}-${{ runner.os }}-${{ hashFiles('build.zig.zon') }}
-      # wl-copy and wl-paste, which the clipboard server's tests run.
-      # Ubuntu's are older than nixpkgs', which the tests also cover.
       - if: runner.os == 'Linux'
         run: sudo apt-get install -y --no-install-recommends wl-clipboard
       - run: zig fmt --check src build.zig
       - run: zig build test --summary all
 
-  # The flake's package. Its hash of the Zig packages has to change when
-  # build.zig.zon's dependencies do.
   nix:
     runs-on: ubuntu-latest
     steps:
@@ -43,8 +36,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
-      # The packages build.zig.zon names, which zig fetches into zig-pkg.
-      # A fetch from a runner fails now and then.
       - uses: actions/cache@v4
         with:
           path: zig-pkg

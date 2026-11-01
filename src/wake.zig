@@ -1,9 +1,7 @@
-//! Uses libc only; supports Linux (glibc and musl) and macOS.
 const std = @import("std");
 const posix = std.posix;
 const c = std.c;
 
-/// A non-blocking, close-on-exec pipe that wakes a thread from poll.
 pub const Wake = struct {
     read_fd: posix.fd_t,
     write_fd: posix.fd_t,
@@ -11,8 +9,6 @@ pub const Wake = struct {
     pub fn init() error{ ProcessFdQuotaExceeded, SystemFdQuotaExceeded, Unexpected }!Wake {
         var fds: [2]posix.fd_t = undefined;
 
-        // Non-blocking: `notify` can't block on a full pipe, and `drain`
-        // stops when it's empty.
         const rc = if (@TypeOf(c.pipe2) != void)
             c.pipe2(&fds, .{ .CLOEXEC = true, .NONBLOCK = true })
         else
@@ -23,7 +19,7 @@ pub const Wake = struct {
             else => |err| posix.unexpectedErrno(err),
         };
 
-        // macOS has no pipe2.
+        // Without pipe2 (macOS), the flags are set after the pipe exists.
         if (@TypeOf(c.pipe2) == void) {
             const nonblock: c_int = @bitCast(posix.O{ .NONBLOCK = true });
             for (fds) |fd| {
@@ -47,17 +43,16 @@ pub const Wake = struct {
         wake.* = undefined;
     }
 
-    /// A full pipe already wakes the reader, so EAGAIN is ignored.
+    /// Makes read_fd readable. A full pipe drops the byte, and read_fd is
+    /// readable already.
     pub fn notify(wake: *Wake) void {
         const byte = [1]u8{0};
         while (posix.errno(c.write(wake.write_fd, &byte, 1)) == .INTR) {}
     }
 
-    /// Empties the pipe. The next poll then waits for the next `notify`.
     pub fn drain(wake: *Wake) void {
         var buf: [64]u8 = undefined;
 
-        // A short read means the pipe is empty. EAGAIN ends it too.
         while (true) {
             const rc = c.read(wake.read_fd, &buf, buf.len);
             switch (posix.errno(rc)) {
@@ -70,7 +65,5 @@ pub const Wake = struct {
 };
 
 fn closeFd(fd: posix.fd_t) void {
-    // Don't retry on EINTR: the fd may already be closed and reused by
-    // another thread.
     _ = c.close(fd);
 }

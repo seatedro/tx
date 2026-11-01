@@ -1,20 +1,3 @@
-//! The clipboard server's protocol state, with no I/O.
-//!
-//! Each program's connection gets its bytes through `Connection.receive`
-//! and its file descriptors through `Connection.fds`, and answers go to
-//! `Connection.out`. The server offers:
-//!
-//! - one `wl_seat`, with no capabilities, which data control works through;
-//! - data control, as both `zwlr_data_control_manager_v1` and
-//!   `ext_data_control_manager_v1`, for the clipboard and the primary
-//!   selection;
-//! - a `wl_compositor` that ignores its surfaces, and one `wl_output`.
-//!   Chromium waits until a compositor and a ready output exist before it
-//!   looks for what it needs to draw. With them, it finds no `wl_shm` and
-//!   no shell, and fails as it does on a server with no display.
-//!
-//! The clipboard holds the user's clipboard, which `Backend` reads, or a
-//! program's data source. The primary selection is only ever a program's.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const c = std.c;
@@ -28,30 +11,30 @@ const Protocol = data_control.Protocol;
 
 const log = std.log.scoped(.wayland);
 
+/// The user holds only .clipboard. A program can hold either.
 pub const Selection = enum { clipboard, primary };
 
-/// What the server needs from the rest of txd.
+/// The user's side of the clipboard. The Server calls it while it handles a
+/// request or a disconnect.
 pub const Backend = struct {
     context: ?*anyopaque = null,
-    /// A program asked for the user's clipboard as `mime`. Takes `fd`, the
-    /// pipe to write the data to; closing it ends the data.
+    /// A program reads the user's clipboard as mime. The callee owns fd, and
+    /// writes the data to it and closes it. mime is borrowed for the call.
     fetch: *const fn (context: ?*anyopaque, mime: []const u8, fd: fd_t) void,
-    /// A program set `selection` to its own data, offered as `mimes`, or
-    /// cleared it (null). `mimes` is valid until the callback returns.
+    /// A program set selection to a source with these types, or the selection
+    /// was cleared (null) by a program or by its source going away. mimes are
+    /// borrowed for the call.
     copied: *const fn (context: ?*anyopaque, selection: Selection, mimes: ?[]const []const u8) void,
 };
 
-/// The most MIME types a selection offers. Programs offer a handful.
 pub const max_mimes = 64;
-/// The longest MIME type. Longer ones are left out of an offer.
 pub const max_mime_len = 255;
-/// The most objects a connection may hold.
 const max_objects = 16 * 1024;
-/// The most file descriptors a connection may send ahead of the requests
-/// that take them.
+/// Received descriptors a connection holds before requests take them.
+/// socket.zig closes a program that sends more.
 pub const max_pending_fds = 64;
 
-/// The globals, in the order of their registry names, from 1.
+// A global's registry name is its index plus one. bind switches on the name.
 const globals = [_]struct { name: []const u8, version: u32 }{
     .{ .name = protocol.seat.name, .version = 7 },
     .{ .name = protocol.compositor.name, .version = 6 },
@@ -62,15 +45,12 @@ const globals = [_]struct { name: []const u8, version: u32 }{
 
 const seat_name = "seat0";
 
-/// What a selection holds.
 const Owner = union(enum) {
     none,
-    /// The user's clipboard. Only the clipboard holds it.
     user: Mimes,
     source: *Source,
 };
 
-/// Owned MIME types.
 const Mimes = std.ArrayList([]u8);
 
 fn freeMimes(gpa: Allocator, mimes: *Mimes) void {
@@ -83,24 +63,23 @@ pub const Server = struct {
     backend: Backend,
     connections: std.ArrayList(*Connection) = .empty,
     selections: std.EnumArray(Selection, Owner) = .initFill(.none),
-    /// Counts each selection's changes. An offer stays valid until its
-    /// selection's generation moves on.
+    /// Counts the changes to each selection. An offer can be read only while
+    /// its generation is current.
     generations: std.EnumArray(Selection, u64) = .initFill(0),
 
     pub fn init(gpa: Allocator, backend: Backend) Server {
         return .{ .gpa = gpa, .backend = backend };
     }
 
-    /// Closes every connection, without calling the backend.
     pub fn deinit(s: *Server) void {
         if (s.selections.getPtr(.clipboard).* == .user) freeMimes(s.gpa, &s.selections.getPtr(.clipboard).user);
+        // With no owners, the disconnects below report no changes.
         s.selections = .initFill(.none);
         while (s.connections.items.len > 0) s.disconnect(s.connections.items[s.connections.items.len - 1]);
         s.connections.deinit(s.gpa);
         s.* = undefined;
     }
 
-    /// A program connected.
     pub fn connect(s: *Server) Allocator.Error!*Connection {
         const conn = try s.gpa.create(Connection);
         errdefer s.gpa.destroy(conn);
@@ -111,10 +90,11 @@ pub const Server = struct {
         return conn;
     }
 
-    /// A program's connection closed, or is being closed. Its data sources
-    /// leave the selections they held, and its file descriptors close.
+    /// Frees conn and closes the descriptors it holds. A selection held by one
+    /// of its sources is cleared and reported to Backend.copied.
     pub fn disconnect(s: *Server, conn: *Connection) void {
         const index = std.mem.indexOfScalar(*Connection, s.connections.items, conn).?;
+        // Removed first, so the selection changes below skip conn.
         _ = s.connections.swapRemove(index);
 
         var it = conn.objects.valueIterator();
@@ -135,9 +115,9 @@ pub const Server = struct {
         s.gpa.destroy(conn);
     }
 
-    /// Sets the clipboard to the user's, offered as `mimes`, or clears it
-    /// (null). A program's source that held it is cancelled. MIME types
-    /// that are too long or have a NUL are left out.
+    /// Gives the clipboard to the user with these types, or to no one when
+    /// mimes is null, and cancels a source that held it. A type with a NUL is
+    /// skipped.
     pub fn setClipboard(s: *Server, mimes: ?[]const []const u8) Allocator.Error!void {
         var owned: Mimes = .empty;
         errdefer freeMimes(s.gpa, &owned);
@@ -149,15 +129,13 @@ pub const Server = struct {
         s.set(.clipboard, if (mimes != null) .{ .user = owned } else .none);
     }
 
-    /// Asks the program whose source holds `selection` to write it as
-    /// `mime` to `fd`. Takes `fd`. False, with `fd` closed, if no program's
-    /// source holds the selection or it doesn't offer `mime`.
+    /// Asks the program whose source holds selection to write mime to fd.
+    /// Takes fd. Returns false, with fd closed, when no source holds the
+    /// selection with that type or the source's connection has failed.
     pub fn read(s: *Server, selection: Selection, mime: []const u8, fd: fd_t) bool {
         switch (s.selections.get(selection)) {
             .source => |source| if (source.offers(mime) and !source.conn.failed) {
                 source.conn.send(source.id, @backingInt(data_control.source.Event.send), &.{ .{ .string = mime }, .{ .fd = fd } });
-                // Out of memory fails the connection, and the event, with
-                // its descriptor, isn't queued.
                 if (!source.conn.failed) return true;
             },
             else => {},
@@ -166,7 +144,6 @@ pub const Server = struct {
         return false;
     }
 
-    /// Replaces what `selection` holds, and cancels a source it replaces.
     fn set(s: *Server, selection: Selection, owner: Owner) void {
         switch (s.selections.get(selection)) {
             .none => {},
@@ -181,7 +158,6 @@ pub const Server = struct {
         s.changed(selection, owner);
     }
 
-    /// Stores what `selection` holds now, and tells every data device.
     fn changed(s: *Server, selection: Selection, owner: Owner) void {
         s.selections.set(selection, owner);
         s.generations.getPtr(selection).* += 1;
@@ -190,7 +166,6 @@ pub const Server = struct {
         }
     }
 
-    /// Tells the backend what a program set `selection` to.
     fn copied(s: *Server, selection: Selection) void {
         switch (s.selections.get(selection)) {
             .none => s.backend.copied(s.backend.context, selection, null),
@@ -202,8 +177,6 @@ pub const Server = struct {
         }
     }
 
-    /// A source is going away: it stops holding any selection, without
-    /// being told.
     fn dropSource(s: *Server, source: *Source) void {
         for ([_]Selection{ .clipboard, .primary }) |selection| {
             const owner = s.selections.get(selection);
@@ -214,9 +187,7 @@ pub const Server = struct {
         }
     }
 
-    /// `receive` on an offer.
     fn receive(s: *Server, offer: Offer, mime: []const u8, fd: fd_t) void {
-        // An offer of what the selection held before gets no data.
         if (offer.generation != s.generations.get(offer.selection)) return close(fd);
         switch (s.selections.get(offer.selection)) {
             .none => close(fd),
@@ -229,13 +200,12 @@ pub const Server = struct {
     }
 };
 
-/// A program's data source.
 const Source = struct {
     conn: *Connection,
     id: u32,
     mimes: Mimes = .empty,
-    /// A selection has been set to it. It can't be set again, and offers
-    /// no more types.
+    // Set by set_selection or set_primary_selection. A used source takes no
+    // more types and can't be set again.
     used: bool = false,
 
     fn offers(source: *const Source, mime: []const u8) bool {
@@ -262,7 +232,6 @@ const Object = struct {
     },
 };
 
-/// An offer of what a selection held when the offer was made.
 const Offer = struct {
     selection: Selection,
     generation: u64,
@@ -271,22 +240,17 @@ const Offer = struct {
 pub const Connection = struct {
     server: *Server,
     objects: std.AutoHashMapUnmanaged(u32, Object) = .empty,
-    /// The IDs of the connection's data devices, in the order they were
-    /// made.
     devices: std.ArrayList(u32) = .empty,
-    /// Received descriptors that no request has taken yet. The caller adds
-    /// to the back; at most `max_pending_fds`.
     fds: std.Deque(fd_t) = .empty,
-    /// Events to send. Its descriptors close once they are sent.
+    /// Events to send. The sender closes the descriptors it sends.
     out: wire.Outbox = .{},
-    /// The next ID for an object the server makes.
     next_server_id: u32 = protocol.server_id_start,
-    /// A protocol error was sent, and the connection takes no more
-    /// requests. It closes once `out` is sent.
+    /// Set after a protocol error, or when an event couldn't be queued. No
+    /// more requests are handled and no more events are queued.
     failed: bool = false,
 
-    /// Handles the complete requests at the start of `bytes`, and returns
-    /// the bytes they took. The rest is the start of a request.
+    /// Handles each complete request in bytes and returns the bytes used. The
+    /// rest must be passed again, with the bytes that follow it.
     pub fn receive(conn: *Connection, bytes: []const u8) usize {
         var used: usize = 0;
         while (!conn.failed) {
@@ -304,7 +268,6 @@ pub const Connection = struct {
     }
 
     const Error = Allocator.Error || error{
-        /// The error is sent, and the connection has failed.
         ProtocolError,
     };
 
@@ -328,6 +291,7 @@ pub const Connection = struct {
         switch (object.kind) {
             .display => switch (try request(display.Request, opcode)) {
                 .sync => {
+                    // done destroys the callback, so it is never stored.
                     const callback = try conn.newId(r);
                     try r.end();
                     conn.send(callback, @backingInt(protocol.callback.Event.done), &.{.{ .uint = 0 }});
@@ -351,7 +315,6 @@ pub const Connection = struct {
                 .bind => try conn.bind(id, r),
             },
 
-            // wl_callback has no requests.
             .callback => return error.UnknownOpcode,
 
             .seat => switch (try request(protocol.seat.Request, opcode)) {
@@ -374,11 +337,13 @@ pub const Connection = struct {
                     try r.end();
                     try conn.add(region, .{ .version = object.version, .kind = .region });
                 },
+                // From version 7, above the one offered.
                 .release => return error.UnknownOpcode,
             },
 
-            // A surface is never shown. Its requests are ignored, except
-            // that the callbacks it makes are kept, and never called.
+            // Surfaces are never shown, and frame callbacks never receive done.
+            // get_release is from version 7, above the one offered. The other
+            // requests are ignored.
             .surface => switch (try request(protocol.surface.Request, opcode)) {
                 .destroy => conn.destroy(id),
                 .frame => {
@@ -415,11 +380,12 @@ pub const Connection = struct {
                     const new = try conn.newId(r);
                     _ = try r.object();
                     try r.end();
+                    // Reserved before add, so a device object is never missing
+                    // from devices.
                     try conn.devices.ensureUnusedCapacity(conn.server.gpa, 1);
                     try conn.add(new, .{ .version = object.version, .kind = .{ .device = p } });
                     conn.devices.appendAssumeCapacity(new);
 
-                    // The device starts with what the selections hold.
                     conn.sendSelection(new, .clipboard);
                     conn.sendSelection(new, .primary);
                 },
@@ -475,8 +441,6 @@ pub const Connection = struct {
         }
     }
 
-    /// `wl_registry.bind`: a global's name, its interface's name, the
-    /// version, and the new object's ID.
     fn bind(conn: *Connection, registry: u32, r: *wire.Reader) HandleError!void {
         const name = try r.uint();
         const interface = (try r.string()) orelse return error.BadString;
@@ -508,7 +472,6 @@ pub const Connection = struct {
         }
     }
 
-    /// An output of one pixel, which no surface is ever shown on.
     fn sendOutput(conn: *Connection, id: u32, version: u32) void {
         const Event = protocol.output.Event;
         conn.send(id, @backingInt(Event.geometry), &.{
@@ -517,6 +480,7 @@ pub const Connection = struct {
             .{ .int = 0 },              .{ .string = "tx" },
             .{ .string = "clipboard" }, .{ .int = 0 },
         });
+        // A 1x1 mode at 60 Hz. The refresh rate is in mHz.
         const mode = protocol.output.Mode.current | protocol.output.Mode.preferred;
         conn.send(id, @backingInt(Event.mode), &.{ .{ .uint = mode }, .{ .int = 1 }, .{ .int = 1 }, .{ .int = 60_000 } });
         if (version >= 2) conn.send(id, @backingInt(Event.scale), &.{.{ .int = 1 }});
@@ -527,7 +491,6 @@ pub const Connection = struct {
         if (version >= 2) conn.send(id, @backingInt(Event.done), &.{});
     }
 
-    /// `set_selection` or `set_primary_selection` on a device.
     fn setSelection(conn: *Connection, device: u32, r: *wire.Reader, selection: Selection) HandleError!void {
         const source_id = try r.object();
         try r.end();
@@ -545,7 +508,6 @@ pub const Connection = struct {
         s.copied(selection);
     }
 
-    /// Tells data device `id` what `selection` holds, with a new offer.
     fn sendSelection(conn: *Connection, id: u32, selection: Selection) void {
         if (conn.failed) return;
         const p = conn.objects.get(id).?.kind.device;
@@ -572,7 +534,6 @@ pub const Connection = struct {
         conn.send(id, @backingInt(event), &.{.{ .uint = offer }});
     }
 
-    /// A new_id argument: a free ID in the program's range.
     fn newId(conn: *Connection, r: *wire.Reader) HandleError!u32 {
         const id = try r.uint();
         if (id == 0 or id >= protocol.server_id_start or conn.objects.contains(id))
@@ -585,7 +546,6 @@ pub const Connection = struct {
         try conn.objects.put(conn.server.gpa, id, object);
     }
 
-    /// A destructor request: the object goes, and its ID is free again.
     fn destroy(conn: *Connection, id: u32) void {
         const object = conn.objects.fetchRemove(id).?.value;
         switch (object.kind) {
@@ -600,8 +560,8 @@ pub const Connection = struct {
             },
             else => {},
         }
-        // A program reuses an ID it made only after the server says it's
-        // done with it. The server's own IDs aren't the program's to reuse.
+        // delete_id is for ids the program allocated. libwayland frees the
+        // server's ids without it.
         if (id < protocol.server_id_start) conn.deleted(id);
     }
 
@@ -609,18 +569,16 @@ pub const Connection = struct {
         conn.send(display.id, @backingInt(display.Event.delete_id), &.{.{ .uint = id }});
     }
 
-    /// Queues an event. Out of memory fails the connection.
     fn send(conn: *Connection, object: u32, opcode: u16, args: []const wire.Arg) void {
         if (conn.failed) return;
         conn.out.event(conn.server.gpa, object, opcode, args) catch |err| switch (err) {
             error.OutOfMemory => conn.failed = true,
-            // MIME types are checked when they arrive.
+            // Strings sent are fixed text, or types that passed max_mime_len
+            // and the NUL checks on the way in.
             error.MessageTooLong, error.BadString => unreachable,
         };
     }
 
-    /// Sends a protocol error, with `code` from the interface's `Error`
-    /// or `display.Error`. The connection takes no more requests.
     fn fail(conn: *Connection, object: u32, code: anytype, message: []const u8) void {
         if (conn.failed) return;
         log.debug("protocol error on object {d}: {s}", .{ object, message });
@@ -634,13 +592,10 @@ pub const Connection = struct {
     }
 };
 
-/// zwlr data control has the primary selection from version 2, ext from
-/// version 1.
 fn hasPrimary(p: Protocol, version: u32) bool {
     return p == .ext or version >= 2;
 }
 
-/// The request with `opcode` in `Request`.
 fn request(comptime Request: type, opcode: u16) error{UnknownOpcode}!Request {
     return std.enums.fromInt(Request, opcode) orelse error.UnknownOpcode;
 }
@@ -651,7 +606,6 @@ fn close(fd: fd_t) void {
 
 const testing = std.testing;
 
-/// What the backend saw.
 const TestBackend = struct {
     fetched: std.ArrayList(u8) = .empty,
     fetch_fds: std.ArrayList(fd_t) = .empty,
@@ -684,23 +638,17 @@ const TestBackend = struct {
     }
 };
 
-/// A program on a connection. It sends requests, and reads the events
-/// it gets as lines of text, such as `registry.global 1 "wl_seat" 7`,
-/// using what it knows of each object's interface.
 const TestProgram = struct {
     conn: *Connection,
     interfaces: std.AutoHashMapUnmanaged(u32, Interface) = .empty,
     next_id: u32 = 2,
-    /// Descriptors from events, which the test owns.
     fds: std.ArrayList(fd_t) = .empty,
-    /// The server's offers, in the order they came. Events show them as
-    /// `o1`, `o2` and so on.
     offers: std.ArrayList(u32) = .empty,
 
     const Interface = enum { display, registry, callback, seat, output, manager, device, source, offer };
 
-    /// Each event's arguments, by interface and opcode: `u` uint, `i`
-    /// int, `s` string, `f` fd, `o` object, `n` a new offer.
+    // Event arguments: u uint, i int, s string, f fd, o an object, and n a
+    // new offer.
     fn signature(interface: Interface, opcode: u16) []const u8 {
         const table: []const []const u8 = switch (interface) {
             .display => &.{ "uus", "u" },
@@ -744,12 +692,10 @@ const TestProgram = struct {
         p.interfaces.deinit(testing.allocator);
     }
 
-    /// The ID of offer `o{n}`.
     fn offer(p: *const TestProgram, n: usize) u32 {
         return p.offers.items[n - 1];
     }
 
-    /// A new object of `interface`, for a new_id argument.
     fn new(p: *TestProgram, interface: Interface) !u32 {
         const id = p.next_id;
         p.next_id += 1;
@@ -765,7 +711,6 @@ const TestProgram = struct {
         try testing.expectEqual(out.bytes.items.len, p.conn.receive(out.bytes.items));
     }
 
-    /// The registry, with the globals' events read.
     fn registry(p: *TestProgram) !u32 {
         const id = try p.new(.registry);
         try p.request(display.id, @backingInt(display.Request.get_registry), &.{.{ .uint = id }});
@@ -790,8 +735,6 @@ const TestProgram = struct {
         p.conn.out.fds.clearRetainingCapacity();
     }
 
-    /// The events since the last call, one per line. Descriptors are
-    /// shown as `fd`, and kept in `fds`.
     fn events(p: *TestProgram) ![]u8 {
         var text: std.ArrayList(u8) = .empty;
         errdefer text.deinit(testing.allocator);
@@ -844,14 +787,12 @@ const TestProgram = struct {
         try testing.expectEqualStrings(want, got);
     }
 
-    /// A data device on the given manager.
     fn device(p: *TestProgram, manager: u32, seat_id: u32) !u32 {
         const id = try p.new(.device);
         try p.request(manager, @backingInt(data_control.manager.Request.get_data_device), &.{ .{ .uint = id }, .{ .uint = seat_id } });
         return id;
     }
 
-    /// A source offering `mimes`.
     fn source(p: *TestProgram, manager: u32, mimes: []const []const u8) !u32 {
         const id = try p.new(.source);
         try p.request(manager, @backingInt(data_control.manager.Request.create_data_source), &.{.{ .uint = id }});
@@ -866,8 +807,6 @@ fn pipe() ![2]fd_t {
     return fds;
 }
 
-/// Whether the write end of the pipe whose read end is `fd` is closed,
-/// and nothing was written.
 fn closedEmpty(fd: fd_t) bool {
     var buf: [1]u8 = undefined;
     return c.read(fd, &buf, 1) == 0;
@@ -906,7 +845,6 @@ test "the registry lists the globals, and binding them sends their state" {
         \\
     );
 
-    // sync answers at once, and frees the callback's ID.
     const callback = try p.new(.callback);
     try p.request(display.id, @backingInt(display.Request.sync), &.{.{ .uint = callback }});
     try p.expectEvents(
@@ -922,7 +860,6 @@ test "a program's copy reaches the backend and other programs, and their reads r
     var server: Server = .init(testing.allocator, backend.backend());
     defer server.deinit();
 
-    // wl-copy, on zwlr data control.
     var copier: TestProgram = try .init(&server);
     defer copier.deinit();
     var registry = try copier.registry();
@@ -934,7 +871,6 @@ test "a program's copy reaches the backend and other programs, and their reads r
     try copier.request(copier_device, @backingInt(data_control.device.Request.set_selection), &.{.{ .uint = source }});
     try testing.expectEqualStrings("clipboard: text/plain text/plain;charset=utf-8\n", backend.copies.items);
 
-    // The copier's own device sees its copy too.
     try copier.expectEvents(
         \\device.data_offer o1
         \\offer.offer "text/plain"
@@ -943,7 +879,6 @@ test "a program's copy reaches the backend and other programs, and their reads r
         \\
     );
 
-    // wl-paste, on ext data control, starts with the copy.
     var paster: TestProgram = try .init(&server);
     defer paster.deinit();
     registry = try paster.registry();
@@ -960,21 +895,18 @@ test "a program's copy reaches the backend and other programs, and their reads r
         \\
     );
 
-    // Its read goes to the copier with the pipe it sent.
     const fds = try pipe();
     defer close(fds[0]);
     try paster.request(paster.offer(1), @backingInt(data_control.offer.Request.receive), &.{ .{ .string = "text/plain" }, .{ .fd = fds[1] } });
     try copier.expectEvents("source.send \"text/plain\" fd\n");
     try testing.expectEqual(fds[1], copier.fds.items[0]);
 
-    // A type that wasn't offered gets no data.
     const other = try pipe();
     defer close(other[0]);
     try paster.request(paster.offer(1), @backingInt(data_control.offer.Request.receive), &.{ .{ .string = "image/png" }, .{ .fd = other[1] } });
     try testing.expect(closedEmpty(other[0]));
     try copier.expectEvents("");
 
-    // The backend reads it the same way.
     const mirror = try pipe();
     defer close(mirror[0]);
     try testing.expect(server.read(.clipboard, "text/plain;charset=utf-8", mirror[1]));
@@ -1005,7 +937,6 @@ test "the user's clipboard replaces a program's copy, and reads of it reach the 
         \\
     );
 
-    // The copy is cancelled, so a background wl-copy exits.
     try server.setClipboard(&.{ "image/png", "bad\x00type", "text/plain" });
     try p.expectEvents(
         \\source.cancelled
@@ -1023,7 +954,6 @@ test "the user's clipboard replaces a program's copy, and reads of it reach the 
     try testing.expectEqualStrings("image/png\n", backend.fetched.items);
     try testing.expectEqual(fds[1], backend.fetch_fds.items[0]);
 
-    // An offer made before the clipboard changed gets no data.
     try server.setClipboard(null);
     try p.expectEvents("device.selection 0\n");
     const stale = try pipe();
@@ -1089,7 +1019,6 @@ test "protocol errors" {
     defer server.deinit();
 
     const Case = struct {
-        /// Sends the requests that end in the error.
         run: *const fn (p: *TestProgram, registry: u32) anyerror!void,
         want: []const u8,
     };
@@ -1142,7 +1071,6 @@ test "protocol errors" {
         .{
             .run = struct {
                 fn f(p: *TestProgram, _: u32) !void {
-                    // An ID the program already uses.
                     try p.request(display.id, @backingInt(display.Request.get_registry), &.{.{ .uint = 2 }});
                 }
             }.f,
@@ -1152,7 +1080,6 @@ test "protocol errors" {
             .run = struct {
                 fn f(p: *TestProgram, registry: u32) !void {
                     const manager = try p.bind(registry, 4, .manager, 2);
-                    // receive with no descriptor.
                     const id = try p.new(.offer);
                     _ = id;
                     try p.request(manager, 0, &.{});
@@ -1173,7 +1100,6 @@ test "protocol errors" {
         try p.expectEvents(case.want);
         try testing.expect(p.conn.failed);
 
-        // Nothing more is handled.
         var out: wire.Outbox = .{};
         defer out.deinit(testing.allocator);
         try out.event(testing.allocator, display.id, @backingInt(display.Request.sync), &.{.{ .uint = 50 }});
@@ -1213,7 +1139,6 @@ const fuzz = @import("fuzz");
 test "fuzz: any requests from two programs" {
     try fuzz.run({}, struct {
         fn one(_: void, in: fuzz.Input) !void {
-            // Every descriptor the programs send is closed in the end.
             const open_before = openFds();
             defer std.debug.assert(openFds() == open_before);
 
@@ -1221,10 +1146,8 @@ test "fuzz: any requests from two programs" {
             defer server.deinit();
             var programs = [2]*Connection{ try server.connect(), try server.connect() };
 
-            // Each program starts as wl-paste and wl-copy do, so that
-            // random requests mostly reach real objects: the registry is
-            // 2, the globals 3 to 7, devices 8 and 9, and sources 10
-            // and 11.
+            // Both programs start with a registry (2), the globals (3 to 7), a
+            // device from each manager (8, 9) and a source from each (10, 11).
             for (programs) |conn| {
                 var out: wire.Outbox = .{};
                 defer out.deinit(testing.allocator);
@@ -1244,7 +1167,6 @@ test "fuzz: any requests from two programs" {
                 const which = in.index(programs.len);
                 const conn = programs[which];
 
-                // The backend's side.
                 if (in.chance(1, 15)) {
                     if (in.chance(1, 1)) {
                         try server.setClipboard(if (in.chance(1, 3)) null else mimes[0..in.index(mimes.len + 1)]);
@@ -1256,15 +1178,12 @@ test "fuzz: any requests from two programs" {
                     continue;
                 }
 
-                // A program that failed is closed and replaced.
                 if (conn.failed or in.chance(1, 30)) {
                     server.disconnect(conn);
                     programs[which] = try server.connect();
                     continue;
                 }
 
-                // A request to a likely object, with arguments of random
-                // types: words that are often IDs, MIME types and pipes.
                 var out: wire.Outbox = .{};
                 defer out.deinit(testing.allocator);
                 var args: [4]wire.Arg = undefined;
@@ -1284,8 +1203,6 @@ test "fuzz: any requests from two programs" {
                 try conn.fds.pushBackSlice(testing.allocator, out.fds.items);
                 _ = conn.receive(out.bytes.items);
 
-                // What the program didn't take, and the events' descriptors,
-                // as the I/O layer would close them.
                 while (conn.fds.popFront()) |fd| close(fd);
                 for (conn.out.fds.items) |fd| close(fd);
                 conn.out.fds.clearRetainingCapacity();

@@ -1,5 +1,3 @@
-//! Loopback tests for quic.zig. The client and server use UDP sockets on
-//! 127.0.0.1 and run in one single-threaded loop.
 const std = @import("std");
 const testing = std.testing;
 const Io = std.Io;
@@ -24,7 +22,6 @@ const Peer = struct {
         self.socket.close(io);
     }
 
-    /// Receive at most one datagram, waiting up to `wait_ms`.
     fn poll(self: *Peer, io: Io, buf: []u8, wait_ms: i64) !?Io.net.IncomingMessage {
         const timeout: Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(wait_ms), .clock = .awake } };
         return self.socket.receiveTimeout(io, buf, timeout) catch |err| switch (err) {
@@ -34,12 +31,8 @@ const Peer = struct {
     }
 };
 
-/// Echoes stream data back on the same stream and sends FIN after the
-/// peer's FIN.
 const Echo = struct {
     stream_id: ?i64 = null,
-    /// ngtcp2 keeps pointers into sent data until it is acknowledged. The
-    /// buffer is preallocated so those pointers stay valid.
     received: []u8,
     received_len: usize = 0,
     sent: usize = 0,
@@ -68,7 +61,6 @@ const Echo = struct {
     }
 };
 
-/// Sends `payload` on one stream after the handshake and collects the reply.
 const Sender = struct {
     gpa: std.mem.Allocator,
     payload: []const u8,
@@ -108,7 +100,6 @@ test "client accepting the server key connects and a stream echoes" {
     const gpa = testing.allocator;
     crypto.init(io);
 
-    // The client accepts either key.
     const identity = Ed25519.KeyPair.generate(io);
     const other = Ed25519.KeyPair.generate(io);
     var server_tls = try quic.Server.init(identity);
@@ -164,8 +155,6 @@ test "client accepting the server key connects and a stream echoes" {
     try testing.expectEqualSlices(u8, payload, sender.received.items);
     try testing.expectEqual(identity.public_key.toBytes(), client_tls.presentedKey().?);
 
-    // Both ends derive the same exporter value, and another label gives
-    // another value.
     var client_secret: [32]u8 = undefined;
     var server_secret: [32]u8 = undefined;
     var other_secret: [32]u8 = undefined;
@@ -174,11 +163,10 @@ test "client accepting the server key connects and a stream echoes" {
     client.conn.?.exportSecret(&other_secret, "EXPORTER-tx-other");
     try testing.expectEqual(client_secret, server_secret);
     try testing.expect(!std.mem.eql(u8, &client_secret, &other_secret));
-    // Client and server each count one X25519MLKEM768 exchange.
+
     try testing.expect(c.tx_tls_mlkem_exchanges() >= mlkem_before + 2);
 }
 
-/// Runs a handshake between fresh connections until it completes or fails.
 fn handshake(client_tls: *const quic.Client, server_tls: *const quic.Server) !void {
     const io = testing.io;
     const gpa = testing.allocator;

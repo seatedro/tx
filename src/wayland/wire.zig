@@ -1,51 +1,30 @@
-//! The Wayland wire format.
-//!
-//! A message is a header and its arguments, in 32-bit words in the host's
-//! byte order. The header is the object's ID, then a word with the
-//! message's size in bytes, header included, in its high 16 bits and the
-//! opcode in its low 16. Arguments, by type:
-//!
-//! - int, uint, fixed, object and new_id: one word. A null object is 0.
-//! - string: a word with the length, counting the terminating NUL, then
-//!   the bytes and the NUL, padded to a word. A null string has length 0.
-//! - array: a word with the length, then the bytes, padded to a word.
-//! - fd: nothing in the message. File descriptors travel beside the bytes
-//!   (`SCM_RIGHTS`), in the order of the messages that carry them.
-//!
-//! The message's interface and opcode give its arguments' types; nothing
-//! on the wire does. `wl_registry.bind` is the one request whose new_id
-//! has no fixed interface: it is sent as a string (the interface's name),
-//! a uint (the version) and the ID.
-//!
-//! Nothing here performs I/O or owns file descriptors.
+//! The Wayland wire format. A message is a header of two native-endian
+//! words, the object id and then size << 16 | opcode, followed by arguments
+//! padded to 4 bytes. Descriptors travel beside the bytes as SCM_RIGHTS, and
+//! each fd argument takes the next one in order. server.zig decodes requests
+//! with Reader and queues events in an Outbox, which socket.zig sends.
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const fd_t = std.posix.fd_t;
 
 pub const header_len = 8;
 
-/// The largest message: libwayland's limit, which its clients keep to and
-/// expect from servers.
+/// The largest message read or written, header included. It is libwayland's
+/// WL_MAX_MESSAGE_SIZE.
 pub const max_message_len = 4096;
 
 pub const DecodeError = error{
-    /// A header's size is under the header's own, isn't a multiple of 4,
-    /// or is over `max_message_len`.
     BadSize,
-    /// An argument runs past the end of its message.
     Truncated,
-    /// A string isn't terminated by NUL, or has a NUL before its end.
     BadString,
-    /// A message takes a file descriptor that didn't arrive before it.
     MissingFd,
-    /// The message is longer than its arguments.
     TrailingBytes,
 };
 
 pub const Header = struct {
     object: u32,
     opcode: u16,
-    /// In bytes, header included.
     size: u16,
 
     pub fn read(bytes: *const [header_len]u8) DecodeError!Header {
@@ -59,12 +38,9 @@ pub const Header = struct {
 
 pub const Message = struct {
     header: Header,
-    /// The arguments' bytes.
     args: []const u8,
 };
 
-/// The first message in `bytes` and the bytes it takes, or null if
-/// `bytes` ends inside it.
 pub fn next(bytes: []const u8) DecodeError!?struct { Message, usize } {
     if (bytes.len < header_len) return null;
     const header = try Header.read(bytes[0..header_len]);
@@ -72,9 +48,8 @@ pub fn next(bytes: []const u8) DecodeError!?struct { Message, usize } {
     return .{ .{ .header = header, .args = bytes[header_len..header.size] }, header.size };
 }
 
-/// Reads a message's arguments, in order. File descriptors come from the
-/// front of `fds`, the connection's received descriptors that no message
-/// has taken yet. A descriptor `fd` returns belongs to the caller.
+/// Reads one message's arguments in order. An fd argument takes the front
+/// descriptor of fds, the ones received on the connection.
 pub const Reader = struct {
     bytes: []const u8,
     fds: *std.Deque(fd_t),
@@ -93,13 +68,14 @@ pub const Reader = struct {
         return @bitCast(try r.uint());
     }
 
-    /// Null for 0, the null object.
+    /// Id 0 is a null object.
     pub fn object(r: *Reader) DecodeError!?u32 {
         const id = try r.uint();
         return if (id == 0) null else id;
     }
 
-    /// Null for the null string. Without the NUL.
+    /// A string's length counts its terminating NUL, and length 0 is a null
+    /// string. The returned text has no NUL.
     pub fn string(r: *Reader) DecodeError!?[]const u8 {
         const bytes = try r.sized();
         if (bytes.len == 0) return null;
@@ -113,16 +89,15 @@ pub const Reader = struct {
         return r.sized();
     }
 
+    /// The caller owns the descriptor.
     pub fn fd(r: *Reader) DecodeError!fd_t {
         return r.fds.popFront() orelse error.MissingFd;
     }
 
-    /// Checks that the arguments took the whole message.
     pub fn end(r: *const Reader) DecodeError!void {
         if (r.bytes.len != 0) return error.TrailingBytes;
     }
 
-    /// A length word, then that many bytes, padded to a word.
     fn sized(r: *Reader) DecodeError![]const u8 {
         const len = try r.uint();
         const padded = std.mem.alignForward(usize, len, 4);
@@ -132,17 +107,14 @@ pub const Reader = struct {
     }
 };
 
-/// An argument of an event being written.
+/// An event argument. An fd takes no bytes in the message.
 pub const Arg = union(enum) {
-    /// Also an object or a new_id.
     uint: u32,
     int: i32,
-    /// Null for the null string. Without the NUL.
     string: ?[]const u8,
     array: []const u8,
     fd: fd_t,
 
-    /// Bytes in the message.
     fn len(arg: Arg) usize {
         return switch (arg) {
             .uint, .int => 4,
@@ -154,17 +126,13 @@ pub const Arg = union(enum) {
 };
 
 pub const EncodeError = Allocator.Error || error{
-    /// The message would be over `max_message_len`.
     MessageTooLong,
-    /// A string has a NUL in it.
     BadString,
 };
 
-/// Events waiting to be sent, and the file descriptors that go with them.
-/// The descriptors are the caller's until it sends them; the outbox only
-/// keeps them in order.
 pub const Outbox = struct {
     bytes: std.ArrayList(u8) = .empty,
+    /// The descriptors of fd arguments, in order. deinit leaves them open.
     fds: std.ArrayList(fd_t) = .empty,
 
     pub fn deinit(o: *Outbox, gpa: Allocator) void {
@@ -173,7 +141,7 @@ pub const Outbox = struct {
         o.* = undefined;
     }
 
-    /// Appends an event for `object`. On error nothing is appended.
+    /// Appends one message. On error nothing is appended.
     pub fn event(o: *Outbox, gpa: Allocator, object: u32, opcode: u16, args: []const Arg) EncodeError!void {
         var size: usize = header_len;
         var fd_count: usize = 0;
@@ -189,7 +157,6 @@ pub const Outbox = struct {
         try o.bytes.ensureUnusedCapacity(gpa, size);
         try o.fds.ensureUnusedCapacity(gpa, fd_count);
 
-        // From here nothing fails.
         o.word(object);
         o.word(@as(u32, @intCast(size)) << 16 | opcode);
         for (args) |arg| switch (arg) {
@@ -198,6 +165,7 @@ pub const Outbox = struct {
             .string => |s| if (s) |text| {
                 o.word(@intCast(text.len + 1));
                 o.bytes.appendSliceAssumeCapacity(text);
+                // The NUL is the first byte of padding.
                 o.pad(text.len, text.len + 1);
             } else o.word(0),
             .array => |bytes| {
@@ -215,8 +183,6 @@ pub const Outbox = struct {
         o.bytes.appendSliceAssumeCapacity(&buf);
     }
 
-    /// NULs after `written` bytes of a value `len` long on the wire, up to
-    /// the next word. A string's terminating NUL is the first of them.
     fn pad(o: *Outbox, written: usize, len: usize) void {
         const padded = std.mem.alignForward(usize, len, 4);
         o.bytes.appendNTimesAssumeCapacity(0, padded - written);
@@ -225,8 +191,6 @@ pub const Outbox = struct {
 
 const testing = std.testing;
 
-/// The bytes of a message, written word by word, with strings padded by
-/// hand.
 fn words(comptime values: []const u32) [values.len * 4]u8 {
     var out: [values.len * 4]u8 = undefined;
     for (values, 0..) |v, i| std.mem.writeInt(u32, out[i * 4 ..][0..4], v, .native);
@@ -237,7 +201,6 @@ test "an event's words, with a string padded to a word and its NUL counted" {
     var out: Outbox = .{};
     defer out.deinit(testing.allocator);
 
-    // wl_registry.global(name 1, "wl_seat", version 7) on object 2.
     try out.event(testing.allocator, 2, 0, &.{ .{ .uint = 1 }, .{ .string = "wl_seat" }, .{ .uint = 7 } });
     const want = words(&.{ 2, 28 << 16 | 0, 1, 8 }) ++ "wl_seat\x00".* ++ words(&.{7});
     try testing.expectEqualSlices(u8, &want, out.bytes.items);
@@ -289,9 +252,7 @@ test "bad arguments" {
     defer fds.deinit(testing.allocator);
 
     const cases = [_]struct { []const u8, DecodeError }{
-        // A string's length past the message's end.
         .{ &words(&.{8}), error.Truncated },
-        // No NUL at the end, and a NUL inside.
         .{ &(words(&.{4}) ++ "abcd".*), error.BadString },
         .{ &(words(&.{4}) ++ "a\x00c\x00".*), error.BadString },
     };
@@ -356,8 +317,6 @@ test "fuzz: events read back as written" {
             var fds: std.Deque(fd_t) = .empty;
             defer fds.deinit(testing.allocator);
 
-            // Arguments of each type, with strings and arrays of any
-            // length that fits.
             var strings: [4][64]u8 = undefined;
             var args: [4]Arg = undefined;
             for (&args, &strings) |*arg, *string_buf| {

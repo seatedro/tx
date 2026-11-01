@@ -1,6 +1,8 @@
 .{
     .name = .tx,
     .fingerprint = 0x54545703d8bf8e13,
+    // build.zig imports the version. nightly.yml and flake.nix read it from
+    // this line with a regex, so it stays on one line in this form.
     .version = "0.0.0",
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
@@ -8,13 +10,13 @@
             .url = "https://github.com/ghostty-org/ghostty/archive/cec8b92f1ecd176a20a56aa405021e7ae991b996.tar.gz",
             .hash = "ghostty-1.3.2-dev-5UdBC__whQXAL8QvZGz2l3tnrp1BTVI2yEQudaD4wgEw",
         },
+        // seatedro/libxev is mitchellh/libxev with fixes to UDP receive and to
+        // kqueue's handling of disarm and rearm.
         .libxev = .{
-            // seatedro/libxev, branch tx: 819ffa18, the commit Ghostty pins,
-            // plus fixes to UDP receive on kqueue and to disarms in kqueue
-            // ticks that don't wait.
             .url = "https://github.com/seatedro/libxev/archive/1bf7b0848b8268f019d0232b03c9a114e12f9448.tar.gz",
             .hash = "libxev-0.0.0-86vtcxk7FAAb7Ad7QAYld65xUS8n3627DtvBFvfFF3Ce",
         },
+        // src/build/ngtcp2.zig repeats this version for ngtcp2/version.h.
         .ngtcp2 = .{
             .url = "https://github.com/ngtcp2/ngtcp2/archive/refs/tags/v1.25.0.tar.gz",
             .hash = "N-V-__8AAGRJQwAAgW_SMRLhEwr1ZQaH-oJp4VWQTLZanCNf",

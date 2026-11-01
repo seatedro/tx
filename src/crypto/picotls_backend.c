@@ -1,15 +1,11 @@
-/*
- * picotls crypto backend on Zig's std.crypto. The algorithm objects are defined
- * in C because picotls's structs contain bitfields, which Zig can't express.
- * The primitives are in primitives.zig.
- */
 #include <tx/picotls_backend.h>
 
 #include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define TX_AES_STATE_SIZE 4096 /* fits software AES; see primitives.zig */
+// The sizes, the 16-byte alignment and the ML-KEM-768 lengths must match primitives.zig.
+#define TX_AES_STATE_SIZE 4096
 #define TX_HASH_STATE_SIZE 128
 #define TX_MLKEM768_PK_LEN 1184
 #define TX_MLKEM768_SK_LEN 2400
@@ -22,7 +18,6 @@ typedef struct {
   _Alignas(16) uint8_t b[TX_HASH_STATE_SIZE];
 } tx_hash_state;
 
-/* primitives.zig */
 void tx_aead_seal(int kind, const uint8_t *key, const uint8_t nonce[12], const void *ad,
                   size_t adlen, const void *m, size_t mlen, void *c);
 int tx_aead_open(int kind, const uint8_t *key, const uint8_t nonce[12], const void *ad,
@@ -44,8 +39,6 @@ int tx_ed25519_sign(const uint8_t secret_key[64], const uint8_t *msg, size_t len
 int tx_ed25519_verify(const uint8_t public_key[32], const uint8_t *msg, size_t len,
                       const uint8_t sig[64]);
 
-/* --- AES-ECB ---------------------------------------------------------------- */
-
 struct tx_aes_ecb_ctx {
   ptls_cipher_context_t super;
   int key_bits, is_enc;
@@ -57,8 +50,7 @@ static void aes_ecb_dispose(ptls_cipher_context_t *_ctx) {
   ptls_clear_memory(&ctx->st, sizeof(ctx->st));
 }
 
-/* ECB takes no IV. ngtcp2's picotls adapter calls ptls_cipher_init on ECB
-   contexts anyway, which picotls's OpenSSL backend accepts. */
+// ECB has no IV. ngtcp2 calls ptls_cipher_init on AES-ECB contexts with a NULL IV.
 static void aes_ecb_init(ptls_cipher_context_t *ctx, const void *iv) { (void)ctx, (void)iv; }
 
 static void aes_ecb_transform(ptls_cipher_context_t *_ctx, void *out, const void *in, size_t len) {
@@ -86,13 +78,11 @@ static int aes256ecb_setup(ptls_cipher_context_t *ctx, int is_enc, const void *k
 }
 
 ptls_cipher_algorithm_t tx_aes128ecb = {
-    "AES128-ECB",    PTLS_AES128_KEY_SIZE,          PTLS_AES_BLOCK_SIZE,
-    0 /* iv size */, sizeof(struct tx_aes_ecb_ctx), aes128ecb_setup};
+    "AES128-ECB",   PTLS_AES128_KEY_SIZE, PTLS_AES_BLOCK_SIZE, 0, sizeof(struct tx_aes_ecb_ctx),
+    aes128ecb_setup};
 ptls_cipher_algorithm_t tx_aes256ecb = {
-    "AES256-ECB",    PTLS_AES256_KEY_SIZE,          PTLS_AES_BLOCK_SIZE,
-    0 /* iv size */, sizeof(struct tx_aes_ecb_ctx), aes256ecb_setup};
-
-/* --- ChaCha20 ----------------------------------------------------------------- */
+    "AES256-ECB",   PTLS_AES256_KEY_SIZE, PTLS_AES_BLOCK_SIZE, 0, sizeof(struct tx_aes_ecb_ctx),
+    aes256ecb_setup};
 
 struct tx_chacha20_ctx {
   ptls_cipher_context_t super;
@@ -107,10 +97,12 @@ static void chacha20_dispose(ptls_cipher_context_t *_ctx) {
   ptls_clear_memory(ctx->key, sizeof(ctx->key));
 }
 
-/* The 16-byte IV is a little-endian 32-bit block counter, then the nonce. */
 static void chacha20_init(ptls_cipher_context_t *_ctx, const void *_iv) {
   struct tx_chacha20_ctx *ctx = (struct tx_chacha20_ctx *)_ctx;
   const uint8_t *iv = _iv;
+
+  // picotls' 16-byte ChaCha20 IV is a little-endian 32-bit block counter
+  // followed by the 96-bit nonce.
   ctx->counter =
       (uint32_t)iv[0] | (uint32_t)iv[1] << 8 | (uint32_t)iv[2] << 16 | (uint32_t)iv[3] << 24;
   memcpy(ctx->nonce, iv + 4, sizeof(ctx->nonce));
@@ -136,15 +128,11 @@ static int chacha20_setup(ptls_cipher_context_t *_ctx, int is_enc, const void *k
   return 0;
 }
 
-ptls_cipher_algorithm_t tx_chacha20 = {"CHACHA20",
-                                       PTLS_CHACHA20_KEY_SIZE,
-                                       1 /* block size */,
-                                       PTLS_CHACHA20_IV_SIZE,
-                                       sizeof(struct tx_chacha20_ctx),
-                                       chacha20_setup};
+ptls_cipher_algorithm_t tx_chacha20 = {
+    "CHACHA20",    PTLS_CHACHA20_KEY_SIZE, 1, PTLS_CHACHA20_IV_SIZE, sizeof(struct tx_chacha20_ctx),
+    chacha20_setup};
 
-/* --- AEAD ----------------------------------------------------------------- */
-
+// Indices into aead_kinds in primitives.zig.
 enum { TX_AES128GCM = 0, TX_AES256GCM = 1, TX_CHACHA20POLY1305 = 2 };
 
 struct tx_aead_ctx {
@@ -170,20 +158,20 @@ static void aead_set_iv(ptls_aead_context_t *_ctx, const void *iv) {
   memcpy(ctx->static_iv, iv, ctx->super.algo->iv_size);
 }
 
-/*
- * Gathers the input vectors into `output` and seals in place. The nonce is the
- * static IV XORed with the record sequence number.
- */
 static void aead_encrypt_v(ptls_aead_context_t *_ctx, void *_output, ptls_iovec_t *input,
                            size_t incnt, uint64_t seq, const void *aad, size_t aadlen) {
   struct tx_aead_ctx *ctx = (struct tx_aead_ctx *)_ctx;
   uint8_t *output = _output, iv[PTLS_MAX_IV_SIZE];
   size_t off = 0;
+
+  // Gather the vectors into output and seal there. input[0] can already start
+  // at output, as picotls encrypts records in place.
   for (size_t i = 0; i < incnt; ++i) {
     if (input[i].len != 0)
       memmove(output + off, input[i].base, input[i].len);
     off += input[i].len;
   }
+
   ptls_aead__build_iv(ctx->super.algo, iv, ctx->static_iv, seq);
   tx_aead_seal(ctx->kind, ctx->key, iv, aad, aadlen, output, off, output);
   ptls_clear_memory(iv, sizeof(iv));
@@ -207,7 +195,7 @@ static int aead_setup(ptls_aead_context_t *_ctx, const void *key, const void *iv
   ctx->super.dispose_crypto = aead_dispose;
   ctx->super.do_get_iv = aead_get_iv;
   ctx->super.do_set_iv = aead_set_iv;
-  ctx->super.do_encrypt_init = NULL; /* deprecated streaming interface */
+  ctx->super.do_encrypt_init = NULL;
   ctx->super.do_encrypt_update = NULL;
   ctx->super.do_encrypt_final = NULL;
   ctx->super.do_encrypt = ptls_aead__do_encrypt;
@@ -281,8 +269,8 @@ ptls_aead_algorithm_t tx_chacha20poly1305 = {
     .setup_crypto = chacha20poly1305_setup,
 };
 
-/* --- SHA-256 -------------------------------------------------------------- */
-
+// picotls clones and snapshots a hash by copying tx_hash_state. std's Sha256
+// state holds no pointers.
 ptls_define_hash(tx_sha256_impl, tx_hash_state, tx_sha256_init, tx_sha256_update, tx_sha256_final);
 
 ptls_hash_algorithm_t tx_sha256 = {"sha256", PTLS_SHA256_BLOCK_SIZE, PTLS_SHA256_DIGEST_SIZE,
@@ -298,16 +286,10 @@ ptls_cipher_suite_t tx_chacha20poly1305sha256 = {
     .aead = &tx_chacha20poly1305,
     .hash = &tx_sha256};
 
-/* --- Key exchange ------------------------------------------------------------ */
-
-/*
- * Used for X25519 and X25519MLKEM768. X25519MLKEM768 (draft-ietf-tls-ecdhe-mlkem)
- * puts ML-KEM first in each value:
- *
- *   client key share  ML-KEM-768 public key || X25519 public key
- *   server key share  ML-KEM-768 ciphertext || X25519 public key
- *   shared secret     ML-KEM-768 secret || X25519 secret
- */
+// In X25519MLKEM768 (draft-ietf-tls-ecdhe-mlkem), the client's key share is the
+// ML-KEM-768 encapsulation key followed by the X25519 public key. The server's is
+// the ML-KEM ciphertext followed by its X25519 public key. The shared secret is
+// the ML-KEM secret followed by the X25519 one.
 struct tx_kx_ctx {
   ptls_key_exchange_context_t super;
   int hybrid;
@@ -318,6 +300,7 @@ struct tx_kx_ctx {
 
 int tx_mlkem_exchanges = 0;
 
+// picotls frees the secret with free().
 static int kx_secret(ptls_iovec_t *secret, size_t len) {
   if ((secret->base = malloc(len)) == NULL)
     return PTLS_ERROR_NO_MEMORY;
@@ -331,6 +314,8 @@ static void kx_free_secret(ptls_iovec_t *secret) {
   *secret = ptls_iovec_init(NULL, 0);
 }
 
+// Derives the client's secret from the server's key share. picotls passes a
+// NULL secret to discard the context.
 static int kx_on_exchange(ptls_key_exchange_context_t **_ctx, int release, ptls_iovec_t *secret,
                           ptls_iovec_t peerkey) {
   struct tx_kx_ctx *ctx = (struct tx_kx_ctx *)*_ctx;
@@ -394,7 +379,8 @@ static int kx_create(ptls_key_exchange_algorithm_t *algo, ptls_key_exchange_cont
   return 0;
 }
 
-/* Server side. Computes the server's key share and the shared secret from the client's share. */
+// Makes the server's key share in *pubkey and derives the secret from the
+// client's. picotls frees *pubkey with free().
 static int kx_exchange(ptls_key_exchange_algorithm_t *algo, ptls_iovec_t *pubkey,
                        ptls_iovec_t *secret, ptls_iovec_t peerkey) {
   int hybrid = algo->id == PTLS_GROUP_X25519MLKEM768;
@@ -446,10 +432,13 @@ ptls_key_exchange_algorithm_t tx_x25519mlkem768 = {.id = PTLS_GROUP_X25519MLKEM7
                                                    .create = kx_create,
                                                    .exchange = kx_exchange};
 
-/* --- Ed25519 raw public keys ---------------------------------------------- */
-
+// DER prefix of an Ed25519 SubjectPublicKeyInfo (RFC 8410): SEQUENCE {
+// SEQUENCE { OID 1.3.101.112 }, BIT STRING of 33 bytes with no unused bits }.
+// The 32-byte key follows.
 static const uint8_t spki_prefix[12] = {0x30, 0x2a, 0x30, 0x05, 0x06, 0x03,
                                         0x2b, 0x65, 0x70, 0x03, 0x21, 0x00};
+// The client's signature_algorithms. picotls rejects a CertificateVerify in any
+// other scheme.
 static const uint16_t ed25519_algos[] = {PTLS_SIGNATURE_ED25519, UINT16_MAX};
 
 void tx_ed25519_spki(uint8_t out[TX_ED25519_SPKI_LEN], const uint8_t public_key[32]) {
@@ -490,8 +479,10 @@ void tx_ed25519_signer_dispose(tx_ed25519_signer *signer) {
 }
 
 static int ed25519_verify_sign(void *key, uint16_t algo, ptls_iovec_t data, ptls_iovec_t sig) {
+  // picotls passes empty data and sig to release verify_data after a later
+  // handshake error. verify_data points into the verifier and needs no freeing.
   if (data.base == NULL)
-    return 0; /* cleanup call; nothing to free */
+    return 0;
   if (algo != PTLS_SIGNATURE_ED25519 || sig.len != 64) {
     return PTLS_ALERT_DECRYPT_ERROR;
   }
@@ -505,17 +496,17 @@ static int ed25519_verify_cert(ptls_verify_certificate_t *_self, ptls_t *tls,
   (void)tls, (void)server_name;
   tx_ed25519_verifier *self = (tx_ed25519_verifier *)_self;
 
-  /* The certificate is an Ed25519 SubjectPublicKeyInfo: a fixed prefix,
-     then the key. Rebuilding it from the key checks the prefix. */
   if (num_certs != 1 || certs[0].len != TX_ED25519_SPKI_LEN) {
     return PTLS_ALERT_BAD_CERTIFICATE;
   }
+  // Rebuilding the SPKI from its last 32 bytes checks the Ed25519 prefix.
   const uint8_t *key = certs[0].base + TX_ED25519_SPKI_LEN - 32;
   uint8_t want[TX_ED25519_SPKI_LEN];
   tx_ed25519_spki(want, key);
   if (!ptls_mem_equal(certs[0].base, want, sizeof(want))) {
     return PTLS_ALERT_BAD_CERTIFICATE;
   }
+
   memcpy(self->presented, key, sizeof(self->presented));
   self->has_presented = 1;
 
@@ -527,7 +518,6 @@ static int ed25519_verify_cert(ptls_verify_certificate_t *_self, ptls_t *tls,
     return PTLS_ALERT_BAD_CERTIFICATE;
   }
 
-  /* CertificateVerify proves the server holds the key's secret half. */
   *verify_sign = ed25519_verify_sign;
   *verify_data = self->presented;
   return 0;

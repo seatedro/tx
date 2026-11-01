@@ -1,20 +1,8 @@
-//! OpenSSH private key files (OpenSSH's PROTOCOL.key), such as
-//! `~/.ssh/id_ed25519`.
-//!
-//! The file is base64 between `-----BEGIN OPENSSH PRIVATE KEY-----` and
-//! `-----END OPENSSH PRIVATE KEY-----`. Decoded, it is:
-//!
-//!     "openssh-key-v1\0"
-//!     string  cipher       "none", or "aes256-ctr" for a passphrase
-//!     string  kdf          "none", or "bcrypt"
-//!     string  kdf options  for bcrypt: string salt, uint32 rounds
-//!     uint32  keys         1
-//!     string  public key blob
-//!     string  private section, encrypted with the cipher
-//!
-//! The private section holds two equal uint32 check values, then the key's
-//! type, public key, 64-byte secret key and comment, then padding. The check
-//! values tell a wrong passphrase from a right one.
+//! OpenSSH private key files (openssh-key-v1, PROTOCOL.key) holding one Ed25519
+//! key. A file is unencrypted, or encrypted with aes256-ctr under the bcrypt
+//! KDF, the scheme ssh-keygen uses for a passphrase. tx signs logins with keys
+//! from these files when the agent doesn't hold them.
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Ed25519 = std.crypto.sign.Ed25519;
@@ -27,24 +15,20 @@ const end_line = "-----END OPENSSH PRIVATE KEY-----";
 const magic = "openssh-key-v1\x00";
 
 pub const ParseError = error{
-    /// Not an OpenSSH private key file, or a damaged one.
     Malformed,
-    /// A key other than Ed25519.
     UnsupportedType,
-    /// Encrypted with a cipher or key derivation other than aes256-ctr and
-    /// bcrypt, the defaults of `ssh-keygen`.
     UnsupportedCipher,
 } || Allocator.Error;
 
 pub const DecryptError = error{ Malformed, WrongPassphrase };
 
+/// A parsed key file. It owns bytes, the decoded file, which deinit zeroes and
+/// frees.
 pub const PrivateKeyFile = struct {
-    /// The decoded file. The fields below point into it.
     bytes: []u8,
     public_key: ssh.Key,
-    /// Null when the key has no passphrase.
     kdf: ?Kdf,
-    /// The private section, still encrypted if `kdf` is set.
+    /// The private key list, encrypted when kdf is set. It points into bytes.
     private: []u8,
 
     const Kdf = struct {
@@ -52,7 +36,6 @@ pub const PrivateKeyFile = struct {
         rounds: u32,
     };
 
-    /// Parses the file's text. Reading the public key needs no passphrase.
     pub fn parse(gpa: Allocator, text: []const u8) ParseError!PrivateKeyFile {
         const bytes = try decodeArmor(gpa, text);
         errdefer gpa.free(bytes);
@@ -73,7 +56,6 @@ pub const PrivateKeyFile = struct {
             error.Malformed => error.Malformed,
         };
 
-        // Unencrypted, or aes256-ctr with a key and IV from bcrypt_pbkdf.
         const kdf: ?Kdf = if (std.mem.eql(u8, cipher, "none") and std.mem.eql(u8, kdf_name, "none"))
             null
         else if (std.mem.eql(u8, cipher, "aes256-ctr") and std.mem.eql(u8, kdf_name, "bcrypt")) kdf: {
@@ -84,14 +66,12 @@ pub const PrivateKeyFile = struct {
             break :kdf .{ .salt = salt, .rounds = rounds };
         } else return error.UnsupportedCipher;
 
-        // An encrypted section is padded to whole AES blocks.
+        // The private key list is padded to the cipher's block size.
         if (kdf != null and private.len % Aes256.block.block_length != 0) return error.Malformed;
 
-        // `private` points into `bytes`, which is mutable.
         return .{ .bytes = bytes, .public_key = public_key, .kdf = kdf, .private = @constCast(private) };
     }
 
-    /// Wipes the file, secret key included.
     pub fn deinit(f: *PrivateKeyFile, gpa: Allocator) void {
         std.crypto.secureZero(u8, f.bytes);
         gpa.free(f.bytes);
@@ -102,19 +82,19 @@ pub const PrivateKeyFile = struct {
         return f.kdf != null;
     }
 
-    /// The key pair. `passphrase` is ignored for an unencrypted key.
+    /// Decrypts the private key list with passphrase and returns its key pair.
+    /// An unencrypted file ignores passphrase. The caller zeroes the key pair.
     pub fn decrypt(f: *const PrivateKeyFile, passphrase: []const u8) DecryptError!Ed25519.KeyPair {
-        // Decrypted into a copy, so a wrong passphrase leaves the file as
-        // it was for another try.
         var plain_buf: [512]u8 = undefined;
         defer std.crypto.secureZero(u8, &plain_buf);
         if (f.private.len > plain_buf.len) return error.Malformed;
         const plain = plain_buf[0..f.private.len];
 
         if (f.kdf) |kdf| {
+            // opensshKdf rejects an empty passphrase as invalid input.
             if (passphrase.len == 0) return error.WrongPassphrase;
 
-            // 32 bytes of AES-256 key, then the 16-byte initial counter.
+            // bcrypt_pbkdf derives the AES-256 key and the CTR IV as one output.
             var key_iv: [32 + 16]u8 = undefined;
             defer std.crypto.secureZero(u8, &key_iv);
             std.crypto.pwhash.bcrypt.opensshKdf(passphrase, kdf.salt, &key_iv, kdf.rounds) catch return error.Malformed;
@@ -125,7 +105,8 @@ pub const PrivateKeyFile = struct {
             @memcpy(plain, f.private);
         }
 
-        // Equal check values mean the passphrase was right.
+        // The list starts with the same random u32 twice (PROTOCOL.key).
+        // Equal values show the passphrase was right.
         var r: ssh.Reader = .init(plain);
         const check1 = r.uint32() catch return error.Malformed;
         const check2 = r.uint32() catch return error.Malformed;
@@ -137,19 +118,19 @@ pub const PrivateKeyFile = struct {
         if (!std.mem.eql(u8, key_type, ssh.ed25519) or public.len != 32 or secret.len != 64) return error.Malformed;
         if (!std.mem.eql(u8, public, &f.public_key)) return error.Malformed;
 
+        // OpenSSH's Ed25519 secret is the seed followed by the public key, the
+        // layout of Ed25519.SecretKey.
         const secret_key = Ed25519.SecretKey.fromBytes(secret[0..64].*) catch return error.Malformed;
         return Ed25519.KeyPair.fromSecretKey(secret_key) catch error.Malformed;
     }
 };
 
-/// The bytes between the BEGIN and END lines, base64-decoded. Owned by the
-/// caller.
 fn decodeArmor(gpa: Allocator, text: []const u8) ParseError![]u8 {
     const begin = std.mem.indexOf(u8, text, begin_line) orelse return error.Malformed;
     const body_start = begin + begin_line.len;
     const end = std.mem.indexOfPos(u8, text, body_start, end_line) orelse return error.Malformed;
 
-    // The base64 is split into lines.
+    // In an unencrypted file the base64 text holds the private key.
     var b64: std.ArrayList(u8) = .empty;
     defer {
         std.crypto.secureZero(u8, b64.items);
@@ -169,7 +150,6 @@ fn decodeArmor(gpa: Allocator, text: []const u8) ParseError![]u8 {
 
 const testing = std.testing;
 
-// `ssh-keygen -t ed25519 -N ''`.
 const plain_key =
     \\-----BEGIN OPENSSH PRIVATE KEY-----
     \\b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
@@ -182,8 +162,6 @@ const plain_key =
 ;
 const plain_public = "AAAAC3NzaC1lZDI1NTE5AAAAIMj+0mYDjHsGqPYBxoihK55fUWYcAMIu20b/aVxyXGlZ";
 
-// `ssh-keygen -t ed25519 -N 'correct horse'`: aes256-ctr, bcrypt with 16
-// rounds.
 const encrypted_key =
     \\-----BEGIN OPENSSH PRIVATE KEY-----
     \\b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABAm/7i1ie
@@ -213,7 +191,6 @@ test "an encrypted key needs its passphrase" {
     defer f.deinit(testing.allocator);
     try testing.expect(f.isEncrypted());
 
-    // The public key is readable without the passphrase.
     const want = try ssh.parseKeyText(ssh.ed25519, encrypted_public);
     try testing.expectEqual(want, f.public_key);
 
@@ -222,7 +199,6 @@ test "an encrypted key needs its passphrase" {
     const kp = try f.decrypt("correct horse");
     try testing.expectEqual(want, kp.public_key.toBytes());
 
-    // The key signs as its public key says.
     const sig = try kp.sign("data", null);
     try sig.verify("data", try .fromBytes(want));
 }
@@ -231,7 +207,6 @@ test "other files are rejected" {
     try testing.expectError(error.Malformed, PrivateKeyFile.parse(testing.allocator, "ssh-ed25519 " ++ plain_public));
     try testing.expectError(error.Malformed, PrivateKeyFile.parse(testing.allocator, begin_line ++ "\nnot base64\n" ++ end_line));
 
-    // A file holding an RSA key, with the private section left empty.
     var w: std.Io.Writer.Allocating = .init(testing.allocator);
     defer w.deinit();
     try w.writer.writeAll(magic);

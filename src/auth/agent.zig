@@ -1,9 +1,3 @@
-//! A client for the SSH agent protocol (draft-ietf-sshm-ssh-agent), over
-//! the socket in `SSH_AUTH_SOCK`.
-//!
-//! Each message is a u32 length, a type byte and a body. Calls block until
-//! the agent answers, which can take as long as the user takes to approve a
-//! signature.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -16,18 +10,14 @@ const sign_request = 13;
 const sign_response = 14;
 const failure = 5;
 
-/// Sign request flags. RSA keys sign with SHA-1 unless asked for SHA-2.
 pub const rsa_sha2_256: u32 = 2;
 pub const rsa_sha2_512: u32 = 4;
 
-/// OpenSSH's limit on an agent message (AGENT_MAX_LEN).
+// OpenSSH's limit on agent replies (MAX_AGENT_REPLY_LEN in authfd.c).
 const max_message = 256 * 1024;
 
 pub const Error = error{
-    /// The agent answered with a malformed or unexpected message.
     Protocol,
-    /// The agent refused, for example a key added with `ssh-add -h`
-    /// destination constraints or a signature the user declined.
     Refused,
 } || Allocator.Error || Io.net.Stream.Reader.Error || Io.net.Stream.Writer.Error;
 
@@ -46,12 +36,10 @@ pub const Agent = struct {
         a.stream.close(a.io);
     }
 
-    /// The agent's public key blobs. Keys of every type are included.
     pub fn identities(a: *Agent, gpa: Allocator) Error!Identities {
         const answer = try a.call(gpa, request_identities, &.{});
         errdefer gpa.free(answer);
 
-        // uint32 nkeys, then a key blob and a comment for each.
         var r: ssh.Reader = .init(answer);
         const count = r.uint32() catch return error.Protocol;
         var blobs: std.ArrayList([]const u8) = .empty;
@@ -66,16 +54,14 @@ pub const Agent = struct {
         return .{ .answer = answer, .blobs = try blobs.toOwnedSlice(gpa) };
     }
 
-    /// Signs `data` with the key whose blob is `key_blob`, an RSA key with
-    /// SHA-512. Returns the signature blob, owned by the caller.
     pub fn sign(a: *Agent, gpa: Allocator, key_blob: []const u8, data: []const u8) Error![]u8 {
         var body: Writer.Allocating = .init(gpa);
         defer body.deinit();
 
-        // string key_blob, string data, uint32 flags. Ed25519 ignores the
-        // flags.
         ssh.writeString(&body.writer, key_blob) catch return error.OutOfMemory;
         ssh.writeString(&body.writer, data) catch return error.OutOfMemory;
+        // Without the flag an agent signs with an RSA key using SHA-1 "ssh-rsa",
+        // which sshsig.verify refuses.
         body.writer.writeInt(u32, rsa_sha2_512, .big) catch return error.OutOfMemory;
 
         const answer = try a.call(gpa, sign_request, body.written());
@@ -87,8 +73,6 @@ pub const Agent = struct {
         return gpa.dupe(u8, sig);
     }
 
-    /// Sends a request and returns the body of a successful answer, owned
-    /// by the caller.
     fn call(a: *Agent, gpa: Allocator, request: u8, body: []const u8) Error![]u8 {
         var write_buf: [256]u8 = undefined;
         var sw = a.stream.writer(a.io, &write_buf);
@@ -104,12 +88,11 @@ pub const Agent = struct {
         const len = r.takeInt(u32, .big) catch |err| return readError(&sr, err);
         if (len == 0 or len > max_message) return error.Protocol;
         const kind = r.takeByte() catch |err| return readError(&sr, err);
+        // len counts the type byte.
         const answer = try gpa.alloc(u8, len - 1);
         errdefer gpa.free(answer);
         r.readSliceAll(answer) catch |err| return readError(&sr, err);
 
-        // Each request has one success type. Anything else is a refusal
-        // or an error.
         const expected: u8 = switch (request) {
             request_identities => identities_answer,
             sign_request => sign_response,
@@ -122,7 +105,6 @@ pub const Agent = struct {
 
     fn readError(sr: *Io.net.Stream.Reader, err: Io.Reader.Error) Error {
         return switch (err) {
-            // The agent closed the socket mid-answer.
             error.EndOfStream => error.Protocol,
             error.ReadFailed => sr.err.?,
         };
@@ -130,7 +112,6 @@ pub const Agent = struct {
 };
 
 pub const Identities = struct {
-    /// The agent's answer. `blobs` point into it.
     answer: []u8,
     blobs: []const []const u8,
 
@@ -141,19 +122,18 @@ pub const Identities = struct {
     }
 };
 
-/// An agent holding Ed25519 keys, and RSA keys from `test_rsa_key`, in
-/// memory, for tests. It serves one connection at a time on its own thread.
 pub const TestAgent = struct {
     io: Io,
     server: Io.net.Server,
     thread: std.Thread,
     keys: []const std.crypto.sign.Ed25519.KeyPair,
     rsa_keys: []const TestRsaKey = &.{},
-    /// Refuses sign requests while set.
     refuse: std.atomic.Value(bool) = .init(false),
     signatures: std.atomic.Value(u32) = .init(0),
     stopping: std.atomic.Value(bool) = .init(false),
 
+    /// Listens on path and starts the thread, which holds a pointer to agent.
+    /// agent must stay at its address until stop.
     pub fn start(agent: *TestAgent, io: Io, path: []const u8, keys: []const std.crypto.sign.Ed25519.KeyPair) !void {
         const address: Io.net.UnixAddress = try .init(path);
         agent.* = .{ .io = io, .server = try address.listen(io, .{}), .thread = undefined, .keys = keys };
@@ -161,9 +141,10 @@ pub const TestAgent = struct {
         agent.thread = try std.Thread.spawn(.{}, serve, .{agent});
     }
 
-    /// Wakes the thread with a connection that sends nothing.
     pub fn stop(agent: *TestAgent, path: []const u8) void {
         agent.stopping.store(true, .release);
+
+        // A connection wakes the thread from accept.
         const address = Io.net.UnixAddress.init(path) catch unreachable;
         if (address.connect(agent.io)) |s| s.close(agent.io) else |_| {}
         agent.thread.join();
@@ -221,8 +202,6 @@ pub const TestAgent = struct {
                     if (agent.refuse.load(.acquire) or (kp == null and rsa_key == null)) {
                         try aw.writeByte(failure);
                     } else if (rsa_key) |k| {
-                        // Without the SHA-512 flag a real agent signs with
-                        // SHA-1. This one refuses.
                         if (flags & rsa_sha2_512 == 0) {
                             try aw.writeByte(failure);
                         } else {
@@ -248,10 +227,7 @@ pub const TestAgent = struct {
     }
 };
 
-/// An RSA key for tests, from `ssh-keygen -t rsa -b 2048`: the private
-/// exponent signs, the rest is `ssh.test_rsa_text`.
 pub const TestRsaKey = struct {
-    /// Big-endian.
     n: []const u8,
     d: []const u8,
 
@@ -259,13 +235,13 @@ pub const TestRsaKey = struct {
         return ssh.parsePublicKeyText(ssh.rsa, ssh.test_rsa_text) catch unreachable;
     }
 
-    /// An `rsa-sha2-512` signature blob over `data` (RFC 8332): EM =
-    /// 0x00 0x01 0xff... 0x00 DigestInfo(SHA-512) H, raised to d mod n.
     fn sign(k: *const TestRsaKey, data: []const u8, out: []u8) ![]const u8 {
         const Sha512 = std.crypto.hash.sha2.Sha512;
         const M = std.crypto.ff.Modulus(4096);
         const len = k.n.len;
 
+        // EMSA-PKCS1-v1_5 (RFC 8017 section 9.2) is 0x00 0x01, 0xff padding,
+        // 0x00, SHA-512's DER DigestInfo prefix and the digest.
         const digest_info = [_]u8{ 0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03, 0x05, 0x00, 0x04, 0x40 };
         var em_buf: [512]u8 = undefined;
         const em = em_buf[0..len];

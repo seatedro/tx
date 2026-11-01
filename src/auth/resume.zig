@@ -1,26 +1,21 @@
-//! Resuming a session without logging in again.
-//!
-//! Each attach gives the client a new resume key for its session, which
-//! the client keeps in memory. A client that lost its connection proves it
-//! holds the key on the new connection with
-//!
-//!     HMAC-SHA256(key, exporter || session_id)
-//!
-//! where `exporter` is the new connection's TLS exporter value for
-//! `exporter_label` and `session_id` is a big-endian u64. The key never
-//! crosses the network again, and a proof is valid for one connection.
-//! Attaching replaces the session's key, so after another client attaches
-//! the old key no longer resumes the session.
+//! The proof a client gives to resume its session on a new connection. The
+//! session sends the client a fresh random key in Attached each time the client
+//! attaches or resumes, and the proof is an HMAC under the latest key. txd lets
+//! Resume through before login, and the session process's check of the proof
+//! authenticates the client.
+
 const std = @import("std");
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 
 pub const key_len = 32;
 pub const proof_len = HmacSha256.mac_length;
 
-/// The TLS exporter label (RFC 8446 §7.5), with an empty context.
+/// The TLS exporter label for the exporter a proof covers. txd exports it on
+/// the resuming connection and hands it to the session in Connect.
 pub const exporter_label = "EXPORTER-tx-resume";
 pub const exporter_len = 32;
 
+/// HMAC-SHA256 under key of exporter followed by session_id as a big-endian u64.
 pub fn proof(key: *const [key_len]u8, exporter: *const [exporter_len]u8, session_id: u64) [proof_len]u8 {
     var mac: HmacSha256 = .init(key);
     mac.update(exporter);
@@ -32,7 +27,8 @@ pub fn proof(key: *const [key_len]u8, exporter: *const [exporter_len]u8, session
     return out;
 }
 
-/// Checks a proof in constant time.
+/// Compares got with proof() in constant time. A proof of the wrong length
+/// fails.
 pub fn verify(key: *const [key_len]u8, exporter: *const [exporter_len]u8, session_id: u64, got: []const u8) bool {
     if (got.len != proof_len) return false;
     const want = proof(key, exporter, session_id);

@@ -1,13 +1,3 @@
-//! The clipboard server on a Unix socket, on the loop.
-//!
-//! Linux only. The loop says when a socket is readable or writable, with
-//! its poll operation, which macOS's kqueue backend lacks; reads and
-//! writes are then plain `recvmsg` and `sendmsg` on non-blocking sockets,
-//! so that they carry file descriptors.
-//!
-//! A program's socket is freed only in one of its own poll callbacks,
-//! once neither poll is in flight. Closing it shuts the socket down, which
-//! ends both.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
@@ -24,18 +14,17 @@ const fd_t = posix.fd_t;
 
 const log = std.log.scoped(.wayland);
 
-/// The most descriptors one `sendmsg` carries, as libwayland's
-/// `MAX_FDS_OUT`. A message carries at most one.
+// libwayland's MAX_FDS_OUT. libwayland sends at most this many descriptors
+// per sendmsg, and has room for this many in a recvmsg.
 const max_fds_per_send = 28;
 
-/// Control data with room for `count` descriptors: `CMSG_SPACE`.
+// CMSG_SPACE for count descriptors.
 fn controlLen(count: usize) usize {
     return @sizeOf(linux.cmsghdr) + std.mem.alignForward(usize, count * @sizeOf(fd_t), linux.cmsg_align);
 }
 
 pub const Error = error{
     NameTooLong,
-    /// Another server listens on the path.
     AddressInUse,
     SystemResources,
     Unexpected,
@@ -51,8 +40,8 @@ pub const Listener = struct {
     clients: std.ArrayList(*Client) = .empty,
     closing: bool = false,
 
-    /// Listens at `path`, replacing a socket there that nothing listens
-    /// on, left by an earlier txd.
+    /// Listens at path and starts accepting. A socket file there that refuses
+    /// connections is removed first.
     pub fn create(gpa: Allocator, loop: *xev.Loop, path: []const u8, backend: Backend) Error!*Listener {
         const fd = try listen(path);
         errdefer closeFd(fd);
@@ -62,9 +51,8 @@ pub const Listener = struct {
         return l;
     }
 
-    /// Closes every program's connection and the socket. The listener is
-    /// freed once the loop has run their last callbacks, and calls the
-    /// backend no more.
+    /// Stops accepting and closes every connection. The backend isn't called
+    /// after close. The Listener frees itself on the loop once its polls end.
     pub fn close(l: *Listener) void {
         if (l.closing) return;
         l.closing = true;
@@ -74,20 +62,16 @@ pub const Listener = struct {
         l.freeIfDone();
     }
 
-    /// See `Server.setClipboard`.
     pub fn setClipboard(l: *Listener, mimes: ?[]const []const u8) Allocator.Error!void {
         defer l.flush();
         return l.server.setClipboard(mimes);
     }
 
-    /// See `Server.read`.
     pub fn read(l: *Listener, selection: Selection, mime: []const u8, fd: fd_t) bool {
         defer l.flush();
         return l.server.read(selection, mime, fd);
     }
 
-    /// Sends what every connection has queued. The server can queue events
-    /// for any connection, whichever's request it handles.
     fn flush(l: *Listener) void {
         for (l.clients.items) |client| client.flush();
     }
@@ -114,8 +98,6 @@ pub const Listener = struct {
         return .disarm;
     }
 
-    /// Accepts a waiting connection. False when none is waiting, or after
-    /// a failure that waiting can't fix.
     fn acceptOne(l: *Listener) bool {
         const rc = linux.accept4(l.fd, null, null, linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC);
         switch (linux.errno(rc)) {
@@ -129,8 +111,6 @@ pub const Listener = struct {
         }
         const fd: fd_t = @intCast(rc);
 
-        // Only the user's own programs. The socket's directory is the
-        // user's alone, so this is a second check.
         if (!sameUser(fd)) {
             log.warn("refused a program of another user", .{});
             closeFd(fd);
@@ -158,18 +138,19 @@ fn closeFetch(_: ?*anyopaque, _: []const u8, fd: fd_t) void {
 
 fn ignoreCopy(_: ?*anyopaque, _: Selection, _: ?[]const []const u8) void {}
 
-/// A program's connection.
+// One program's socket. It is freed by freeIfDone, from a poll callback, once
+// it is closing and neither poll is pending.
 const Client = struct {
     listener: *Listener,
     conn: *Connection,
     fd: fd_t,
-    /// Received bytes that don't make a whole request yet. A request is at
-    /// most `wire.max_message_len`, so one always fits after a whole one.
+    // The bytes the Connection leaves are part of one message, under
+    // max_message_len, and recvmsg always has room after them. With no room it
+    // would return 0, which reads as EOF.
     in: [2 * wire.max_message_len]u8 = undefined,
     in_len: usize = 0,
     read_c: xev.Completion = .{},
     write_c: xev.Completion = .{},
-    /// A poll is in flight, or its callback is running.
     reading: bool = false,
     writing: bool = false,
     closing: bool = false,
@@ -203,17 +184,14 @@ const Client = struct {
             if (!client.receive()) break;
         }
 
-        // A connection that failed has its error queued, and takes no
-        // more requests. Reading stops until it closes.
         const again = !client.closing and !client.conn.failed;
         if (!again) client.reading = false;
+        // Requests can queue events on any connection.
         l.flush();
         if (!again) client.freeIfDone();
         return if (again) .rearm else .disarm;
     }
 
-    /// Reads what's waiting and handles the requests it completes. False
-    /// once nothing is waiting, or the connection closed.
     fn receive(client: *Client) bool {
         var iov = [_]posix.iovec{.{ .base = client.in[client.in_len..].ptr, .len = client.in.len - client.in_len }};
         var control: [controlLen(max_fds_per_send)]u8 align(@alignOf(linux.cmsghdr)) = undefined;
@@ -237,7 +215,6 @@ const Client = struct {
             },
         }
 
-        // Descriptors first: the requests read here may take them.
         if (!client.takeFds(&msg)) {
             client.close();
             return false;
@@ -254,11 +231,14 @@ const Client = struct {
         return true;
     }
 
-    /// Moves the descriptors in `msg`'s control data to the connection.
-    /// False if they were cut short or are too many to keep.
+    // Queues the received descriptors on the Connection, up to
+    // max_pending_fds. Returns false if any was lost, after closing those it
+    // didn't queue.
     fn takeFds(client: *Client, msg: *const linux.msghdr) bool {
         var ok = msg.flags & linux.MSG.CTRUNC == 0;
         const control: [*]align(@alignOf(linux.cmsghdr)) const u8 = @ptrCast(@alignCast(msg.control.?));
+
+        // CMSG_FIRSTHDR and CMSG_NXTHDR.
         var offset: usize = 0;
         while (offset + @sizeOf(linux.cmsghdr) <= msg.controllen) {
             const header: *const linux.cmsghdr = @ptrCast(@alignCast(control + offset));
@@ -268,8 +248,6 @@ const Client = struct {
                 const count = data.len / @sizeOf(fd_t);
                 for (0..count) |i| {
                     const fd = std.mem.readInt(fd_t, data[i * @sizeOf(fd_t) ..][0..@sizeOf(fd_t)], .native);
-                    // Over the limit, or out of memory: the descriptors
-                    // close, and so does the connection.
                     if (!ok or client.conn.fds.len >= server_pkg.max_pending_fds) {
                         closeFd(fd);
                         ok = false;
@@ -286,26 +264,19 @@ const Client = struct {
         return ok;
     }
 
-    /// Sends what the connection has queued, as far as the socket takes
-    /// it, and waits for room for the rest.
     fn flush(client: *Client) void {
         if (client.closing or client.writing) return;
         const out = &client.conn.out;
         while (out.bytes.items.len > 0) {
             if (!client.sendSome()) return;
         }
-        // A connection that failed closes once its error is sent.
         if (client.conn.failed) client.close();
     }
 
-    /// One `sendmsg`. False if the socket is full, now waited on, or the
-    /// connection closed.
     fn sendSome(client: *Client) bool {
         const out = &client.conn.out;
         const iov = [_]posix.iovec_const{.{ .base = out.bytes.items.ptr, .len = out.bytes.items.len }};
 
-        // Descriptors go with the first bytes still to send, and so arrive
-        // before the message that carries them.
         const count = @min(out.fds.items.len, max_fds_per_send);
         var control: [controlLen(max_fds_per_send)]u8 align(@alignOf(linux.cmsghdr)) = undefined;
         var control_len: usize = 0;
@@ -338,7 +309,7 @@ const Client = struct {
             },
         }
 
-        // The program has its own copies of the descriptors now.
+        // The program has its own copies now.
         for (out.fds.items[0..count]) |fd| closeFd(fd);
         out.fds.replaceRangeAssumeCapacity(0, count, &.{});
         out.bytes.replaceRangeAssumeCapacity(0, rc, &.{});
@@ -364,12 +335,12 @@ const Client = struct {
         return .disarm;
     }
 
-    /// Shuts the socket down, which ends the polls in flight. The client
-    /// is freed in the last of their callbacks. With none in flight, a
-    /// read poll is started for that.
     fn close(client: *Client) void {
         if (client.closing) return;
         client.closing = true;
+        // shutdown ends the pending polls. With none pending, a read poll is
+        // started, so the client is freed from its callback after the caller
+        // returns.
         _ = linux.shutdown(client.fd, linux.SHUT.RDWR);
         if (!client.reading and !client.writing) client.startRead();
     }
@@ -380,16 +351,16 @@ const Client = struct {
         const index = std.mem.indexOfScalar(*Client, l.clients.items, client).?;
         _ = l.clients.swapRemove(index);
 
-        // Its sources leave the selections, which other programs hear of.
         l.server.disconnect(client.conn);
         closeFd(client.fd);
         l.gpa.destroy(client);
+        // Disconnecting can clear a selection, which queues events on the
+        // other connections.
         l.flush();
         l.freeIfDone();
     }
 };
 
-/// A non-blocking socket listening at `path`.
 fn listen(path: []const u8) Error!fd_t {
     var address: linux.sockaddr.un = .{ .family = linux.AF.UNIX, .path = @splat(0) };
     if (path.len >= address.path.len) return error.NameTooLong;
@@ -403,8 +374,8 @@ fn listen(path: []const u8) Error!fd_t {
     for (0..2) |_| {
         switch (linux.errno(linux.bind(fd, @ptrCast(&address), @sizeOf(linux.sockaddr.un)))) {
             .SUCCESS => break,
-            // A socket that nothing listens on is left from a txd that
-            // ended. One that answers is another server's.
+            // A socket file that refuses connections is left by a server that
+            // is gone. It is removed and bound again.
             .ADDRINUSE => {
                 if (listening(&address)) return error.AddressInUse;
                 var buf: [std.fs.max_path_bytes:0]u8 = undefined;
@@ -421,7 +392,6 @@ fn listen(path: []const u8) Error!fd_t {
     return fd;
 }
 
-/// Whether something accepts connections at `address`.
 fn listening(address: *const linux.sockaddr.un) bool {
     const rc = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
     if (linux.errno(rc) != .SUCCESS) return true;
@@ -431,6 +401,7 @@ fn listening(address: *const linux.sockaddr.un) bool {
 }
 
 fn sameUser(fd: fd_t) bool {
+    // struct ucred from <sys/socket.h>.
     const Ucred = extern struct { pid: linux.pid_t, uid: linux.uid_t, gid: linux.gid_t };
     var cred: Ucred = undefined;
     var len: linux.socklen_t = @sizeOf(Ucred);
@@ -445,9 +416,6 @@ fn closeFd(fd: fd_t) void {
 const testing = std.testing;
 const Io = std.Io;
 
-/// The listener's loop on a thread, with the user's clipboard held in
-/// memory. Tests run code on the thread through `call`. io_uring cancels a
-/// thread's requests when the thread exits, so it runs until `stop`.
 const TestServer = struct {
     loop: xev.Loop,
     listener: *Listener = undefined,
@@ -457,9 +425,7 @@ const TestServer = struct {
     pending: std.atomic.Value(?*const Call) = .init(null),
     done: std.atomic.Value(bool) = .init(false),
     stopping: bool = false,
-    /// The user's clipboard, as one text.
     text: []const u8 = "",
-    /// The types of the last copy a program made, one per line.
     copied: std.ArrayList(u8) = .empty,
 
     const Call = struct {
@@ -487,7 +453,6 @@ const TestServer = struct {
         return if (ts.stopping) .disarm else .rearm;
     }
 
-    /// Runs `c` on the loop's thread, and waits for it.
     fn call(ts: *TestServer, c: Call) void {
         ts.done.store(false, .release);
         ts.pending.store(&c, .release);
@@ -508,7 +473,6 @@ const TestServer = struct {
         ts.copied.deinit(testing.allocator);
     }
 
-    /// Writes the clipboard's text, at once: tests copy little.
     fn fetch(context: ?*anyopaque, _: []const u8, fd: fd_t) void {
         const ts: *TestServer = @ptrCast(@alignCast(context.?));
         _ = linux.write(fd, ts.text.ptr, ts.text.len);
@@ -523,8 +487,6 @@ const TestServer = struct {
     }
 };
 
-/// Runs a wl-clipboard tool against the server at `path`, and returns
-/// its output. A host without wl-clipboard skips the test.
 fn tool(environ: *const std.process.Environ.Map, argv: []const []const u8) ![]u8 {
     const result = std.process.run(testing.allocator, testing.io, .{
         .argv = argv,
@@ -544,8 +506,6 @@ fn tool(environ: *const std.process.Environ.Map, argv: []const []const u8) ![]u8
     return result.stdout;
 }
 
-/// Runs wl-copy, which leaves a process of its own in the background to
-/// serve the copy. That process keeps the output open, so it isn't read.
 fn copy(environ: *const std.process.Environ.Map, argv: []const []const u8) !void {
     var child = std.process.spawn(testing.io, .{
         .argv = argv,
@@ -574,7 +534,6 @@ test "wl-paste reads the user's clipboard, and wl-copy's copies reach the user a
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "{s}/wayland-1", .{dir});
 
-    // An absolute WAYLAND_DISPLAY is the socket's path.
     var environ: std.process.Environ.Map = .init(testing.allocator);
     defer environ.deinit();
     try environ.put("PATH", testing.environ.getPosix("PATH") orelse "/usr/bin:/bin");
@@ -585,7 +544,6 @@ test "wl-paste reads the user's clipboard, and wl-copy's copies reach the user a
     try ts.start(path);
     defer ts.stop();
 
-    // The user's clipboard.
     ts.call(.{ .run = struct {
         fn f(s: *TestServer, _: ?*anyopaque) void {
             s.text = "from the laptop";
@@ -595,13 +553,10 @@ test "wl-paste reads the user's clipboard, and wl-copy's copies reach the user a
     try expectTool(&environ, &.{ "wl-paste", "--list-types" }, "text/plain;charset=utf-8\ntext/plain\n");
     try expectTool(&environ, &.{ "wl-paste", "--no-newline" }, "from the laptop");
 
-    // A copy. wl-copy serves it from a process of its own, in the
-    // background.
     try copy(&environ, &.{ "wl-copy", "from a program" });
     try testing.expect(std.mem.indexOf(u8, ts.copied.items, "text/plain\n") != null);
     try expectTool(&environ, &.{ "wl-paste", "--no-newline" }, "from a program");
 
-    // txd reads it as other programs do.
     const fds = try pipe();
     defer closeFd(fds[0]);
     const Read = struct {
@@ -624,12 +579,9 @@ test "wl-paste reads the user's clipboard, and wl-copy's copies reach the user a
     }
     try testing.expectEqualStrings("from a program", got[0..len]);
 
-    // The primary selection stays among programs.
     try copy(&environ, &.{ "wl-copy", "--primary", "selected" });
     try expectTool(&environ, &.{ "wl-paste", "--primary", "--no-newline" }, "selected");
 
-    // The user's clipboard replaces the copy, and the background wl-copy
-    // is told it can exit.
     ts.call(.{ .run = struct {
         fn f(s: *TestServer, _: ?*anyopaque) void {
             s.text = "newer";

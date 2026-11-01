@@ -1,5 +1,3 @@
-# Ignore everything by default; allow only what belongs in the repo.
-# Rules are anchored to the root so they never match inside zig-pkg/.
 *
 !*/
 

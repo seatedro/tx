@@ -1,4 +1,3 @@
-//! The `tx` client's side of the user's terminal.
 pub const tty = @import("tty.zig");
 pub const escape = @import("escape.zig");
 pub const session = @import("session.zig");
@@ -25,7 +24,6 @@ test {
     _ = report;
     _ = clipboard;
     _ = pasteboard;
-    // Analyzes the transport and crypto modules, whose exports the linked
-    // C code needs.
+    // No test here calls run; referencing it gets it compiled.
     _ = &session.run;
 }

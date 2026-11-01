@@ -1,12 +1,8 @@
-//! ssh's escape sequences over the bytes read from the user's terminal.
-//!
-//! The escape character is recognized after a carriage return or line feed
-//! and at the start of input. `~.` disconnects and `~~` forwards one `~`.
-//! Any other byte after `~` is forwarded along with the `~`.
-//!
-//! With the Kitty keyboard protocol's report-all-keys flag set, the terminal
-//! encodes `~` and Enter as CSI sequences, and escapes are not recognized.
-//! ssh has the same limitation.
+//! ssh's escape sequences in typed input. The escape character at the start
+//! of a line is held back. A '.' after it returns .disconnect, a second
+//! escape character sends one, and any other byte sends both. session.zig
+//! passes the terminal Reader's input through an Escape.
+
 const std = @import("std");
 const assert = std.debug.assert;
 
@@ -14,32 +10,30 @@ pub const Action = enum {
     disconnect,
 };
 
+/// forward is the input to send, a slice of feed's out. With an action, the
+/// input after the sequence is dropped.
 pub const Result = struct {
-    /// A prefix of the `out` passed to `feed`.
     forward: []u8,
-    /// Input after the escape that produced an action was not processed.
     action: ?Action = null,
 };
 
 pub const Escape = struct {
-    /// Null disables escapes, like ssh's `EscapeChar none`.
+    /// null turns escapes off.
     char: ?u8 = '~',
     state: State = .line_start,
 
     const State = enum {
         line_start,
         mid_line,
-        /// The escape character was read at the start of a line and not
-        /// forwarded.
         pending,
     };
 
-    /// Asserts `out.len >= input.len + 1`. A pending escape character from
-    /// the previous call can be forwarded with the first byte of `input`.
+    /// out must hold input.len + 1 bytes, since a held escape character
+    /// comes out with the byte after it. The state carries over between
+    /// calls.
     pub fn feed(e: *Escape, input: []const u8, out: []u8) Result {
         assert(out.len >= input.len + 1);
 
-        // Escapes are off: forward everything.
         const char = e.char orelse {
             @memcpy(out[0..input.len], input);
             return .{ .forward = out[0..input.len] };
@@ -48,8 +42,6 @@ pub const Escape = struct {
         var len: usize = 0;
         for (input) |byte| {
             switch (e.state) {
-                // Hold back an escape character at the start of a line until
-                // the next byte shows what it is.
                 .line_start => if (byte == char) {
                     e.state = .pending;
                     continue;
@@ -63,9 +55,6 @@ pub const Escape = struct {
                         return .{ .forward = out[0..len], .action = .disconnect };
                     }
 
-                    // `~~` forwards one `~`. Any other byte forwards the held
-                    // `~` before it. This is the one place `out` gains a byte
-                    // over `input`.
                     if (byte != char) {
                         out[len] = char;
                         len += 1;

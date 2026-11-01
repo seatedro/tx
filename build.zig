@@ -2,14 +2,8 @@ const std = @import("std");
 const ngtcp2_build = @import("src/build/ngtcp2.zig");
 const picotls_build = @import("src/build/picotls.zig");
 
-/// The version in build.zig.zon. Builds other than `zig build release`
-/// add `-dev`. `-Dversion` gives another, as nightly releases and the Nix
-/// package do.
 const version = @import("build.zig.zon").version;
 
-/// The platforms `zig build release` builds for. `os` and `arch` are the
-/// names of `std.Target.Os.Tag` and `std.Target.Cpu.Arch`. Linux builds are
-/// static, so that they run on any distribution.
 const release_targets = [_]struct { query: std.Target.Query, os: []const u8, arch: []const u8 }{
     .{ .query = .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl }, .os = "linux", .arch = "x86_64" },
     .{ .query = .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .musl }, .os = "linux", .arch = "aarch64" },
@@ -34,8 +28,6 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     const test_network_step = b.step("test-network", "Run unit tests, including ones that need the internet");
 
-    // For the fuzz tests. One module, since a test build may reach it
-    // through more than one of its modules.
     const fuzz = b.createModule(.{ .root_source_file = b.path("src/fuzz.zig") });
 
     const crypto_tests = b.addTest(.{
@@ -95,11 +87,6 @@ pub fn build(b: *std.Build) void {
     wayland_tests.root_module.addImport("fuzz", fuzz);
     addTestRuns(b, wayland_tests, test_step, test_network_step);
 
-    // The tests with fuzz tests that `--fuzz` can build. Under it, C code
-    // doesn't link and ghostty-vt's build makes a Unicode table that
-    // doesn't compile, so the end-to-end tests are left out. They build
-    // with LLVM, which adds the fuzzer's instrumentation; the x86_64
-    // backend Debug builds use doesn't.
     const fuzz_step = b.step("fuzz", "Run the fuzz tests of what a client reaches before login and of the Wayland wire format; with --fuzz, fuzz them");
     for ([_]struct { []const u8, *std.Build.Module }{
         .{ "proto-fuzz", protoModule(b, target, optimize) },
@@ -108,6 +95,7 @@ pub fn build(b: *std.Build) void {
     }) |entry| {
         const name, const module = entry;
         module.addImport("fuzz", fuzz);
+        // --fuzz needs coverage instrumentation, which the LLVM backend provides.
         const tests = b.addTest(.{ .name = name, .root_module = module, .use_llvm = true });
         fuzz_step.dependOn(&b.addRunArtifact(tests).step);
     }
@@ -154,8 +142,6 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(txd_bin);
     addTestRuns(b, b.addTest(.{ .name = "txd-test", .root_module = txd }), test_step, test_network_step);
 
-    // The end-to-end tests run a server and clients in one process. The
-    // sessions run in txd processes.
     const e2e = b.createModule(.{
         .root_source_file = b.path("src/e2e_test.zig"),
         .target = target,
@@ -177,9 +163,6 @@ pub fn build(b: *std.Build) void {
     e2e.addImport("build_options", e2e_options.createModule());
     addTestRuns(b, b.addTest(.{ .name = "e2e-test", .root_module = e2e }), test_step, test_network_step);
 
-    // `zig build release` makes `tx-VERSION-OS-ARCH.tar.gz` in
-    // zig-out/release for each release platform, with tx, txd, the license
-    // and the README in a directory of the same name.
     const release_step = b.step("release", "Build tx and txd for every release platform");
     const release_version = version_option orelse version;
     const release_info = buildInfo(b, release_version);
@@ -198,6 +181,8 @@ pub fn build(b: *std.Build) void {
         const tx_exe = b.addExecutable(.{ .name = "tx", .root_module = txModule(b, rt_target, .ReleaseSafe, rt_app, release_info) });
         tx_exe.root_module.strip = true;
 
+        // tx-VERSION-OS-ARCH names the asset and its top directory, as
+        // install.sh expects.
         const name = b.fmt("tx-{s}-{s}-{s}", .{ release_version, rt.os, rt.arch });
         const tarball = b.addRunArtifact(tarball_tool);
         const out = tarball.addOutputFileArg(b.fmt("{s}.tar.gz", .{name}));
@@ -214,7 +199,6 @@ pub fn build(b: *std.Build) void {
     }
 }
 
-/// `build_options`, with the version.
 fn buildInfo(b: *std.Build, version_text: []const u8) *std.Build.Module {
     const options = b.addOptions();
     options.addOption([]const u8, "version", version_text);
@@ -224,7 +208,6 @@ fn buildInfo(b: *std.Build, version_text: []const u8) *std.Build.Module {
 const Libraries = struct {
     ghostty_vt: *std.Build.Module,
     transport: TransportLibs,
-    /// The wake pipe, shared by the client's threads and the session host.
     wake: *std.Build.Module,
 };
 
@@ -265,8 +248,6 @@ fn libraries(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     };
 }
 
-/// One instance of each module for the executables and the end-to-end
-/// test, so that they share their dependencies' code and globals.
 const AppModules = struct {
     xev: *std.Build.Module,
     term: *std.Build.Module,
@@ -515,8 +496,6 @@ fn cryptoModule(
     return mod;
 }
 
-/// `test_network_step` sets `TX_TEST_NETWORK`, which enables the tests that
-/// need the internet.
 fn addTestRuns(
     b: *std.Build,
     tests: *std.Build.Step.Compile,
@@ -542,8 +521,9 @@ fn transportModule(
     optimize: std.builtin.OptimizeMode,
     libs: TransportLibs,
 ) *std.Build.Module {
-    // picotls's headers are left out because its structs use bitfields,
-    // which translate-c can't express. Only tls.c includes them.
+    // Module `c` is the translation of src/transport/c.h. A TranslateC step
+    // links no libraries, so ngtcp2's installed headers come from the include
+    // trees the libraries emit.
     const c = b.addTranslateC(.{
         .root_source_file = b.path("src/transport/c.h"),
         .target = target,

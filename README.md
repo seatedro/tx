@@ -1,118 +1,87 @@
 # tx
 
-A remote terminal, meant to replace ssh and mosh, built on QUIC and
-[libghostty-vt](https://github.com/ghostty-org/ghostty). Sessions keep
-running on the server, survive network changes and sleep, and can be
+A remote terminal on QUIC and libghostty-vt, meant to replace ssh and mosh.
+Sessions run on the server, survive network changes and sleep, and can be
 reattached from anywhere.
 
-tx is early and changes often. Don't rely on it yet.
+tx is early and changes often.
 
 ## Install
 
-Each night that main changes, it is published as a release,
-`0.0.0-nightly.YYYYMMDD`. To install tx and txd from the latest in
-`~/.local/bin`, on Linux or macOS:
-
     curl -fsSL https://github.com/seatedro/tx/releases/latest/download/install.sh | sh
 
-On a machine that tx connects to, add `--txd`, which keeps txd running as a
-service for your user. Run it again to upgrade; sessions keep running.
+This puts tx and txd in `~/.local/bin`. On a machine you connect to, add
+`--txd` to also run txd as a user service. Run it again to upgrade.
 
     curl -fsSL https://github.com/seatedro/tx/releases/latest/download/install.sh | sh -s -- --txd
 
-With Nix, the flake's package has tx and txd, built from main:
+Releases are nightly builds of main for Linux and macOS, on x86_64 and aarch64.
 
-    nix profile install github:seatedro/tx
+With Nix, the flake has a package and a home-manager module:
 
-Its home-manager module runs txd as a service, as `--txd` does. On Linux,
-the service runs from boot only with lingering on:
-`users.users.NAME.linger = true` on NixOS, or `loginctl enable-linger`.
+```nix
+# inputs.tx.url = "github:seatedro/tx";
+imports = [ inputs.tx.homeModules.default ];
+services.txd = { enable = true; listen = "tailnet"; };
+```
 
-    # inputs.tx.url = "github:seatedro/tx";
-    imports = [ inputs.tx.homeModules.default ];
-    services.txd = {
-      enable = true;
-      listen = "tailnet"; # optional; see Server
-    };
+On Linux the service starts at boot only with lingering on
+(`loginctl enable-linger`).
 
 ## Use
 
-    tx [USER@]HOST          # attach the detached session, or start one
-    tx --new HOST           # start another session
-    tx --list HOST          # list sessions
-    tx --attach ID HOST     # attach session ID
-    tx --kill ID HOST       # end session ID
-    tx HOST COMMAND...      # run COMMAND, as ssh does
-    tx -t HOST COMMAND...   # run COMMAND on a terminal, as ssh -t does
+```sh
+tx host               # attach to the detached session, or start one
+tx --new host         # start another session
+tx --list host        # list sessions
+tx --attach 3 host    # attach to session 3
+tx --kill 3 host      # end session 3
+tx host make test     # run a command, as ssh does
+tx -t host htop       # run a command on a terminal, in a new session
+```
 
-tx takes ssh's options, read as ssh reads them, so tools that run ssh can
-run tx: `GIT_SSH_COMMAND=tx git clone ssh://host/repo`, `rsync -e tx`. `-p`
-is txd's port. Options for features tx lacks, such as `-L`, are refused.
+`~.` detaches. tx takes ssh's options and reads `~/.ssh/config`, so git and
+rsync can use it: `GIT_SSH_COMMAND=tx git clone host:repo`, `rsync -e tx`.
+Options for features tx lacks, such as `-L`, are refused.
 
-tx reads ssh's config itself, after its own, `~/.config/tx/config`, which
-has the same format, so `tx pulsar` reaches what `ssh pulsar` does. From
-both it takes `Host`, `Match`, `Include`, `HostName`, `User`,
-`IdentityFile`, `IdentitiesOnly`, `IdentityAgent` and `ProxyJump`, and from
-tx's alone, `Port`, since the port in ssh's is sshd's. `-F` names another
-ssh config. tx can't go through a `ProxyJump` host yet; it warns, and
-connects directly.
+`-p` is txd's port, 8739 by default. A `Port` line counts only in
+`~/.config/tx/config`, which tx reads before `~/.ssh/config`, in the same
+format.
 
-`~.` detaches. A new session gets the client's `TERM`, `COLORTERM`, `LANG`
-and `LC_*`, and the terminfo entry for its `TERM`, so `xterm-ghostty` and
-`xterm-kitty` work on hosts whose ncurses lacks them. txd compiles the entry
-with the host's `tic`; without it, the session's `TERM` is `xterm-256color`.
+## Logging in
 
-tx logs in with the same keys as ssh: the SSH agent's Ed25519 and RSA keys,
-then the `IdentityFile`s, or else `~/.ssh/id_ed25519`. txd accepts the keys
-in `~/.ssh/authorized_keys`.
-Without a user from `-l`, the destination or ssh's config, tx names none,
-and txd logs you in to the account it runs as.
+tx logs in with the SSH agent's keys, then the Ed25519 key files `-i` or
+IdentityFile name, `~/.ssh/id_ed25519` by default. txd accepts the keys in
+`~/.config/tx/authorized_keys`, or else `~/.ssh/authorized_keys`, and logs you
+in to the account it runs as.
 
-The first time tx connects to a host, it shows the host's key fingerprint
-and asks whether to trust it, as ssh does. `txd --install` prints the same
-fingerprint on the host. tx trusts the key without asking when
-`~/.ssh/known_hosts` lists it for the host, or when Tailscale says the host
-is one of your own nodes: yours, and not tagged. tx records the key in
-`~/.config/tx/known_hosts`.
-
-### Clipboard
-
-On a Linux host, programs share the clipboard of the Mac you run tx on,
-text and images: txd runs a Wayland server that does only the clipboard,
-and sessions get `WAYLAND_DISPLAY`. Ctrl-V of a screenshot in Claude Code or
-Codex works as it does locally. Claude Code needs wl-clipboard on the host.
-
-Programs read the clipboard only within 5 seconds of a paste: Ctrl-V, or
-any paste into the terminal. Other reads, such as Neovim's `"+p`, get
-nothing. Copies on the host, such as Neovim's `"+y`, go to the Mac's
-clipboard. Nothing is shared while the pasteboard holds what a password
-manager marked as concealed.
+The first time tx connects to a host, it asks whether to trust txd's key, as
+ssh does, unless `~/.ssh/known_hosts` lists the key or Tailscale says the host
+is one of your untagged nodes. Trusted keys go in `~/.config/tx/known_hosts`.
 
 ## Server
 
-txd runs on the host as your user. `install.sh --txd` sets it up as a user
-service: systemd on Linux, launchd on macOS, or a background process
-elsewhere. `txd --uninstall` ends the host's sessions, and removes the
-service and txd's files. tx never runs ssh, and never installs anything on
-a host.
+txd runs as your user on UDP port 8739. If Tailscale is up when it starts, it
+listens only on tailnet addresses and loopback. `--listen` picks other
+addresses.
 
-Each session runs in a process of its own, so a restart or upgrade of txd
-leaves sessions running, and attached clients reconnect to the new txd.
+`txd --install` runs txd as a systemd user service or a launchd agent.
+`txd --uninstall` ends the sessions and removes the service and txd's files,
+the host key included. Each session is a process of its own, so a restart or
+upgrade of txd leaves sessions running.
 
-On a machine where Tailscale is up, txd listens only on its tailnet
-addresses and loopback, so that only your tailnet reaches it. Elsewhere it
-listens on every address. The port is 8739, on UDP. `txd --listen` picks
-the addresses: `tailnet`, or an address and port.
+On Linux, programs in a session share the clipboard of the Mac running tx,
+through a Wayland server that only does the clipboard. They can read it only
+within 5 seconds of a paste.
 
 ## Build
 
 Needs Zig 0.17.0, or `nix develop`.
 
-    zig build               # zig-out/bin/tx and zig-out/bin/txd
+    zig build            # zig-out/bin/tx and zig-out/bin/txd
     zig build test
-    zig build fuzz --fuzz   # fuzz what a client reaches before it logs in, and Wayland's wire format
-    zig build release       # static Linux and macOS builds in zig-out/release
-    nix build               # result/bin/tx and result/bin/txd
+    zig build release    # release tarballs in zig-out/release
+    nix build            # result/bin/tx and result/bin/txd
 
 ## License
 

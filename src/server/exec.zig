@@ -1,18 +1,3 @@
-//! A command a client runs with `proto.Exec`: the user's shell runs it with
-//! `-c`, its stdin, stdout and stderr on sockets (`session.pty.Pipes`).
-//!
-//! Its stdout and stderr go to the client on two unidirectional streams,
-//! each ended at its socket's end of file. The client's side of a
-//! bidirectional stream is its stdin, and that side's end shuts the stdin
-//! socket. An output socket isn't read while its stream has more than
-//! `high_water` bytes the client hasn't acknowledged, and stdin's flow
-//! control credit returns once the command has taken the bytes.
-//!
-//! A thread waits for the command to exit. The loop then reaps it, closes
-//! its stdin, and reports `Exit`. If the connection closes first, the
-//! sockets are shut down: the command sees the end of its stdin, and EPIPE
-//! when it writes. An `Exec` frees itself once the command has exited and
-//! its sockets are closed.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
@@ -28,16 +13,12 @@ const Term = session.pty.Term;
 
 const log = std.log.scoped(.exec);
 
-/// Bytes an output stream may have unacknowledged before its socket waits,
-/// and the level it reads again at.
 const high_water = 1 << 20;
 const low_water = 256 << 10;
 
-/// The most bytes read from an output socket at once.
 const read_size = 64 << 10;
 
 pub const Options = struct {
-    /// The user's shell, which runs `command` with `-c`.
     shell: []const u8,
     command: []const u8,
     environ: *const std.process.Environ.Map,
@@ -46,14 +27,9 @@ pub const Options = struct {
 };
 
 pub const Handler = struct {
-    /// The client's, until `detach`.
     client: *anyopaque,
-    /// The command exited. Not called after `detach`.
     exited: *const fn (client: *anyopaque, exit: proto.Exit) void,
-    /// The server's.
     server: *anyopaque,
-    /// The `Exec` frees itself when this returns. `client` is null after
-    /// `detach`.
     freed: *const fn (server: *anyopaque, client: ?*anyopaque, exec: *Exec) void,
 };
 
@@ -61,26 +37,23 @@ pub const Exec = struct {
     gpa: Allocator,
     loop: *xev.Loop,
     handler: Handler,
-    /// False once `detach` is called.
     attached: bool = true,
     pipes: Pipes,
     stdout: Output,
     stderr: Output,
     stdin: Input,
-    /// Waits for the command to exit, then notifies `exited`.
     waiter: std.Thread,
     exited: xev.Async,
     exited_c: xev.Completion = .{},
-    /// Set once the command is reaped.
     term: ?Term = null,
 
-    /// Starts the command, and opens its streams on `conn` in the order
-    /// `proto.Exec` gives.
+    /// Spawns the command and opens its streams on conn, stdout and stderr as
+    /// uni streams and then stdin as a bidi stream. They must be the server's
+    /// first streams on conn. The client expects their IDs to be 3, 7 and 1.
     pub fn start(gpa: Allocator, loop: *xev.Loop, conn: *Conn, options: Options) !*Exec {
         const e = try gpa.create(Exec);
         errdefer gpa.destroy(e);
 
-        // As sshd runs a command: argv[0] is the shell's name.
         var pipes: Pipes = try .spawn(gpa, .{
             .argv = &.{ std.fs.path.basename(options.shell), "-c", options.command },
             .program = options.shell,
@@ -92,7 +65,8 @@ pub const Exec = struct {
         const stdout = try conn.openStream(.uni);
         const stderr = try conn.openStream(.uni);
         const stdin = try conn.openStream(.bidi);
-        // The server's side of the stdin stream carries nothing.
+        // The server writes nothing on stdin. Its FIN is the stream's first
+        // frame, which tells the client that the stream exists.
         stdin.finish();
 
         const stdout_buf = try gpa.alloc(u8, read_size);
@@ -120,34 +94,29 @@ pub const Exec = struct {
         return e;
     }
 
-    /// Whether `stream` is one of the command's.
     pub fn owns(e: *const Exec, stream: *const Stream) bool {
         return e.stdout.stream == stream or e.stderr.stream == stream or e.stdin.stream == stream;
     }
 
-    /// Bytes from the client on a stream `owns`.
     pub fn received(e: *Exec, stream: *Stream, bytes: []const u8, fin: bool) void {
-        // Nothing is expected on the output streams.
         if (stream != e.stdin.stream) return stream.consume(bytes.len);
         e.stdin.receive(bytes, fin);
         e.freeIfDone();
     }
 
-    /// The client acknowledged output.
     pub fn acked(e: *Exec, stream: *Stream) void {
         if (stream == e.stdout.stream) e.stdout.resume_();
         if (stream == e.stderr.stream) e.stderr.resume_();
     }
 
-    /// `stream` is about to be freed.
     pub fn streamClosed(e: *Exec, stream: *Stream) void {
         for ([_]*?*Stream{ &e.stdout.stream, &e.stderr.stream, &e.stdin.stream }) |s| {
             if (s.* == stream) s.* = null;
         }
     }
 
-    /// The connection is closing. The command keeps running, without its
-    /// sockets.
+    /// The client is gone. The outputs end and stdin is dropped. The command
+    /// runs on, and the Exec frees itself once it exits.
     pub fn detach(e: *Exec) void {
         e.attached = false;
         e.stdout.detach();
@@ -156,20 +125,20 @@ pub const Exec = struct {
         e.freeIfDone();
     }
 
-    /// Kills the command and every process in its session, for a server
-    /// that is stopping.
+    /// Sends SIGKILL to the command's process group. The command leads a
+    /// POSIX session of its own.
     pub fn kill(e: *Exec) void {
         if (e.pipes.pid) |pid| _ = std.c.kill(-pid, .KILL);
     }
 
-    /// Kills the command and frees the `Exec` at once, for a server whose
-    /// loop won't run again.
     pub fn destroy(e: *Exec) void {
         e.kill();
         e.waiter.join();
         e.finalize();
     }
 
+    // Runs on the waiter thread. waitExited leaves the child unreaped. Its pid,
+    // which kill uses, stays its own until onExited reaps it on the loop.
     fn waitMain(e: *Exec) void {
         e.pipes.waitExited() catch |err| log.warn("waiting for a command failed: {t}", .{err});
         e.exited.notify() catch {};
@@ -180,7 +149,6 @@ pub const Exec = struct {
         e.waiter.join();
         e.term = (e.pipes.tryWait() catch null) orelse .{ .unknown = 0 };
 
-        // Nothing reads the command's stdin now.
         e.stdin.end();
         if (e.attached) e.handler.exited(e.handler.client, session.session.exitMessage(e.term.?));
         e.freeIfDone();
@@ -205,21 +173,17 @@ pub const Exec = struct {
     }
 };
 
-/// The command's stdout or stderr.
 const Output = struct {
     exec: *Exec,
-    /// In `exec.pipes`.
+    // Points into exec.pipes. Pipes.close sets it to -1, which pipes.deinit
+    // skips.
     fd: *posix.fd_t,
     socket: xev.TCP,
-    /// Null once freed, or once detached.
     stream: ?*Stream,
     buf: []u8,
     read_c: xev.Completion = .{},
-    /// A read is in flight, or its callback is running.
     reading: bool = false,
-    /// The stream is above `high_water`.
     paused: bool = false,
-    /// The socket reached its end, or was shut down, and is closed.
     ended: bool = false,
 
     fn idle(o: *const Output) bool {
@@ -235,14 +199,12 @@ const Output = struct {
     fn onRead(o_: ?*Output, _: *xev.Loop, _: *xev.Completion, _: xev.TCP, _: xev.ReadBuffer, result: xev.ReadError!usize) xev.CallbackAction {
         const o = o_.?;
         const n = result catch {
-            // The end of the output, or a shutdown by `detach`.
             o.reading = false;
             o.end();
             o.exec.freeIfDone();
             return .disarm;
         };
 
-        // After `detach`, output is dropped.
         if (o.stream) |stream| {
             stream.write(o.buf[0..n]) catch stream.conn.close(0);
             if (stream.buffered() > high_water) o.paused = true;
@@ -259,7 +221,6 @@ const Output = struct {
         o.startRead();
     }
 
-    /// Finishes the stream, and closes the socket.
     fn end(o: *Output) void {
         if (o.ended) return;
         o.ended = true;
@@ -270,33 +231,27 @@ const Output = struct {
     fn detach(o: *Output) void {
         o.stream = null;
         if (o.ended) return;
-        // A read in flight ends with the shutdown, and ends the output.
+        // Shutting the socket down completes the read in flight, and onRead
+        // ends the output.
         if (o.reading) {
             _ = std.c.shutdown(o.fd.*, posix.SHUT.RDWR);
         } else o.end();
     }
 };
 
-/// The command's stdin.
+// Writes the client's stdin stream to the command. Bytes are consumed on the
+// stream once written, so the stream's flow control window bounds the queue.
 const Input = struct {
     exec: *Exec,
-    /// In `exec.pipes`.
     fd: *posix.fd_t,
     socket: xev.TCP,
-    /// Null once freed, or once detached.
     stream: ?*Stream,
-    /// Bytes received and not yet written.
     queue: std.ArrayList(u8) = .empty,
-    /// The bytes of the write in flight, from `written` on.
     writing: std.ArrayList(u8) = .empty,
     written: usize = 0,
     write_c: xev.Completion = .{},
-    /// A write is in flight, or its callback is running.
     write_active: bool = false,
-    /// The client finished its side of the stream.
     fin: bool = false,
-    /// What arrives is dropped. The socket closes once no write is in
-    /// flight.
     ended: bool = false,
 
     fn idle(i: *const Input) bool {
@@ -316,7 +271,6 @@ const Input = struct {
     fn startWrite(i: *Input) void {
         if (i.write_active or i.ended) return;
         if (i.written == i.writing.items.len) {
-            // All of stdin was written: the command sees its end.
             if (i.queue.items.len == 0) {
                 if (i.fin) i.end();
                 return;
@@ -334,11 +288,9 @@ const Input = struct {
         i.write_active = false;
         if (result) |n| {
             i.written += n;
-            // The credit returns once the command has the bytes.
             if (i.stream) |stream| stream.consume(n);
             i.startWrite();
         } else |_| {
-            // The command closed its stdin, or exited.
             i.end();
         }
         i.closeIfIdle();
@@ -346,9 +298,6 @@ const Input = struct {
         return .disarm;
     }
 
-    /// Drops what wasn't written, returning its credit, and closes the
-    /// socket once no write is in flight. A write in flight ends with the
-    /// shutdown.
     fn end(i: *Input) void {
         if (i.ended) return;
         i.ended = true;
@@ -356,6 +305,8 @@ const Input = struct {
         i.queue.clearRetainingCapacity();
         i.writing.clearRetainingCapacity();
         i.written = 0;
+        // Shutting the socket down fails the write in flight, and onWrite
+        // closes the fd.
         if (i.write_active) {
             _ = std.c.shutdown(i.fd.*, posix.SHUT.RDWR);
         } else i.closeIfIdle();

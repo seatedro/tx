@@ -1,16 +1,9 @@
-//! A session host: a program on a pseudo-terminal and the primary terminal
-//! its output feeds.
-//!
-//! A thread moves bytes between the pty and two queues with poll, as
-//! Ghostty's read thread does, so the host works the same on every
-//! platform. The caller owns the primary: after `Options.notify`, it calls
-//! `processOutput` on its own thread, which logs and applies the queued
-//! output.
-//!
-//! User input and the primary's query replies go to the pty through one
-//! queue, in the order they were produced. The primary answers queries only
-//! while `answer_queries` is set; while a client is attached, its own
-//! terminal answers them.
+//! Host runs a program on a pty and feeds its output into a term Primary. A
+//! thread of its own reads and writes the pty master, and trades output and
+//! input with the loop thread through queues under a mutex. It calls notify,
+//! and the owner then calls processOutput on the loop thread, which owns the
+//! Primary.
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -27,7 +20,6 @@ const Pty = pty_pkg.Pty;
 const log = std.log.scoped(.host);
 
 pub const Options = struct {
-    /// See `pty.Options`.
     argv: []const []const u8,
     program: ?[]const u8 = null,
     environ: *const std.process.Environ.Map,
@@ -35,14 +27,12 @@ pub const Options = struct {
     diagnostic: ?*pty_pkg.Diagnostic = null,
 
     size: term.log.Resize,
-    /// The terminal's size comes from `size`.
     terminal: TerminalOptions = .{},
 
-    /// Called on the host's thread when output is queued, at end of file
-    /// and when the program exits. It must not call the host.
+    /// Called on the host thread when output is waiting, the pty has closed,
+    /// or the program has exited.
     notify: *const fn (context: ?*anyopaque) void,
     context: ?*anyopaque = null,
-    /// The thread stops reading the pty while this much output is queued.
     output_limit: usize = 256 * 1024,
 
     pub const TerminalOptions = struct {
@@ -53,7 +43,9 @@ pub const Options = struct {
     };
 };
 
-/// The largest output record `processOutput` logs.
+// The largest read from the pty and the largest log record. An Output frame
+// carries one record and must decode under max_message (1 MiB) in the channel
+// and the client.
 const max_record = 16 * 1024;
 
 pub const Host = struct {
@@ -61,16 +53,12 @@ pub const Host = struct {
     io: Io,
     pty: Pty,
     primary: *Primary,
-    /// Clear while a client is attached. Queries then reach the client's
-    /// terminal in the client stream, and its replies arrive as input.
+    /// Whether the Primary answers the program's queries through the pty.
+    /// Session clears it while a client is attached; that client's terminal
+    /// sees the same output and answers.
     answer_queries: bool = true,
-    /// The color scheme the last client's terminal reported, for
-    /// `CSI ? 996 n` while none is attached.
     dark: ?bool = null,
-    /// Set by `processOutput` once the program has exited and all its
-    /// output is processed. Then call `reap`.
     finished: bool = false,
-    /// Output taken from `queues.output`, being processed.
     taken: std.ArrayList(u8) = .empty,
 
     notify: *const fn (context: ?*anyopaque) void,
@@ -81,25 +69,15 @@ pub const Host = struct {
     mutex: Io.Mutex = .init,
     queues: Queues = .{},
 
-    /// Shared with the thread, under `mutex`.
     const Queues = struct {
-        /// Read from the pty, not yet taken by `processOutput`.
         output: std.ArrayList(u8) = .empty,
-        /// User input and primary replies not yet written to the pty, from
-        /// `input_start`. Unbounded: the transport's flow control must stop
-        /// reading client input while the program isn't reading.
         input: std.ArrayList(u8) = .empty,
         input_start: usize = 0,
-        /// End of file on the pty: every process closed the terminal.
         closed: bool = false,
-        /// The program has exited. Set after `closed`, so no output
-        /// follows it.
         exited: bool = false,
         stopping: bool = false,
     };
 
-    /// Start the program and the thread. Heap-allocated because the
-    /// primary's reply callback and the thread point to the host.
     pub fn create(gpa: Allocator, io: Io, options: Options) !*Host {
         const self = try gpa.create(Host);
         errdefer gpa.destroy(self);
@@ -114,8 +92,7 @@ pub const Host = struct {
             .log_capacity = t.log_capacity,
         });
         errdefer primary.destroy();
-        // The initial size isn't logged, so apply a cell size as a resize
-        // to log it.
+        // Primary.create takes no cell size; the resize sets it.
         if (options.size.cell_size_px != null) try primary.resize(options.size);
 
         var wake: Wake = try .init();
@@ -140,7 +117,6 @@ pub const Host = struct {
         };
         errdefer self.pty.deinit();
 
-        // The primary's query replies go to the pty through the input queue.
         primary.context = self;
         primary.handler().effects.write_pty = &writePty;
         primary.handler().effects.color_scheme = &colorScheme;
@@ -149,7 +125,6 @@ pub const Host = struct {
         return self;
     }
 
-    /// Kill the program if it is still running and free the host.
     pub fn destroy(self: *Host) void {
         const gpa = self.gpa;
         if (self.thread) |thread| {
@@ -157,10 +132,9 @@ pub const Host = struct {
             self.queues.stopping = true;
             self.mutex.unlock(self.io);
 
-            // Wakes the thread from poll.
             self.wake.notify();
 
-            // The thread may be waiting for the program to exit.
+            // The thread may be blocked in waitExited until the program exits.
             self.pty.kill(.KILL) catch {};
             thread.join();
         }
@@ -174,24 +148,20 @@ pub const Host = struct {
         gpa.destroy(self);
     }
 
-    /// Log and apply the output the thread has queued. Queues any replies.
-    /// On error the rest of the taken output is dropped; `finished` is set
-    /// either way.
     pub fn processOutput(self: *Host) term.log.AppendError!void {
-        // Swap buffers with the thread and process the output without the
-        // lock. `exited` is read under the same lock. No output follows it,
-        // and all of the program's output is in what was taken.
         self.mutex.lockUncancelable(self.io);
         std.mem.swap(std.ArrayList(u8), &self.queues.output, &self.taken);
         const exited = self.queues.exited;
         self.mutex.unlock(self.io);
 
-        // A full queue stopped the thread reading. It has room again.
+        // The host thread stopped reading at output_limit. Waking it makes it
+        // poll the pty again.
         if (self.taken.items.len >= self.output_limit) self.wake.notify();
 
+        // exited is set after the last output was queued, so this batch holds
+        // the rest of it.
         self.finished = exited;
 
-        // Logged in records of at most `max_record` bytes.
         defer self.taken.clearRetainingCapacity();
         var rest = self.taken.items;
         while (rest.len > 0) {
@@ -201,50 +171,40 @@ pub const Host = struct {
         }
     }
 
-    /// After `finished` is set: ends the thread and reaps the program.
+    /// Joins the host thread and reaps the program. It blocks until the
+    /// program exits; the owner calls it once finished is set.
     pub fn reap(self: *Host) pty_pkg.WaitError!pty_pkg.Term {
-        // The thread has set `exited` and is ending.
         if (self.thread) |thread| {
             thread.join();
             self.thread = null;
         }
 
-        // The program is a zombie. This doesn't block.
         return self.pty.wait();
     }
 
-    /// Queue input for the pty. Dropped after end of file.
     pub fn sendInput(self: *Host, bytes: []const u8) Allocator.Error!void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const q = &self.queues;
         if (q.closed or bytes.len == 0) return;
 
-        // The thread polls for writability while input is queued. It needs
-        // a wakeup when the queue stops being empty.
+        // The thread polls for POLLOUT while input is pending.
         const was_empty = q.input_start == q.input.items.len;
         try q.input.appendSlice(self.gpa, bytes);
         if (was_empty) self.wake.notify();
     }
 
-    /// Resize the terminal before the pty, so the program's redraw after
-    /// SIGWINCH is logged after the resize.
     pub fn resize(self: *Host, size: term.log.Resize) !void {
         try self.primary.resize(size);
         try self.pty.resize(ptySize(size));
     }
 
-    /// The colors an attaching client's terminal reported (see
-    /// `proto.Attach.foreground`), as the primary's defaults. The primary
-    /// answers color queries with them while no client is attached, and
-    /// rebuilds don't carry them.
     pub fn setColors(self: *Host, m: proto.Attach) void {
         const colors = &self.primary.terminal.colors;
         if (m.foreground) |rgb| colors.foreground.default = toRgb(rgb);
         if (m.background) |rgb| colors.background.default = toRgb(rgb);
         if (m.dark) |dark| self.dark = dark;
 
-        // Each entry is an index, then red, green and blue.
         const entries = m.palette orelse return;
         var palette = colors.palette.original.*;
         var i: usize = 0;
@@ -268,8 +228,6 @@ pub const Host = struct {
     fn writePty(h: *term.primary.Handler, data: []const u8) void {
         const self: *Host = @ptrCast(@alignCast(Primary.fromHandler(h).context.?));
         if (!self.answer_queries) return;
-        // A reply that can't be queued is dropped. To the program this
-        // looks like a terminal that didn't answer.
         self.sendInput(data) catch return;
     }
 
@@ -277,8 +235,6 @@ pub const Host = struct {
         const fd = self.pty.master;
         var buf: [max_record]u8 = undefined;
         while (true) {
-            // Decide what to wait for. Reading stops while the output queue
-            // is full, which leaves the program blocked on its writes.
             self.mutex.lockUncancelable(self.io);
             const q = &self.queues;
             const stopping = q.stopping;
@@ -288,16 +244,14 @@ pub const Host = struct {
             self.mutex.unlock(self.io);
             if (stopping) return;
 
-            // After end of file there is nothing left to read or write.
             if (closed) return self.waitExited();
 
             var events: i16 = 0;
             if (want_read) events |= posix.POLL.IN;
             if (want_write) events |= posix.POLL.OUT;
-            // poll ignores a negative fd. A closed slave reports POLLHUP
-            // even with no events requested.
-            // On macOS, the child's exit is what ends the output (see
-            // `Pty.exit_fd`). It is -1 elsewhere, and once seen.
+            // poll skips an fd of -1. exit_fd is -1 except on Darwin, where the
+            // held slave keeps the master from reaching end of file until the
+            // program's exit is seen.
             var fds = [_]posix.pollfd{
                 .{ .fd = self.wake.read_fd, .events = posix.POLL.IN, .revents = 0 },
                 .{ .fd = if (events == 0) -1 else fd, .events = events, .revents = 0 },
@@ -310,11 +264,8 @@ pub const Host = struct {
                     return self.close();
                 },
             };
-            // A wakeup only means the queues changed. The loop's next pass
-            // reads them.
             if (fds[0].revents != 0) self.wake.drain();
 
-            // An error or hangup is reported by the read or write itself.
             const revents = fds[1].revents;
             const failed = posix.POLL.ERR | posix.POLL.HUP;
             if (want_write and revents & (posix.POLL.OUT | failed) != 0) self.writeInput();
@@ -322,10 +273,7 @@ pub const Host = struct {
         }
     }
 
-    /// Reads until the pty would block or `buf` is full.
     fn readOutput(self: *Host, buf: []u8) void {
-        // macOS returns at most 1 KiB per read from a pty master. Read until
-        // `buf` is full, then take the lock once.
         var len: usize = 0;
         const eof = while (len < buf.len) {
             const n = self.pty.read(buf[len..]) catch |err| switch (err) {
@@ -346,24 +294,18 @@ pub const Host = struct {
         if (eof) q.closed = true;
         self.mutex.unlock(self.io);
 
-        // Notify when output arrives in an empty queue. The caller takes the
-        // whole queue, and later appends don't need another notification.
+        // processOutput takes the whole queue, so a notification is due when
+        // the queue was empty, and at end of file.
         if (eof or (was_empty and len > 0)) self.notify(self.context);
     }
 
-    /// Writes queued input until the pty would block.
     fn writeInput(self: *Host) void {
-        // Held across the writes, which don't block: `sendInput` may move
-        // the queue's buffer.
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const q = &self.queues;
         while (q.input_start < q.input.items.len) {
             const n = self.pty.write(q.input.items[q.input_start..]) catch |err| switch (err) {
-                // Out of kernel buffers. Retry when the pty is writable.
                 error.WouldBlock, error.SystemResources => break,
-                // Drop the input. The program's exit shows up as end of
-                // file on the next read.
                 error.BrokenPipe, error.Unexpected => {
                     q.input_start = q.input.items.len;
                     break;
@@ -376,8 +318,6 @@ pub const Host = struct {
             q.input.clearRetainingCapacity();
             q.input_start = 0;
         } else if (q.input_start > q.input.items.len / 2) {
-            // Discard written bytes so the buffer doesn't grow without
-            // bound behind a slow reader.
             const rest = q.input.items[q.input_start..];
             std.mem.copyForwards(u8, q.input.items[0..rest.len], rest);
             q.input.shrinkRetainingCapacity(rest.len);
@@ -385,7 +325,6 @@ pub const Host = struct {
         }
     }
 
-    /// Ends reading and writing after poll fails.
     fn close(self: *Host) void {
         self.mutex.lockUncancelable(self.io);
         self.queues.closed = true;
@@ -394,8 +333,6 @@ pub const Host = struct {
         self.waitExited();
     }
 
-    /// After end of file. A program can close the terminal and keep
-    /// running, so this can block for a long time; `destroy` kills it.
     fn waitExited(self: *Host) void {
         self.pty.waitExited() catch |err| log.warn("wait failed: {t}", .{err});
 
@@ -404,14 +341,14 @@ pub const Host = struct {
         const stopping = self.queues.stopping;
         self.mutex.unlock(self.io);
 
-        // `destroy` killed the program and is joining the thread. The
-        // caller may be freeing what `notify` points to.
+        // While stopping, destroy is joining this thread and the owner takes
+        // no notification.
         if (!stopping) self.notify(self.context);
     }
 };
 
-/// Converts the cell size in `size` to the grid's pixel size, which the
-/// pty takes.
+/// The window's pixel size from the cell size. winsize's pixel fields are u16,
+/// and larger sizes saturate.
 fn ptySize(size: term.log.Resize) pty_pkg.Size {
     const cell = size.cell_size_px orelse return .{ .cols = size.cols, .rows = size.rows };
     return .{
@@ -443,15 +380,12 @@ fn spawnTest(environ: *const std.process.Environ.Map, script: []const u8) !*Host
     });
 }
 
-/// The tests poll `processOutput` instead.
 fn ignoreNotify(_: ?*anyopaque) void {}
 
 fn now() i64 {
     return std.Io.Clock.awake.now(testing.io).toMilliseconds();
 }
 
-/// Process output until `done` returns true or the program has exited,
-/// with a deadline.
 fn run(host: *Host, done: ?*const fn (*Host) bool) !void {
     const deadline = now() + test_timeout_ms;
     while (true) {
@@ -463,7 +397,6 @@ fn run(host: *Host, done: ?*const fn (*Host) bool) !void {
     }
 }
 
-/// Run until the program exits and reap it.
 fn finish(host: *Host) !pty_pkg.Term {
     try run(host, null);
     return host.reap();
@@ -488,7 +421,6 @@ test "output reaches the terminal and the log" {
     try testing.expectEqual(pty_pkg.Term{ .exited = 0 }, try finish(host));
     try testing.expect(screenContains(host, "hello bold"));
 
-    // The log holds the output unchanged.
     var logged: std.ArrayList(u8) = .empty;
     defer logged.deinit(testing.allocator);
     var it = try host.primary.log.iterator(0);
@@ -499,8 +431,6 @@ test "output reaches the terminal and the log" {
 test "primary answers queries through the pty" {
     var environ = try testEnviron();
     defer environ.deinit();
-    // Ask for the cursor position (DSR 6) and print the 6-byte reply in
-    // hex.
     const host = try spawnTest(&environ,
         \\stty -icanon -echo min 1
         \\printf 'ab\033[6n'
@@ -510,15 +440,12 @@ test "primary answers queries through the pty" {
     defer host.destroy();
 
     try testing.expectEqual(pty_pkg.Term{ .exited = 0 }, try finish(host));
-    // ESC [ 1 ; 3 R
     try testing.expect(screenContains(host, "reply:1b 5b 31 3b 33 52"));
 }
 
 test "with no client attached, the primary answers with the last client's colors" {
     var environ = try testEnviron();
     defer environ.deinit();
-    // The queries wait for `setColors`, as a program's would for an
-    // attach. Escapes print as E.
     const host = try spawnTest(&environ,
         \\stty -icanon -echo min 0 time 10
         \\sleep 0.2
@@ -543,7 +470,6 @@ test "with no client attached, the primary answers with the last client's colors
 test "primary stays silent while answer_queries is clear" {
     var environ = try testEnviron();
     defer environ.deinit();
-    // The read gives up after 0.3 s without input.
     const host = try spawnTest(&environ,
         \\stty -icanon -echo min 0 time 3
         \\printf 'ab\033[6n'
@@ -560,9 +486,6 @@ test "primary stays silent while answer_queries is clear" {
 test "large input reaches the program intact" {
     var environ = try testEnviron();
     defer environ.deinit();
-    // Larger than the tty's input queue, so most of it waits in the
-    // host's queue. GNU stty's raw leaves IEXTEN set, and on macOS IEXTEN
-    // makes ^V and ^O special even in raw mode.
     const len = 256 * 1024;
     const host = try spawnTest(&environ,
         \\stty raw -echo -iexten
@@ -582,7 +505,6 @@ test "large input reaches the program intact" {
     try host.sendInput(input);
     try testing.expectEqual(pty_pkg.Term{ .exited = 0 }, try finish(host));
 
-    // POSIX cksum of the input.
     var crc: u32 = 0;
     var table: [256]u32 = undefined;
     for (&table, 0..) |*e, i| {
@@ -600,8 +522,6 @@ test "large input reaches the program intact" {
 test "a terminal fed the log ends in the primary's state" {
     var environ = try testEnviron();
     defer environ.deinit();
-    // Scrollback, the alternate screen, a read, a resize and a return to
-    // the primary screen.
     const host = try spawnTest(&environ,
         \\i=0
         \\while [ $i -lt 60 ]; do printf '\033[3%dmline %d\033[m\r\n' $((i % 8)) $i; i=$((i + 1)); done
@@ -624,8 +544,6 @@ test "a terminal fed the log ends in the primary's state" {
     try testing.expect(screenContains(host, "got yes, size 30 100"));
     try testing.expect(screenContains(host, "back on the primary screen"));
 
-    // A second Primary with no effect callbacks stands in for the client's
-    // terminal.
     const stand_in: *Primary = try .create(testing.allocator, testing.io, .{ .cols = 80, .rows = 24 });
     defer stand_in.destroy();
     var it = try host.primary.log.iterator(0);
@@ -644,7 +562,6 @@ test "a terminal fed the log ends in the primary's state" {
 test "a program that closes its terminal is reaped when it exits" {
     var environ = try testEnviron();
     defer environ.deinit();
-    // End of file arrives 0.2 s before the exit.
     const host = try spawnTest(&environ,
         \\printf 'closing\r\n'
         \\exec </dev/null >/dev/null 2>&1
@@ -660,8 +577,6 @@ test "a program that closes its terminal is reaped when it exits" {
 test "destroy kills a running program" {
     var environ = try testEnviron();
     defer environ.deinit();
-    // One program holds the terminal open, the other has closed it, so
-    // the thread is in poll or waiting for the exit.
     for ([_][]const u8{ "exec sleep 30", "exec </dev/null >/dev/null 2>&1; exec sleep 30" }) |script| {
         const host = try spawnTest(&environ, script);
         try testing.io.sleep(.fromMilliseconds(50), .awake);

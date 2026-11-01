@@ -1,10 +1,3 @@
-//! A Wayland server with a seat and data control only, so that programs in
-//! a session reach the user's clipboard through `wl-paste` and `wl-copy`.
-//!
-//! `wire` reads and writes messages, `protocol` has the interfaces'
-//! opcodes, `server` is the protocol's state, and `socket` puts it on a
-//! Unix socket on the loop, on Linux. `pipe` moves clipboard data through
-//! the pipes programs pass.
 const builtin = @import("builtin");
 
 pub const wire = @import("wire.zig");

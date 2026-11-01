@@ -1,18 +1,10 @@
-//! The user's clipboard, for programs on the host. Linux only, with the
-//! clipboard server (see `wayland`).
-//!
-//! Programs read the clipboard of the provider: the attached client that
-//! sent input last, or before any did, the first to offer. A read asks the
-//! provider for the type (`proto.ClipboardRequest`). Reads of one type
-//! share one request, and the answer is kept until the clipboard changes.
-//! The client decides whether to answer: it does only just after the user
-//! pasted.
-//!
-//! A program's copy is read at once, in full, since the program may exit
-//! before anyone pastes. txd then holds it: the program's source is
-//! cancelled, so a `wl-copy` waiting in the background exits, and txd
-//! serves the copy to other programs itself. The provider gets it for the
-//! user's clipboard. The primary selection stays among the programs.
+//! Bridges the Wayland clipboard server, which programs in sessions reach
+//! through WAYLAND_DISPLAY, to the clipboards of tx clients. One client at a
+//! time, the provider, backs the clipboard. Programs see the types of its
+//! latest offer, and their pastes become ClipboardRequests to it. A program's
+//! copy is read in full and held to serve later pastes. The provider gets it
+//! as well. Linux only.
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -26,27 +18,21 @@ const fd_t = posix.fd_t;
 
 const log = std.log.scoped(.clipboard);
 
-/// How long a read waits for the provider to start answering. arboard,
-/// which Codex uses, gives up after 4 seconds.
 const answer_timeout_ms = 1500;
-/// How long an answer may take once it has started.
 const transfer_timeout_ms = 30_000;
-/// How long reading a program's copy may take.
 const copy_timeout_ms = 2000;
-/// The most a program's copy holds, in all its types.
+/// The most data a program's copy may hold over all its types, and the most an
+/// answer may carry. src/client/clipboard.zig's max_data_len is the same 64 MiB.
 pub const max_copy_len = 64 << 20;
-/// The most types of a copy that are read.
+// writeCopy in src/client/session.zig takes at most 16 types.
 const max_copy_types = 16;
-/// How often the deadlines are checked, while any are pending.
 const sweep_ms = 250;
 
-/// A client, as the clipboard sees it.
 pub const Peer = struct {
-    /// Sends the client `proto.ClipboardRequest`.
     request: *const fn (peer: *Peer, m: proto.ClipboardRequest) void,
-    /// Sends the client a program's copy: its types and their data.
+    /// Sends a program's copy to the client. Everything is borrowed for the
+    /// call.
     copy: *const fn (peer: *Peer, mimes: []const []const u8, data: []const *Blob) void,
-    /// The client's last offer.
     offer: ?Offer = null,
 
     pub const Offer = struct {
@@ -54,7 +40,6 @@ pub const Peer = struct {
         mimes: [][]u8,
     };
 
-    /// Frees the offer. `gpa` is the clipboard's.
     pub fn dropOffer(peer: *Peer, gpa: Allocator) void {
         const offer = peer.offer orelse return;
         for (offer.mimes) |m| gpa.free(m);
@@ -69,21 +54,19 @@ pub const Clipboard = struct {
     loop: *xev.Loop,
     listener: *wayland.Listener,
     provider: ?*Peer = null,
-    /// What programs read: the provider's offer, or a program's copy txd
-    /// read.
     holding: enum { nothing, offer, copy } = .nothing,
-    /// A program's copy, read in full.
     copy: Copy = .{},
-    /// Reading a program's copy.
     reading: ?Reading = null,
-    /// Answers to the provider's current offer, by type.
     answers: std.StringArrayHashMapUnmanaged(*Blob) = .empty,
     requests: std.ArrayList(*Request) = .empty,
     next_id: u64 = 1,
     timer: xev.Timer,
     timer_c: xev.Completion = .{},
+    // Set by close. A timer that was running frees the Clipboard from its
+    // callback.
     closing: bool = false,
 
+    // Owns its type names and one reference to each blob.
     const Copy = struct {
         mimes: std.ArrayList([]u8) = .empty,
         data: std.ArrayList(*Blob) = .empty,
@@ -97,30 +80,25 @@ pub const Clipboard = struct {
         }
     };
 
-    /// Reading a program's copy, one type at a time.
     const Reading = struct {
-        /// The types to read. `copy` collects what has been read.
         mimes: std.ArrayList([]u8),
         next: usize = 0,
         copy: Copy = .{},
         reader: ?*wayland.pipe.Reader = null,
+        // In milliseconds of Io.Clock.awake, like every deadline here.
         deadline: i64,
     };
 
-    /// A read waiting for the provider.
     const Request = struct {
         id: u64,
         peer: *Peer,
         change: u64,
         mime: []u8,
-        /// The pipes waiting for the data.
         fds: std.ArrayList(fd_t) = .empty,
-        /// The answer has started.
         started: bool = false,
         deadline: i64,
     };
 
-    /// Starts the clipboard server at `path`.
     pub fn create(gpa: Allocator, io: Io, loop: *xev.Loop, path: []const u8) !*Clipboard {
         const cb = try gpa.create(Clipboard);
         errdefer gpa.destroy(cb);
@@ -130,9 +108,8 @@ pub const Clipboard = struct {
         return cb;
     }
 
-    /// Stops the server. Pending reads get no data. It's freed now, or by
-    /// the deadline timer when that's running, which ends within
-    /// `sweep_ms`.
+    /// Closes the Wayland server and ends every request. The Clipboard frees
+    /// itself, now or from its timer callback.
     pub fn close(cb: *Clipboard) void {
         cb.closing = true;
         cb.listener.close();
@@ -151,15 +128,12 @@ pub const Clipboard = struct {
         cb.gpa.destroy(cb);
     }
 
-    /// The client sent input. It provides the clipboard from now on, with
-    /// its last offer.
     pub fn input(cb: *Clipboard, peer: *Peer) void {
         if (cb.provider == peer) return;
         cb.provider = peer;
         if (peer.offer != null) cb.useOffer();
     }
 
-    /// The client's clipboard changed. Takes nothing: `mimes` is copied.
     pub fn offer(cb: *Clipboard, peer: *Peer, change: u64, mimes: []const []const u8) void {
         peer.dropOffer(cb.gpa);
         const owned = cb.gpa.alloc([]u8, mimes.len) catch return;
@@ -174,7 +148,6 @@ pub const Clipboard = struct {
         if (cb.provider == peer) cb.useOffer();
     }
 
-    /// The client is gone, or no longer attached.
     pub fn gone(cb: *Clipboard, peer: *Peer) void {
         var i: usize = cb.requests.items.len;
         while (i > 0) {
@@ -191,15 +164,14 @@ pub const Clipboard = struct {
         }
     }
 
-    /// The client's answer to request `id` began.
     pub fn answerStarted(cb: *Clipboard, peer: *Peer, id: u64) void {
         const req = cb.findRequest(peer, id) orelse return;
         req.started = true;
         req.deadline = cb.now() + transfer_timeout_ms;
     }
 
-    /// The client's answer to request `id`: its data, which this takes, or
-    /// null if it refused.
+    /// peer's answer to request id ended. data is null when the client refused
+    /// or the answer failed, and is the Clipboard's to free otherwise.
     pub fn answer(cb: *Clipboard, peer: *Peer, id: u64, data: ?[]u8) void {
         const req = cb.findRequest(peer, id) orelse {
             if (data) |d| cb.gpa.free(d);
@@ -211,14 +183,14 @@ pub const Clipboard = struct {
         const blob = Blob.create(cb.gpa, bytes) catch return;
         defer blob.unref();
 
-        // Kept for later reads while the offer is current.
+        // The data is kept for later pastes if the request's offer is still the
+        // one served.
         const current = cb.provider == peer and cb.holding == .offer and peer.offer != null and peer.offer.?.change == req.change;
         if (current) cb.keepAnswer(req.mime, blob);
         for (req.fds.items) |fd| wayland.pipe.write(cb.gpa, cb.loop, fd, blob.ref());
         req.fds.clearRetainingCapacity();
     }
 
-    /// The provider's offer is what programs read now.
     fn useOffer(cb: *Clipboard) void {
         const peer = cb.provider.?;
         const o = peer.offer.?;
@@ -232,8 +204,8 @@ pub const Clipboard = struct {
         };
     }
 
-    // The clipboard server's backend.
-
+    // A program pastes mime. The Clipboard owns fd, the write end of the
+    // program's pipe.
     fn fetch(context: ?*anyopaque, mime: []const u8, fd: fd_t) void {
         const cb: *Clipboard = @ptrCast(@alignCast(context.?));
         switch (cb.holding) {
@@ -253,7 +225,7 @@ pub const Clipboard = struct {
         const change = (peer.offer orelse return closeFd(fd)).change;
         if (cb.answers.get(mime)) |blob| return wayland.pipe.write(cb.gpa, cb.loop, fd, blob.ref());
 
-        // A read of the same type waiting already takes this one too.
+        // Pastes of the same type of the same offer share one request.
         for (cb.requests.items) |req| {
             if (req.peer == peer and req.change == change and std.mem.eql(u8, req.mime, mime)) {
                 req.fds.append(cb.gpa, fd) catch closeFd(fd);
@@ -278,8 +250,6 @@ pub const Clipboard = struct {
         return req;
     }
 
-    /// Frees a request that has been removed from `requests`. Pipes still
-    /// waiting get no data.
     fn endRequest(cb: *Clipboard, req: *Request) void {
         for (req.fds.items) |fd| closeFd(fd);
         req.fds.deinit(cb.gpa);
@@ -310,8 +280,6 @@ pub const Clipboard = struct {
         cb.answers.clearRetainingCapacity();
     }
 
-    /// A program copied, or cleared the clipboard. Its copy is read, and
-    /// held once read.
     fn copied(context: ?*anyopaque, selection: wayland.Selection, mimes: ?[]const []const u8) void {
         const cb: *Clipboard = @ptrCast(@alignCast(context.?));
         if (selection != .clipboard or cb.closing) return;
@@ -332,15 +300,12 @@ pub const Clipboard = struct {
         cb.armTimer();
     }
 
-    /// Asks the program for the next type of its copy, or holds the copy
-    /// once all are read.
     fn readNext(cb: *Clipboard) void {
         const r = if (cb.reading) |*r| r else return;
         while (r.next < r.mimes.items.len) {
             const mime = r.mimes.items[r.next];
             const fds = pipe() catch return cb.finishReading();
             if (!cb.listener.read(.clipboard, mime, fds[1])) {
-                // The program's source is gone.
                 closeFd(fds[0]);
                 return cb.finishReading();
             }
@@ -382,13 +347,13 @@ pub const Clipboard = struct {
                 };
                 cb.readNext();
             },
-            // What was read is kept.
             .too_long, .failed => cb.finishReading(),
         }
     }
 
-    /// Holds what was read of the program's copy, and sends it to the
-    /// provider. With nothing read, the program keeps serving its copy.
+    // Makes the types read so far the held copy, also when the read was cut
+    // short. setClipboard takes the selection from the program, whose source
+    // is cancelled. The provider gets the copy.
     fn finishReading(cb: *Clipboard) void {
         var r = cb.reading orelse return;
         cb.reading = null;
@@ -408,7 +373,6 @@ pub const Clipboard = struct {
         if (cb.provider) |peer| peer.copy(peer, mimes, cb.copy.data.items);
     }
 
-    /// Drops a copy being read: another replaced it.
     fn stopReading(cb: *Clipboard) void {
         var r = cb.reading orelse return;
         cb.reading = null;
@@ -417,8 +381,6 @@ pub const Clipboard = struct {
         r.mimes.deinit(cb.gpa);
         r.copy.deinit(cb.gpa);
     }
-
-    // Deadlines.
 
     fn now(cb: *const Clipboard) i64 {
         return Io.Clock.awake.now(cb.io).toMilliseconds();
@@ -455,8 +417,7 @@ pub const Clipboard = struct {
     }
 };
 
-/// Cancels a read whose result nobody wants any more. The reader may
-/// outlive the clipboard, so it no longer calls it.
+// Cancels reader. dropRead frees what it read if it finishes first.
 fn abandon(reader: *wayland.pipe.Reader) void {
     reader.handler = .{ .context = null, .done = dropRead };
     reader.cancel();

@@ -1,17 +1,3 @@
-/*
- * Tests for picotls_backend.c, called from root.zig. Each entry point returns
- * the number of failures and prints the failures.
- *
- * - Known-answer vectors: FIPS-197 AES, GCM spec test case 3, and RFC 9001
- *   appendix A (QUIC Initial key derivation, AES header protection, and the
- *   ChaCha20-Poly1305 short-header packet, which exercises the
- *   IV-XOR-sequence nonce). picotls's minicrypto backend computes each value
- *   too, to show which side is wrong on a mismatch.
- * - In-memory TLS 1.3 handshakes between tx and minicrypto in both directions
- *   with both cipher suites, followed by application data each way.
- * - A TLS 1.3 handshake with cloudflare.com offering only X25519MLKEM768.
- *   Runs when TX_TEST_NETWORK is set.
- */
 #include <tx/picotls_backend.h>
 
 #include <picotls/minicrypto.h>
@@ -43,7 +29,8 @@ static void print_hex(const char *label, const uint8_t *p, size_t n) {
 
 static int failures = 0;
 
-/* Compare tx's output and minicrypto's output against the expected hex. */
+// Compares as many bytes as want_hex holds. Only a tx mismatch counts as a failure. minicrypto's
+// output is printed with it to tell a bad vector from a tx bug.
 static void check(const char *name, const uint8_t *tx, const uint8_t *mini, const char *want_hex) {
   uint8_t want[256];
   size_t n = unhex(want, want_hex);
@@ -58,8 +45,6 @@ static void check(const char *name, const uint8_t *tx, const uint8_t *mini, cons
       fprintf(stderr, "    (minicrypto matches the vector)\n");
   }
 }
-
-/* --- Known-answer tests ------------------------------------------------------- */
 
 static void ecb(ptls_cipher_algorithm_t *algo, const uint8_t *key, const uint8_t *in, size_t len,
                 uint8_t *out) {
@@ -168,12 +153,13 @@ static void kat_rfc9001_chacha(void) {
   check("RFC 9001 A.5 hp", hp_a, hp_b,
         "25a282b9e82f06f21f488917a4fc8f1b73573685608597d0efcb076b0ab7a7a4");
 
-  /* The nonce is iv XOR packet number, built by ptls_aead__build_iv. */
   unhex(header, "4200bff4");
   seal(&tx_chacha20poly1305, key_a, iv_a, 654360564, header, 4, pt, 1, ct_a);
   seal(&ptls_minicrypto_chacha20poly1305, key_b, iv_b, 654360564, header, 4, pt, 1, ct_b);
   check("RFC 9001 A.5 payload ciphertext", ct_a, ct_b, "655e5cd55c41f69080575d7999c25a5bfb");
 
+  // ChaCha20 header protection (RFC 9001 section 5.4.4) takes the sample as the IV and encrypts
+  // zeros.
   unhex(sample, "5e5cd55c41f69080575d7999c25a5bfb");
   ptls_cipher_context_t *c = ptls_cipher_new(&tx_chacha20, 1, hp_a);
   ptls_cipher_init(c, sample);
@@ -186,13 +172,10 @@ static void kat_rfc9001_chacha(void) {
   check("RFC 9001 A.5 header protection mask", mask_a, mask_b, "aefefe7d03");
 }
 
-/* --- TLS handshakes between backends, in memory ------------------------------ */
-
+// minicrypto has no ML-KEM.
 static ptls_key_exchange_algorithm_t *tx_kx[] = {&tx_x25519, NULL};
 static ptls_key_exchange_algorithm_t *mini_kx[] = {&ptls_minicrypto_x25519, NULL};
 
-/* Feeds `in` to `tls` as handshake input and drops the consumed bytes. Returns
-   the handshake status. */
 static int feed(ptls_t *tls, ptls_buffer_t *out, ptls_buffer_t *in) {
   size_t consumed = in->off;
   int ret = ptls_handshake(tls, out, in->base, &consumed, NULL);
@@ -256,8 +239,6 @@ static void tls_pair(const char *name, int client_tx, int server_tx, int chacha,
   ptls_buffer_init(&c2s, "", 0);
   ptls_buffer_init(&s2c, "", 0);
   int cret = ptls_handshake(client, &c2s, NULL, NULL, NULL), sret = -1;
-  /* A picotls server returns 0 after sending its Finished, before it reads the
-     client's. Loop until both sides report the handshake complete. */
   for (int i = 0;
        i < 8 && !(ptls_handshake_is_complete(client) && ptls_handshake_is_complete(server)); ++i) {
     if (c2s.off)
@@ -278,11 +259,11 @@ static void tls_pair(const char *name, int client_tx, int server_tx, int chacha,
   tx_ed25519_signer_dispose(&signer);
 }
 
-/* --- Hybrid key exchange against cloudflare.com -------------------------------- */
-
+// The cloudflare.com test checks key exchange and record protection. It accepts any certificate
+// and CertificateVerify.
 static int accept_sign(void *ctx, uint16_t algo, ptls_iovec_t data, ptls_iovec_t sig) {
   (void)ctx, (void)algo, (void)data, (void)sig;
-  return 0; /* The certificate is not checked; this test covers key exchange. */
+  return 0;
 }
 
 static int accept_cert(ptls_verify_certificate_t *self, ptls_t *tls, const char *name,
@@ -348,11 +329,12 @@ static void hybrid_cloudflare(void) {
       off += consumed;
     }
   }
+
+  // The ptls_handshake call that completes the handshake leaves the client Finished in out.
   if (out.off)
     send(fd, out.base, out.off, 0);
   out.off = 0;
 
-  /* Check that application data decrypts by reading an HTTP status line. */
   int got_http = 0;
   if (ret == 0) {
     char req[128];
@@ -407,7 +389,6 @@ int tx_crypto_test_backend_interop(const uint8_t secret_key[64], const uint8_t p
   return failures;
 }
 
-/* Returns -1 when skipped (TX_TEST_NETWORK unset). */
 int tx_crypto_test_cloudflare(void) {
   if (getenv("TX_TEST_NETWORK") == NULL)
     return -1;

@@ -1,4 +1,3 @@
-//! Endpoints on one libxev loop over 127.0.0.1.
 const std = @import("std");
 const testing = std.testing;
 const Io = std.Io;
@@ -24,13 +23,14 @@ fn nowMs() i64 {
     return Io.Clock.awake.now(testing.io).toMilliseconds();
 }
 
-/// A loop with a 10 ms tick, so that `runUntil` can check its deadline.
 const Harness = struct {
     loop: xev.Loop,
     tick: xev.Timer,
     tick_c: xev.Completion = .{},
     ticking: bool = true,
 
+    /// A 10 ms tick keeps loop.run(.once) returning, and runUntil and runFor
+    /// check their deadlines between runs.
     fn init(h: *Harness) !void {
         h.* = .{ .loop = try .init(.{}), .tick = try .init() };
         h.tick.run(&h.loop, &h.tick_c, 10, Harness, h, onTick);
@@ -55,7 +55,6 @@ const Harness = struct {
         while (nowMs() < end) try h.loop.run(.once);
     }
 
-    /// Stops the endpoints and runs the loop until nothing is active.
     fn finish(h: *Harness, endpoints: []const *Endpoint) !void {
         for (endpoints) |e| e.stop();
         h.ticking = false;
@@ -85,8 +84,6 @@ const Keys = struct {
     }
 };
 
-/// Echoes stream data back on the same stream and finishes it after the
-/// peer does. Counts closes.
 const EchoServer = struct {
     closed: u32 = 0,
     last_reason: ?CloseReason = null,
@@ -108,8 +105,6 @@ const EchoServer = struct {
     }
 };
 
-/// Sends `payload` on one stream once connected and collects what comes
-/// back.
 const Sender = struct {
     payload: []const u8,
     received: std.ArrayList(u8) = .empty,
@@ -233,7 +228,6 @@ test "a server serves several clients at once" {
     try h.finish(&endpoints);
 }
 
-/// Records stream data without consuming it until `consuming` is set.
 const SlowReader = struct {
     received: usize = 0,
     unconsumed: usize = 0,
@@ -368,7 +362,6 @@ test "an idle connection times out on both ends" {
     try h.finish(&.{ &client, &server });
 }
 
-/// Counts the unidirectional streams that end.
 const UniCounter = struct {
     ended: usize = 0,
 
@@ -399,8 +392,8 @@ test "a peer keeps opening streams as its earlier ones close" {
     _ = try client.connect(server.local);
     try h.runUntil(&sender, Sender.isConnected);
 
-    // More than the 100 the transport parameters allow at once. Each waits
-    // for the server to give back the place of one that closed.
+    // More streams than the 100 a peer may have open at once
+    // (initial_max_streams_uni in quic.zig).
     for (0..250) |i| {
         const deadline = nowMs() + timeout_ms;
         const stream = while (true) {

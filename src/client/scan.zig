@@ -1,8 +1,3 @@
-//! Learns a server's key, as `ssh-keyscan` does: a handshake that accepts
-//! any key, closed as soon as it completes. The handshake proves the server
-//! holds the key's secret half. Nothing is sent over the connection.
-//!
-//! The server's addresses are raced as for a session (see `connect`).
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -16,12 +11,10 @@ const CloseReason = transport.endpoint.CloseReason;
 
 pub const Result = union(enum) {
     found: Found,
-    /// Every attempt closed before its handshake completed.
     failed: CloseReason,
 
     pub const Found = struct {
         key: [32]u8,
-        /// The address that answered.
         address: IpAddress,
     };
 };
@@ -44,7 +37,6 @@ pub fn hostKey(gpa: Allocator, io: Io, servers: []const IpAddress, idle_timeout_
 
     while (scan.result == null) try loop.run(.once);
 
-    // Lets the endpoints' completions finish.
     racer.stop();
     try loop.run(.until_done);
 

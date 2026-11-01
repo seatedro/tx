@@ -1,9 +1,3 @@
-//! Writes a gzip-compressed tarball of files in one directory. Every
-//! timestamp is 0, so the same files make the same tarball.
-//!
-//! Usage: tarball OUT ROOT [NAME MODE PATH]...
-//!
-//! MODE is octal, such as 755.
 const std = @import("std");
 const Io = std.Io;
 const flate = std.compress.flate;

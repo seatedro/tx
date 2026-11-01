@@ -1,17 +1,8 @@
-//! What a client signs to log in, and how the server checks it.
-//!
-//! The client signs an SSHSIG in namespace `tx-auth-v1@tx` over:
-//!
-//!     string  exporter    the connection's TLS exporter value
-//!     string  host_key    the server's public key blob
-//!     string  user        the account to log in as, or empty for the
-//!                         account the server serves
-//!     string  alpn        the connection's ALPN protocol ID
-//!     uint32  revision    the protocol revision
-//!
-//! Each side derives the exporter value from its own TLS state, and the
-//! server never sends it. A signature is valid for one connection to one
-//! server, and the namespace keeps it from passing as an SSH login.
+//! The login transcript. A client logs in by signing it as SSHSIG data with a
+//! key that authorized_keys lists. The server rebuilds the transcript with its
+//! own host key and verifies the signature. The TLS exporter in the transcript
+//! ties a signature to one connection.
+
 const std = @import("std");
 const Writer = std.Io.Writer;
 const ssh = @import("ssh.zig");
@@ -19,27 +10,30 @@ const sshsig = @import("sshsig.zig");
 
 pub const namespace = "tx-auth-v1@tx";
 
-/// The TLS exporter label (RFC 8446 §7.5), with an empty context.
 pub const exporter_label = "EXPORTER-tx-auth";
 pub const exporter_len = 32;
 
-/// The longest user name a login carries. POSIX's LOGIN_NAME_MAX on Linux
-/// is 256, terminator included.
+/// The longest user name a Transcript holds. tx refuses longer names before it
+/// connects.
 pub const max_user_len = 255;
 
+/// TLS caps an ALPN protocol name at 255 bytes (RFC 7301).
 pub const max_alpn_len = 255;
 
+/// What a login signature covers. Both ends fill it from their side of the
+/// connection, with alpn set to quic.alpn and revision to proto.revision.
 pub const Transcript = struct {
     exporter: [exporter_len]u8,
+    /// The server's host key. The client uses the key the server presented in
+    /// the TLS handshake.
     host_key: ssh.Key,
+    /// The account the client asks for. Empty asks for the account txd runs as.
     user: []const u8,
     alpn: []const u8,
     revision: u32,
 
     const max_len = 4 + exporter_len + 4 + ssh.key_blob_len + 4 + max_user_len + 4 + max_alpn_len + 4;
 
-    /// The SSHSIG input. Asserts the lengths are within bounds; the caller
-    /// checks a user name it received.
     pub fn signedData(t: Transcript) sshsig.SignedData {
         std.debug.assert(t.user.len <= max_user_len);
         std.debug.assert(t.alpn.len <= max_alpn_len);
@@ -54,7 +48,6 @@ pub const Transcript = struct {
         return .init(namespace, w.buffered());
     }
 
-    /// Checks a client's signature blob made with `key`.
     pub fn verify(t: Transcript, key: *const ssh.PublicKey, signature_blob: []const u8) sshsig.VerifyError!void {
         return sshsig.verify(key, signature_blob, &t.signedData());
     }

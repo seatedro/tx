@@ -1,26 +1,5 @@
-//! `txd --install`: keeps txd running for the user, and
-//! starts it if it isn't running. `install.sh --txd` runs it after it
-//! installs txd.
-//!
-//! On Linux with a systemd user manager, it installs the user service
-//! `txd.service` and turns on lingering, so that the user's manager
-//! starts at boot and keeps running after they log out. On macOS, it
-//! installs the LaunchAgent `txd`, which starts at each login.
-//! Elsewhere, when lingering can't be turned on, or when launchctl fails,
-//! it starts txd in the background, where it runs until the
-//! machine restarts.
-//!
-//! Running it again starts the server only if nothing has its port. A
-//! service file that names another binary or other options is rewritten.
-//! A server that has the port keeps running, with its sessions, and the
-//! new file applies from its next start. One that doesn't, such as after a
-//! change of port, restarts with the new file.
-//!
-//! Each session runs in a process of its own (see `session.spawn`), and
-//! the service manager stops only txd: sessions outlive a restart of the
-//! service, and the next txd finds them.
-//!
-//! `txd --uninstall` undoes it all; see `uninstall`.
+//! nix/home-module.nix declares the same service for home-manager.
+
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
@@ -33,23 +12,21 @@ const session = @import("session");
 const runtime_dir = @import("server").runtime_dir;
 const paths = @import("paths.zig");
 
-/// The systemd unit and the launchd label.
+/// The systemd unit is txd.service and the launchd label is txd. install.sh
+/// checks and restarts the service by these names.
 const name = "txd";
 
-/// How long a started server has to bind its port.
 const start_timeout_ms = 5000;
 
-/// In the state directory: the pid of a server started in the background,
-/// and a file that says `install` turned on lingering.
 const pid_file = name ++ ".pid";
+
+/// Present when txd --install turned on lingering, which --uninstall then
+/// turns off.
 const linger_file = "linger";
 
 pub const Options = struct {
-    /// The path of the txd binary the service runs.
     exe: []const u8,
-    /// The server's arguments, after `exe`.
     args: []const []const u8,
-    /// The address the server binds.
     listen: IpAddress,
     user: []const u8,
 };
@@ -74,23 +51,18 @@ pub fn install(gpa: Allocator, io: Io, environ: *const Environ.Map, options: Opt
 }
 
 const Start = enum {
-    /// A server already had the port.
     serving,
-    /// A server was started, and may not have bound its port yet.
     started,
 };
 
-/// How long `serving` waits for a refusal.
 const probe_timeout_ms = 200;
 
-/// True when something has bound the port of `address`. For a wildcard,
-/// the port is checked on 127.0.0.1, which txd binds too.
-///
-/// A datagram to a port nobody has bound draws an ICMP port unreachable,
-/// which a connected socket reports as ECONNREFUSED. Binding the port would
-/// tell as well, but while the check holds it, a server that is starting
-/// can fail to bind.
+/// Whether a UDP socket is bound at address, probed with one datagram. txd
+/// drops the byte without a reply. A closed port answers with ICMP port
+/// unreachable, which recv reports as ECONNREFUSED on a connected socket.
+/// Silence for probe_timeout_ms counts as bound.
 fn serving(address: IpAddress) bool {
+    // A txd on a wildcard address also listens on 127.0.0.1.
     const to: IpAddress = if (isWildcard(address)) .{ .ip4 = .loopback(address.getPort()) } else address;
     var addr: PosixAddress = undefined;
     const addr_len = Io.Threaded.addressToPosix(&to, &addr);
@@ -100,7 +72,6 @@ fn serving(address: IpAddress) bool {
     defer _ = std.c.close(fd);
     if (std.c.connect(fd, &addr.any, addr_len) != 0) return false;
 
-    // One byte, which a QUIC server drops.
     const probe = [1]u8{0};
     if (std.c.send(fd, &probe, probe.len, 0) < 0) return false;
 
@@ -111,6 +82,7 @@ fn serving(address: IpAddress) bool {
     return std.posix.errno(-1) != .CONNREFUSED;
 }
 
+/// A copy of isWildcard in server/addresses.zig.
 fn isWildcard(address: IpAddress) bool {
     return switch (address) {
         .ip4 => |a| std.mem.allEqual(u8, &a.bytes, 0),
@@ -118,13 +90,9 @@ fn isWildcard(address: IpAddress) bool {
     };
 }
 
-/// Null when no systemd user manager answers, or lingering is off and
-/// can't be turned on.
 fn systemd(gpa: Allocator, io: Io, environ: *const Environ.Map, options: Options) !?Start {
     if (!try succeeds(gpa, io, &.{ "systemctl", "--user", "--quiet", "show-environment" }, .quiet)) return null;
 
-    // Without lingering, the user's manager stops at their last logout,
-    // with its services, such as when the ssh session this runs in ends.
     const linger = try output(gpa, io, &.{ "loginctl", "show-user", options.user, "--property=Linger", "--value" }, .quiet);
     defer if (linger) |text| gpa.free(text);
     const lingering = if (linger) |text| std.mem.eql(u8, std.mem.trim(u8, text, " \n"), "yes") else false;
@@ -135,14 +103,11 @@ fn systemd(gpa: Allocator, io: Io, environ: *const Environ.Map, options: Options
         }
         std.debug.print("txd: turned on lingering for {s}, so the user's services run without a login\n", .{options.user});
 
-        // So that `uninstall` turns it off again.
         const linger_path = try paths.state(gpa, environ, linger_file);
         defer gpa.free(linger_path);
         _ = try writeIfChanged(gpa, io, linger_path, "txd --install turned on lingering.\n");
     }
 
-    // The user manager reads ~/.config/systemd/user whatever this
-    // session's XDG_CONFIG_HOME is.
     const path = try paths.home(gpa, environ, ".config/systemd/user/" ++ name ++ ".service");
     defer gpa.free(path);
     const unit = try systemdUnit(gpa, options.exe, options.args);
@@ -154,13 +119,15 @@ fn systemd(gpa: Allocator, io: Io, environ: *const Environ.Map, options: Options
     }
     if (!try succeeds(gpa, io, &.{ "systemctl", "--user", "--quiet", "enable", name ++ ".service" }, .show)) return error.SystemctlFailed;
 
+    // A txd that answers already keeps running, with the old unit if it
+    // changed.
     if (serving(options.listen)) return .serving;
 
-    // After five failed starts in ten seconds, systemd refuses to start the
-    // service until its failures are reset.
+    // After a crash loop hits systemd's start limit, systemd refuses to start
+    // the unit until reset-failed.
     _ = try succeeds(gpa, io, &.{ "systemctl", "--user", "reset-failed", name ++ ".service" }, .quiet);
 
-    // `start` leaves a running server alone, and it may have another port.
+    // start leaves a running service alone, and a changed unit needs restart.
     const verb = if (changed) "restart" else "start";
     if (!try succeeds(gpa, io, &.{ "systemctl", "--user", verb, name ++ ".service" }, .show)) {
         std.debug.print("txd: see journalctl --user -u {s}\n", .{name});
@@ -169,15 +136,15 @@ fn systemd(gpa: Allocator, io: Io, environ: *const Environ.Map, options: Options
     return .started;
 }
 
-/// The LaunchAgent goes in the GUI login's domain when there is one, and in
-/// the user's background domain otherwise. Null when launchctl fails to
-/// start it.
 fn launchd(gpa: Allocator, io: Io, environ: *const Environ.Map, options: Options) !?Start {
     const uid = std.c.getuid();
     var gui_buf: [32]u8 = undefined;
     const gui = std.fmt.bufPrint(&gui_buf, "gui/{d}", .{uid}) catch unreachable;
     var user_buf: [32]u8 = undefined;
     const user = std.fmt.bufPrint(&user_buf, "user/{d}", .{uid}) catch unreachable;
+
+    // gui/UID is the domain of the user's desktop login, when there is one.
+    // install.sh picks the domain the same way.
     const domain = if (try succeeds(gpa, io, &.{ "launchctl", "print", gui }, .quiet)) gui else user;
     var target_buf: [64]u8 = undefined;
     const target = std.fmt.bufPrint(&target_buf, "{s}/" ++ name, .{domain}) catch unreachable;
@@ -193,14 +160,16 @@ fn launchd(gpa: Allocator, io: Io, environ: *const Environ.Map, options: Options
 
     if (serving(options.listen)) return .serving;
 
-    // A loaded job keeps the plist it was loaded with until it is
-    // unloaded.
+    // launchd keeps the plist it bootstrapped. A changed file takes effect
+    // after bootout and bootstrap.
     var loaded = try succeeds(gpa, io, &.{ "launchctl", "print", target }, .quiet);
     if (loaded and changed) {
         _ = try succeeds(gpa, io, &.{ "launchctl", "bootout", target }, .show);
         loaded = false;
     }
-    // `launchctl disable` outlasts the job, and stops a bootstrap.
+
+    // A disabled service can't be bootstrapped, and launchd keeps that state
+    // across boots.
     const started = if (loaded)
         try succeeds(gpa, io, &.{ "launchctl", "kickstart", target }, .show)
     else
@@ -213,9 +182,6 @@ fn launchd(gpa: Allocator, io: Io, environ: *const Environ.Map, options: Options
     return .started;
 }
 
-/// Starts the server in its own process group, with its output going to
-/// `txd.log` in the state directory. It outlives the login that started it
-/// unless logind kills a user's processes at logout (`KillUserProcesses`).
 fn background(gpa: Allocator, io: Io, environ: *const Environ.Map, options: Options) !Start {
     if (serving(options.listen)) return .serving;
 
@@ -230,7 +196,8 @@ fn background(gpa: Allocator, io: Io, environ: *const Environ.Map, options: Opti
     argv[0] = options.exe;
     @memcpy(argv[1..], options.args);
 
-    // Not waited for. It is reparented when this process exits.
+    // A process group of its own keeps txd out of the terminal's foreground
+    // group, the group that gets SIGINT from Ctrl-C and SIGHUP on a hangup.
     const child = try std.process.spawn(io, .{
         .argv = argv,
         .stdin = .ignore,
@@ -239,7 +206,6 @@ fn background(gpa: Allocator, io: Io, environ: *const Environ.Map, options: Opti
         .pgid = 0,
     });
 
-    // For `uninstall`, which has no service to stop it with.
     const pid_path = try paths.state(gpa, environ, pid_file);
     defer gpa.free(pid_path);
     var pid_buf: [16]u8 = undefined;
@@ -248,21 +214,10 @@ fn background(gpa: Allocator, io: Io, environ: *const Environ.Map, options: Opti
     return .started;
 }
 
-/// Undoes `install`. Stops txd: its service, or the server it started in
-/// the background. Turns lingering off if `install` turned it on. Ends the
-/// sessions, as `tx --kill` does. Then removes txd's files in the state
-/// directory, the default host key and the log, and last
-/// `~/.local/share/tx`, with the terminfo entries txd compiled, and the
-/// copies of txd that older versions of tx put there over ssh. A key given
-/// with `--key`, `~/.config/tx/authorized_keys`, and the tx and txd that
-/// were installed stay.
-///
-/// Each step must succeed before the next. Nothing is removed while
-/// something still has the port of `listen`, the address the server was
-/// installed with, such as a txd started by hand. After a failure, running
-/// it again picks up where it stopped.
+/// Stops txd however --install started it and ends every session before
+/// deleting the files txd keeps. Fails with error.PortInUse, before ending
+/// sessions, when something still answers on listen.
 pub fn uninstall(gpa: Allocator, io: Io, environ: *const Environ.Map, user: []const u8, listen: IpAddress) !void {
-    // The service first, so that nothing starts txd again.
     switch (builtin.os.tag) {
         .macos => try removeLaunchd(gpa, io, environ),
         .linux => try removeSystemd(gpa, io, environ, user),
@@ -275,11 +230,7 @@ pub fn uninstall(gpa: Allocator, io: Io, environ: *const Environ.Map, user: []co
     }
     try endSessions(gpa, io, environ);
 
-    // The keys and the log, then the directory with txd in it, so that
-    // after a failure the next uninstall has a txd to run. The binary
-    // running this keeps running.
     const dir = Io.Dir.cwd();
-    // `spa_key` is an older txd's.
     for ([_][]const u8{ "host_key", "spa_key", name ++ ".log" }) |file| {
         const path = try paths.state(gpa, environ, file);
         defer gpa.free(path);
@@ -287,7 +238,6 @@ pub fn uninstall(gpa: Allocator, io: Io, environ: *const Environ.Map, user: []co
     }
     const state_dir = try paths.state(gpa, environ, "");
     defer gpa.free(state_dir);
-    // The state directory, if nothing else is in it.
     dir.deleteDir(io, state_dir) catch {};
     std.debug.print("txd: removed txd's keys and log\n", .{});
 
@@ -299,20 +249,19 @@ pub fn uninstall(gpa: Allocator, io: Io, environ: *const Environ.Map, user: []co
     }
 }
 
-/// Stops and removes the user service, and turns lingering off if
-/// `install` turned it on.
 fn removeSystemd(gpa: Allocator, io: Io, environ: *const Environ.Map, user: []const u8) !void {
     const path = try paths.home(gpa, environ, ".config/systemd/user/" ++ name ++ ".service");
     defer gpa.free(path);
     if (exists(io, path)) {
-        // `--now` stops the service too. With `KillMode=process`, its
-        // sessions keep running.
         if (!try succeeds(gpa, io, &.{ "systemctl", "--user", "--quiet", "disable", "--now", name ++ ".service" }, .show)) {
             std.debug.print("txd: can't stop {s}.service\n", .{name});
             return error.SystemctlFailed;
         }
         try Io.Dir.cwd().deleteFile(io, path);
         _ = try succeeds(gpa, io, &.{ "systemctl", "--user", "daemon-reload" }, .show);
+
+        // systemd lists a failed unit until reset-failed, even after its file
+        // is gone.
         _ = try succeeds(gpa, io, &.{ "systemctl", "--user", "reset-failed", name ++ ".service" }, .quiet);
         std.debug.print("txd: removed {s}\n", .{path});
     }
@@ -327,10 +276,10 @@ fn removeSystemd(gpa: Allocator, io: Io, environ: *const Environ.Map, user: []co
     }
 }
 
-/// Unloads the LaunchAgent from whichever domain has it, and removes it
-/// and its log.
 fn removeLaunchd(gpa: Allocator, io: Io, environ: *const Environ.Map) !void {
     const uid = std.c.getuid();
+
+    // --install may have used either domain.
     for ([_][]const u8{ "gui", "user" }) |domain| {
         var target_buf: [64]u8 = undefined;
         const target = std.fmt.bufPrint(&target_buf, "{s}/{d}/" ++ name, .{ domain, uid }) catch unreachable;
@@ -353,11 +302,8 @@ fn removeLaunchd(gpa: Allocator, io: Io, environ: *const Environ.Map) !void {
     try deleteIfExists(io, log_path);
 }
 
-/// How long `uninstall` waits for txd and the sessions to exit.
 const stop_timeout_ms = 5000;
 
-/// Stops the server `background` started, if it still runs. The pid file
-/// goes once that server is gone.
 fn stopBackground(gpa: Allocator, io: Io, environ: *const Environ.Map) !void {
     const path = try paths.state(gpa, environ, pid_file);
     defer gpa.free(path);
@@ -367,10 +313,12 @@ fn stopBackground(gpa: Allocator, io: Io, environ: *const Environ.Map) !void {
     };
     defer gpa.free(text);
 
-    // After a restart the pid may be another program's.
     const pid = std.fmt.parseInt(std.posix.pid_t, std.mem.trim(u8, text, " \n"), 10) catch null;
+
+    // The pid in the file can belong to another program by now.
     if (pid != null and try isTxd(gpa, io, pid.?) and std.c.kill(pid.?, .TERM) == 0) {
         var waited: u64 = 0;
+
         while (std.c.kill(pid.?, @fromBackingInt(@intCast(0))) == 0) : (waited += 50) {
             if (waited >= stop_timeout_ms) {
                 std.debug.print("txd: the server running in the background, pid {d}, didn't stop\n", .{pid.?});
@@ -383,8 +331,6 @@ fn stopBackground(gpa: Allocator, io: Io, environ: *const Environ.Map) !void {
     try Io.Dir.cwd().deleteFile(io, path);
 }
 
-/// Whether process `pid` runs a program named txd. ps names it on Linux and
-/// macOS alike.
 fn isTxd(gpa: Allocator, io: Io, pid: std.posix.pid_t) !bool {
     var pid_buf: [16]u8 = undefined;
     const pid_text = std.fmt.bufPrint(&pid_buf, "{d}", .{pid}) catch unreachable;
@@ -393,8 +339,9 @@ fn isTxd(gpa: Allocator, io: Io, pid: std.posix.pid_t) !bool {
     return std.mem.eql(u8, std.fs.path.basename(std.mem.trim(u8, text, " \n")), name);
 }
 
-/// Ends every session and waits for their processes to exit, then removes
-/// the runtime directory.
+/// Sends Kill to every session socket in the runtime directory, then waits for
+/// the sockets to go. A session process removes its socket when its session
+/// ends.
 fn endSessions(gpa: Allocator, io: Io, environ: *const Environ.Map) !void {
     const dir = try paths.runtime(gpa, environ);
     defer gpa.free(dir);
@@ -407,12 +354,11 @@ fn endSessions(gpa: Allocator, io: Io, environ: *const Environ.Map) !void {
     var ended: usize = 0;
     for (ids) |id| {
         killSession(dir, id) catch |err| switch (err) {
-            // A socket whose process is gone, as the server treats one.
+            // The socket outlived its process.
             error.ConnectionRefused => {
                 runtime_dir.remove(dir, id);
                 continue;
             },
-            // Gone since the listing.
             error.FileNotFound => continue,
             else => {
                 std.debug.print("txd: can't reach session {d}: {t}\n", .{ id, err });
@@ -422,7 +368,6 @@ fn endSessions(gpa: Allocator, io: Io, environ: *const Environ.Map) !void {
         ended += 1;
     }
 
-    // A session process removes its socket as its session ends.
     var waited: u64 = 0;
     while (true) : (waited += 50) {
         const left = try runtime_dir.ids(gpa, io, dir);
@@ -440,7 +385,7 @@ fn endSessions(gpa: Allocator, io: Io, environ: *const Environ.Map) !void {
     Io.Dir.cwd().deleteDir(io, dir) catch {};
 }
 
-/// Sends `Kill` to session `id`'s process.
+/// Sends Kill and leaves the reply unread; endSessions watches the socket file.
 fn killSession(dir: []const u8, id: u64) !void {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const fd = try session.unix.connect(try runtime_dir.socketPath(&path_buf, dir, id));
@@ -469,18 +414,14 @@ fn deleteIfExists(io: Io, path: []const u8) !void {
     };
 }
 
-/// Whether a failing command's stderr is shown. A check that is expected
-/// to fail is quiet.
 const Errors = enum { show, quiet };
 
-/// Runs `argv`. A program that isn't installed fails.
 fn succeeds(gpa: Allocator, io: Io, argv: []const []const u8, errors: Errors) !bool {
     const text = try output(gpa, io, argv, errors) orelse return false;
     gpa.free(text);
     return true;
 }
 
-/// The stdout of `argv`, owned, or null if it fails.
 fn output(gpa: Allocator, io: Io, argv: []const []const u8, errors: Errors) !?[]u8 {
     const result = std.process.run(gpa, io, .{
         .argv = argv,
@@ -499,8 +440,6 @@ fn output(gpa: Allocator, io: Io, argv: []const []const u8, errors: Errors) !?[]
     return null;
 }
 
-/// Writes `data` to `path`, creating its directory, unless the file holds
-/// it already. Returns whether it wrote.
 fn writeIfChanged(gpa: Allocator, io: Io, path: []const u8, data: []const u8) !bool {
     const dir = Io.Dir.cwd();
     if (dir.readFileAlloc(io, path, gpa, .limited(1 << 20))) |old| {
@@ -516,9 +455,6 @@ fn writeIfChanged(gpa: Allocator, io: Io, path: []const u8, data: []const u8) !b
     return true;
 }
 
-/// `KillMode=process` stops only txd, and the session processes stay in
-/// the service's cgroup. Shutdown and the end of the user's manager still
-/// end them.
 fn systemdUnit(gpa: Allocator, exe: []const u8, args: []const []const u8) ![]u8 {
     var out: Io.Writer.Allocating = .init(gpa);
     errdefer out.deinit();
@@ -536,6 +472,9 @@ fn systemdUnit(gpa: Allocator, exe: []const u8, args: []const []const u8) ![]u8 
         try w.writeByte(' ');
         try writeSystemdArg(w, arg);
     }
+
+    // Session processes share txd's cgroup. KillMode=process leaves them
+    // running when the service stops.
     try w.writeAll(
         \\
         \\Restart=on-failure
@@ -548,8 +487,8 @@ fn systemdUnit(gpa: Allocator, exe: []const u8, args: []const []const u8) ![]u8 
     return out.toOwnedSlice();
 }
 
-/// A word of `ExecStart`, in double quotes. `%` and `$` are doubled, since
-/// systemd expands `%` specifiers and `$` variables inside quotes too.
+/// Writes arg as one quoted ExecStart word. systemd expands % specifiers and $
+/// variables in it, and reads %% and $$ as % and $.
 fn writeSystemdArg(w: *Io.Writer, arg: []const u8) !void {
     try w.writeByte('"');
     for (arg) |byte| switch (byte) {
@@ -560,8 +499,6 @@ fn writeSystemdArg(w: *Io.Writer, arg: []const u8) !void {
     try w.writeByte('"');
 }
 
-/// `AbandonProcessGroup` keeps launchd from killing txd's process group
-/// when txd exits. Session processes are in sessions of their own already.
 fn launchdPlist(gpa: Allocator, exe: []const u8, args: []const []const u8, log_path: []const u8) ![]u8 {
     var out: Io.Writer.Allocating = .init(gpa);
     errdefer out.deinit();
@@ -626,10 +563,8 @@ fn writeXmlString(w: *Io.Writer, text: []const u8) !void {
     try w.writeAll("</string>");
 }
 
-/// The path of the running binary, without resolving symlinks, so that a
-/// service names `/opt/homebrew/bin/txd` and keeps working after an
-/// upgrade replaces the binary it points to. Falls back to the resolved
-/// path.
+/// The absolute path argv[0] names, looked up in PATH when it has no slash,
+/// with symlinks left unresolved. Falls back to the running executable's path.
 pub fn exePath(gpa: Allocator, io: Io, environ: *const Environ.Map, arg0: []const u8) ![]u8 {
     if (std.mem.indexOfScalar(u8, arg0, '/') != null) {
         if (std.fs.path.isAbsolute(arg0)) return gpa.dupe(u8, arg0);
@@ -638,7 +573,6 @@ pub fn exePath(gpa: Allocator, io: Io, environ: *const Environ.Map, arg0: []cons
         return std.fs.path.join(gpa, &.{ cwd, arg0 });
     }
 
-    // Found in PATH, as the shell found it.
     if (environ.get("PATH")) |search| {
         var dirs = std.mem.tokenizeScalar(u8, search, ':');
         while (dirs.next()) |dir| {

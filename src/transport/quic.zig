@@ -1,9 +1,3 @@
-//! QUIC connections over ngtcp2, with TLS 1.3 from tls.c (Ed25519 raw public
-//! keys, ALPN "tx/1", hybrid post-quantum key exchange).
-//!
-//! `Connection` performs no I/O. The caller passes received datagrams to
-//! `receive`, transmits the datagrams written by `send` and `sendStream`, and
-//! calls `handleExpiry` when `timeout` elapses.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -13,36 +7,28 @@ const Ed25519 = std.crypto.sign.Ed25519;
 const crypto = @import("crypto");
 const c = @import("c");
 
+/// ngtcp2 errors as Connection sorts them. Closed means the connection is
+/// closing or draining. IdleTimeout includes a handshake timeout.
 pub const Error = error{
     OutOfMemory,
-    /// The datagram is not a QUIC Initial packet a server can accept.
     NotInitial,
-    /// The TLS handshake failed, for example because the client doesn't
-    /// accept the server's key.
     HandshakeFailed,
-    /// The connection is closing or draining.
     Closed,
-    /// The connection timed out from inactivity.
     IdleTimeout,
-    /// The peer allows no more streams for now.
     StreamLimit,
-    /// The stream does not exist or its send side is shut.
     StreamClosed,
-    /// Any other ngtcp2 error; `Connection.last_error` holds its code.
     Quic,
 };
 
-/// The ALPN protocol ID of tx connections. Both ends require it.
 pub const alpn: []const u8 = c.TX_TLS_ALPN;
 
-/// Minimum length of the buffers passed to `send` and `sendStream`. This is
-/// ngtcp2's default maximum UDP payload size.
+/// ngtcp2 writes no datagram larger than its default max_tx_udp_payload_size,
+/// 1500 - 48 bytes. Buffers passed to send, sendStream and writeClose hold at
+/// least this much.
 pub const max_datagram_size = 1452;
 
-/// Server TLS context for one Ed25519 identity.
 pub const Server = struct {
     tls: *c.tx_tls_server,
-    /// Derives stateless reset tokens from connection IDs.
     reset_secret: [32]u8,
 
     pub fn init(identity: Ed25519.KeyPair) Error!Server {
@@ -62,17 +48,13 @@ pub const Server = struct {
     }
 };
 
-/// Client TLS context. Use it for one connection at a time: it keeps the
-/// key the server presented.
+/// TLS settings for outgoing connections. Every connection made from one
+/// Client shares the record of which key the server presented.
 pub const Client = struct {
     tls: *c.tx_tls_client,
 
-    /// The server keys a client accepts.
     pub const Accept = union(enum) {
-        /// Copied by `init`.
         keys: []const [32]u8,
-        /// Any key, to learn a server's key on first contact. The handshake
-        /// still proves the server holds the key it presents.
         any,
     };
 
@@ -81,8 +63,6 @@ pub const Client = struct {
             .keys => |keys| keys,
             .any => &.{},
         };
-        // translate-c drops the const of `const uint8_t (*)[32]`. The keys
-        // are only read.
         const tls = c.tx_tls_client_new(@constCast(keys.ptr), keys.len, @intFromBool(accept == .any), @intFromBool(crypto.has_hardware_aes)) orelse
             return error.OutOfMemory;
         return .{ .tls = tls };
@@ -92,8 +72,6 @@ pub const Client = struct {
         c.tx_tls_client_free(self.tls);
     }
 
-    /// The key the server presented in the last handshake, accepted or
-    /// not.
     pub fn presentedKey(self: *const Client) ?[32]u8 {
         var key: [32]u8 = undefined;
         if (c.tx_tls_client_presented_key(self.tls, &key) == 0) return null;
@@ -106,34 +84,29 @@ pub const Datagram = struct {
     to: IpAddress,
 };
 
-/// What a client's Initial packet shows about its address: nothing, that
-/// it returned a Retry's token, or a token that doesn't verify.
 pub const RetryCheck = union(enum) {
     none,
     valid: Retry,
     invalid,
 };
 
-/// A verified Retry token.
+/// What Connection.accept needs from a verified Retry token. token points
+/// into the received packet.
 pub const Retry = struct {
-    /// The connection ID the client's first Initial went to.
     original_dcid: c.ngtcp2_cid,
-    /// Points into the packet.
     token: []const u8,
 };
 
-/// How long a client has to return a Retry's token.
 const retry_token_timeout_ns = 10 * std.time.ns_per_s;
 
-/// The header of `packet` if it is an Initial a server can accept.
 pub fn initialHeader(packet: []const u8) ?c.ngtcp2_pkt_hd {
     var hd: c.ngtcp2_pkt_hd = undefined;
     if (c.ngtcp2_accept(&hd, packet.ptr, packet.len) != 0) return null;
     return hd;
 }
 
-/// Checks the token of the Initial with header `hd`, which `remote` sent.
 pub fn checkRetryToken(io: Io, secret: *const [32]u8, hd: *const c.ngtcp2_pkt_hd, remote: IpAddress) RetryCheck {
+    // ngtcp2 tokens start with a magic byte. Tokens of other kinds count as none.
     if (hd.tokenlen == 0 or hd.token[0] != c.NGTCP2_CRYPTO_TOKEN_MAGIC_RETRY2) return .none;
     var addr: PosixAddress = undefined;
     const addr_len = Io.Threaded.addressToPosix(&remote, &addr);
@@ -143,8 +116,6 @@ pub fn checkRetryToken(io: Io, secret: *const [32]u8, hd: *const c.ngtcp2_pkt_hd
     return .{ .valid = .{ .original_dcid = original_dcid, .token = hd.token[0..hd.tokenlen] } };
 }
 
-/// Writes into `out` a Retry answering the Initial with header `hd`, which
-/// `remote` sent. Returns its length.
 pub fn writeRetry(io: Io, out: []u8, secret: *const [32]u8, hd: *const c.ngtcp2_pkt_hd, remote: IpAddress) Error!usize {
     var addr: PosixAddress = undefined;
     const addr_len = Io.Threaded.addressToPosix(&remote, &addr);
@@ -157,6 +128,8 @@ pub fn writeRetry(io: Io, out: []u8, secret: *const [32]u8, hd: *const c.ngtcp2_
     return @intCast(n);
 }
 
+/// Heap-allocated. ngtcp2's user data and the TLS session's conn_ref point at
+/// it.
 pub const Connection = struct {
     gpa: Allocator,
     io: Io,
@@ -165,61 +138,42 @@ pub const Connection = struct {
     conn_ref: c.ngtcp2_crypto_conn_ref,
     local: IpAddress,
     handler: Handler,
-    /// Set on servers. Stateless reset tokens are derived from it.
     reset_secret: ?*const [32]u8,
-    /// The ngtcp2 error code behind the last `Error.Quic`.
     last_error: c_int = 0,
 
+    /// Callbacks run inside ngtcp2 calls. ngtcp2 forbids calling receive,
+    /// send, sendStream or writeClose from them.
     pub const Handler = struct {
         ctx: ?*anyopaque = null,
         handshakeCompleted: ?*const fn (ctx: ?*anyopaque, conn: *Connection) void = null,
-        /// Call `consume` after processing `data` to extend the peer's flow
-        /// control window.
+        /// The stream's receive window reopens as consume is called for the
+        /// data.
         streamData: ?*const fn (ctx: ?*anyopaque, conn: *Connection, stream_id: i64, data: []const u8, fin: bool) void = null,
-        /// The peer acknowledged `len` bytes of `stream_id` starting at
-        /// `offset`. Bytes passed to `sendStream` must stay valid and
-        /// unchanged until they are acknowledged. Successive calls for a
-        /// stream cover contiguous ranges.
         streamAcked: ?*const fn (ctx: ?*anyopaque, conn: *Connection, stream_id: i64, offset: u64, len: u64) void = null,
-        /// The peer opened `stream_id`.
         streamOpened: ?*const fn (ctx: ?*anyopaque, conn: *Connection, stream_id: i64) void = null,
-        /// The peer reset its sending side of `stream_id`.
         streamReset: ?*const fn (ctx: ?*anyopaque, conn: *Connection, stream_id: i64, app_error_code: u64) void = null,
-        /// ngtcp2 discarded the state of `stream_id`. It holds no more
-        /// references to data passed to `sendStream` for the stream.
         streamClosed: ?*const fn (ctx: ?*anyopaque, conn: *Connection, stream_id: i64) void = null,
-        /// The connection issued a source connection ID. The peer may
-        /// address packets to it.
         connectionIdIssued: ?*const fn (ctx: ?*anyopaque, conn: *Connection, cid: []const u8) void = null,
         connectionIdRetired: ?*const fn (ctx: ?*anyopaque, conn: *Connection, cid: []const u8) void = null,
     };
 
     pub const Options = struct {
         handler: Handler = .{},
-        /// SNI sent by clients. Optional; raw public key authentication does
-        /// not use it.
         server_name: ?[*:0]const u8 = null,
         idle_timeout_ns: u64 = 30 * std.time.ns_per_s,
-        /// Gives up on a handshake that hasn't completed after this long.
-        /// Null leaves it to the idle timeout.
+        /// Used by connect only. Null leaves ngtcp2 with no handshake
+        /// timeout.
         handshake_timeout_ns: ?u64 = null,
-        /// Send a PING after this long without other packets, so an idle
-        /// connection stays open.
         keep_alive_ns: ?u64 = null,
-        /// Bytes the peer may send on each stream ahead of `consume`.
         stream_window: u64 = 8 << 20,
-        /// Bytes the peer may send on all streams together ahead of
-        /// `consume`.
         connection_window: u64 = 32 << 20,
     };
 
-    /// Error code carried by a CONNECTION_CLOSE frame.
     pub const CloseCode = union(enum) {
         transport: u64,
         application: u64,
     };
 
-    /// Start a client connection to `remote`.
     pub fn connect(
         gpa: Allocator,
         io: Io,
@@ -277,8 +231,6 @@ pub const Connection = struct {
         return self;
     }
 
-    /// Accept a client's first datagram on a server. `retry` is set when
-    /// the datagram returned a Retry's token.
     pub fn accept(
         gpa: Allocator,
         io: Io,
@@ -305,13 +257,17 @@ pub const Connection = struct {
             .reset_secret = &server.reset_secret,
         };
 
+        // ngtcp2 issues later connection IDs at this length, and endpoint.zig's
+        // cid_len assumes it.
         const scid = randomCid(16);
         var settings = defaultSettings(io);
         var params = defaultParams(options);
         params.original_dcid = hd.dcid;
         params.original_dcid_present = 1;
-        // After a Retry, the client's address is validated, and the
-        // parameters name both IDs, as RFC 9000 §7.3 requires.
+
+        // After a Retry, original_dcid is the DCID of the client's first
+        // Initial, recovered from the token. retry_scid is the SCID the Retry
+        // chose, which the client sends as its DCID (RFC 9000 section 7.3).
         if (retry) |r| {
             params.original_dcid = r.original_dcid;
             params.retry_scid = hd.dcid;
@@ -359,14 +315,12 @@ pub const Connection = struct {
     }
 
     pub fn deinit(self: *Connection) void {
-        // The connection references the session as its TLS native handle.
-        // Delete the connection first.
         c.ngtcp2_conn_del(self.conn);
         c.tx_tls_session_free(self.session);
         self.gpa.destroy(self);
     }
 
-    /// Process one datagram from `from`.
+    /// Processes one datagram from `from`. Handler callbacks run inside.
     pub fn receive(self: *Connection, from: IpAddress, packet: []const u8) Error!void {
         var path: Path = undefined;
         path.init(self.local, from);
@@ -374,8 +328,6 @@ pub const Connection = struct {
         try self.check(c.ngtcp2_conn_read_pkt_versioned(self.conn, &path.value, c.NGTCP2_PKT_INFO_VERSION, &pi, packet.ptr, packet.len, now(self.io)));
     }
 
-    /// Write the next packet into `buf`, or return null if there is nothing
-    /// to send.
     pub fn send(self: *Connection, buf: []u8) Error!?Datagram {
         std.debug.assert(buf.len >= max_datagram_size);
         var ps: c.ngtcp2_path_storage = undefined;
@@ -387,42 +339,29 @@ pub const Connection = struct {
 
     pub const StreamWrite = struct {
         datagram: ?Datagram,
-        /// Bytes of `data` accepted by the connection (see `sendStream`).
         consumed: usize,
-        /// The packet carries the stream's FIN.
         fin: bool = false,
-        /// Flow control blocks the stream. `datagram` is a packet without
-        /// data for it, if there was anything else to send.
         blocked: bool = false,
     };
 
-    /// Write the next packet into `buf`, carrying as much of `data` for
-    /// `stream_id` as fits and flow control allows. With `fin`, the stream
-    /// is closed once all of `data` has been consumed.
-    ///
-    /// ngtcp2 does not copy stream data. It keeps pointers into `data` for
-    /// retransmission. Consumed bytes must stay valid and unchanged until
-    /// `Handler.streamAcked` covers them.
+    /// Writes a datagram carrying a prefix of data on the stream, with FIN
+    /// when fin is set and all of data fits. The caller keeps sent bytes
+    /// until streamAcked covers them or the stream closes. ngtcp2 retransmits
+    /// from them.
     pub fn sendStream(self: *Connection, buf: []u8, stream_id: i64, data: []const u8, fin: bool) Error!StreamWrite {
         std.debug.assert(buf.len >= max_datagram_size);
         var ps: c.ngtcp2_path_storage = undefined;
         c.ngtcp2_path_storage_zero(&ps);
         var pi: c.ngtcp2_pkt_info = undefined;
         var vec: c.ngtcp2_vec = .{ .base = @constCast(data.ptr), .len = data.len };
-        // ngtcp2 sets `datalen` to the stream bytes it put in the packet,
-        // and leaves it at -1 if the packet carries none.
         var datalen: c.ngtcp2_ssize = -1;
         const flags: u32 = if (fin) c.NGTCP2_WRITE_STREAM_FLAG_FIN else 0;
         const n = c.ngtcp2_conn_writev_stream_versioned(self.conn, &ps.path, c.NGTCP2_PKT_INFO_VERSION, &pi, buf.ptr, buf.len, &datalen, flags, stream_id, &vec, 1, now(self.io));
 
-        // The stream has no credit, but other frames (ACKs, other streams)
-        // may still need a packet.
         if (n == c.NGTCP2_ERR_STREAM_DATA_BLOCKED) {
             return .{ .datagram = try self.send(buf), .consumed = 0, .blocked = true };
         }
 
-        // The FIN went out if a packet was written and it carried the last
-        // byte of `data`.
         const d = try self.datagram(n, &ps);
         return .{
             .datagram = d,
@@ -443,20 +382,14 @@ pub const Connection = struct {
         return stream_id;
     }
 
-    /// Whether this side opened `stream_id`.
     pub fn isLocalStream(self: *const Connection, stream_id: i64) bool {
         return c.ngtcp2_conn_is_local_stream2(self.conn, stream_id) != 0;
     }
 
-    /// Abort `stream_id` in both directions its type allows, sending
-    /// RESET_STREAM and STOP_SENDING with `app_error_code`. Unacknowledged
-    /// data is not retransmitted.
     pub fn resetStream(self: *Connection, stream_id: i64, app_error_code: u64) Error!void {
         try self.check(c.ngtcp2_conn_shutdown_stream(self.conn, 0, stream_id, app_error_code));
     }
 
-    /// Write a packet carrying CONNECTION_CLOSE with `code` into `buf`. The
-    /// connection then sends nothing else.
     pub fn writeClose(self: *Connection, buf: []u8, code: CloseCode) Error!?Datagram {
         std.debug.assert(buf.len >= max_datagram_size);
 
@@ -473,17 +406,13 @@ pub const Connection = struct {
         return self.datagram(n, &ps);
     }
 
-    /// The transport error code that reports `last_error` to the peer.
     pub fn errorCode(self: *const Connection) u64 {
-        // A TLS failure is reported as CRYPTO_ERROR plus the TLS alert
-        // (RFC 9000 §20.1).
+        // A TLS alert maps to CRYPTO_ERROR 0x0100 + alert (RFC 9001 section 4.8).
         if (self.last_error == c.NGTCP2_ERR_CRYPTO)
             return c.NGTCP2_CRYPTO_ERROR | @as(u64, c.ngtcp2_conn_get_tls_alert2(self.conn));
         return c.ngtcp2_err_infer_quic_transport_error_code(self.last_error);
     }
 
-    /// The code of the peer's CONNECTION_CLOSE, once `receive` has
-    /// returned `error.Closed` for it.
     pub fn peerCloseCode(self: *const Connection) CloseCode {
         const ccerr = c.ngtcp2_conn_get_ccerr2(self.conn);
         return switch (ccerr.*.type) {
@@ -492,31 +421,20 @@ pub const Connection = struct {
         };
     }
 
-    /// Source connection IDs in use. The peer addresses packets to them.
     pub fn connectionIds(self: *const Connection, buf: *[max_connection_ids]c.ngtcp2_cid) []c.ngtcp2_cid {
-        // With a null buffer, ngtcp2_conn_get_scid2 returns the count.
         std.debug.assert(c.ngtcp2_conn_get_scid2(self.conn, null) <= buf.len);
         return buf[0..c.ngtcp2_conn_get_scid2(self.conn, buf)];
     }
 
-    /// ngtcp2 keeps up to 8 IDs in use (NGTCP2_MAX_SCID_POOL_SIZE), and
-    /// counts retired IDs it hasn't dropped yet.
     pub const max_connection_ids = 16;
 
-    /// Give the peer `n` more bytes of flow control credit on `stream_id` and
-    /// on the connection. Call after processing `n` bytes of received data.
     pub fn consume(self: *Connection, stream_id: i64, n: usize) Error!void {
         try self.check(c.ngtcp2_conn_extend_max_stream_offset(self.conn, stream_id, n));
         c.ngtcp2_conn_extend_max_offset(self.conn, n);
     }
 
-    /// Fills `out` from the TLS exporter (RFC 8446 §7.5) with `label` and
-    /// an empty context. Both ends derive the same bytes. Asserts the
-    /// handshake has completed.
     pub fn exportSecret(self: *const Connection, out: []u8, label: [*:0]const u8) void {
         std.debug.assert(self.isHandshakeComplete());
-        // picotls fails only before the handshake or on a label longer
-        // than the exporter's HKDF can take.
         if (c.tx_tls_session_export(self.session, out.ptr, out.len, label) != 0) unreachable;
     }
 
@@ -524,8 +442,6 @@ pub const Connection = struct {
         return c.ngtcp2_conn_get_handshake_completed(self.conn) != 0;
     }
 
-    /// Nanoseconds until `handleExpiry` must be called, or null if no timer
-    /// is armed.
     pub fn timeout(self: *const Connection) ?u64 {
         const expiry = c.ngtcp2_conn_get_expiry(self.conn);
         if (expiry == std.math.maxInt(u64)) return null;
@@ -533,7 +449,6 @@ pub const Connection = struct {
         return if (expiry <= t) 0 else expiry - t;
     }
 
-    /// Run expired timers, such as retransmission and idle timeout.
     pub fn handleExpiry(self: *Connection) Error!void {
         const t = now(self.io);
         if (c.ngtcp2_conn_get_expiry(self.conn) <= t) {
@@ -555,7 +470,6 @@ pub const Connection = struct {
         return switch (code) {
             c.NGTCP2_ERR_CRYPTO => error.HandshakeFailed,
             c.NGTCP2_ERR_DRAINING, c.NGTCP2_ERR_CLOSING => error.Closed,
-            // A handshake that timed out is reported as an idle timeout.
             c.NGTCP2_ERR_IDLE_CLOSE, c.NGTCP2_ERR_HANDSHAKE_TIMEOUT => error.IdleTimeout,
             c.NGTCP2_ERR_NOMEM => error.OutOfMemory,
             c.NGTCP2_ERR_STREAM_ID_BLOCKED => error.StreamLimit,
@@ -565,8 +479,8 @@ pub const Connection = struct {
     }
 };
 
-/// An ngtcp2_path with inline address storage. `value` points into the
-/// struct; initialize it in place and do not copy it.
+/// value points into local and remote. A Path is initialized in place and
+/// must not be copied.
 const Path = struct {
     local: PosixAddress,
     remote: PosixAddress,
@@ -583,6 +497,7 @@ const Path = struct {
     }
 };
 
+/// ngtcp2 timestamps are nanoseconds on a monotonic clock.
 fn now(io: Io) c.ngtcp2_tstamp {
     return @intCast(Io.Clock.awake.now(io).nanoseconds);
 }
@@ -706,9 +621,6 @@ fn ackedStreamData(
     return 0;
 }
 
-// The ngtcp2 callbacks below forward to `Handler`. Returning 0 tells ngtcp2
-// the callback succeeded.
-
 fn streamOpen(_: ?*c.ngtcp2_conn, stream_id: i64, user_data: ?*anyopaque) callconv(.c) c_int {
     const self = fromUserData(user_data);
     if (self.handler.streamOpened) |f| f(self.handler.ctx, self, stream_id);
@@ -725,11 +637,10 @@ fn streamClose(
 ) callconv(.c) c_int {
     const self = fromUserData(user_data);
 
-    // A stream the peer opened gives its place back, so that the peer can
-    // keep opening streams over a long connection. ngtcp2 leaves this to
-    // the application.
+    // ngtcp2 doesn't raise the peer's stream limit by itself. Each closed peer
+    // stream lets the peer open one more. Bit 0x2 marks a unidirectional
+    // stream ID (RFC 9000 section 2.1).
     if (c.ngtcp2_conn_is_local_stream2(conn, stream_id) == 0) {
-        // Bit 1 of a stream's ID is set for a unidirectional stream.
         if (stream_id & 0x2 != 0) c.ngtcp2_conn_extend_max_streams_uni(conn, 1) else c.ngtcp2_conn_extend_max_streams_bidi(conn, 1);
     }
 

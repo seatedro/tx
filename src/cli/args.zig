@@ -1,65 +1,39 @@
-//! tx's command line: ssh's options, read as ssh reads them (see
-//! `getopt`), so that a tool that runs ssh can run tx, and tx's own,
-//! which are long.
-//!
-//! As in ssh, options come before the destination and after it. The first
-//! word after the destination that isn't an option starts the command,
-//! and `--` ends the options. The destination is `[user@]host` or
-//! `ssh://[user@]host[:port]`.
-//!
-//! Of ssh's options, some take effect, some have nothing to do in tx and
-//! are ignored, some ask for a feature tx lacks without changing what the
-//! connection does and are ignored with a warning (`Args.ignored`), and
-//! the rest are refused as unsupported.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const getopt = @import("getopt.zig");
 
-/// ssh's option letters, from OpenSSH's ssh.c.
+/// The option string OpenSSH's ssh passes to getopt. State.short has a case
+/// for every letter in it.
 const ssh_spec = "1246ab:c:e:fgi:kl:m:no:p:qstvxAB:CD:E:F:GI:J:KL:MNO:P:QR:S:TVw:W:XYy";
 
 pub const Args = struct {
     host: []const u8 = "",
-    /// `-l`, `user@`, or `User`. The first one given wins, as in ssh.
+    /// From -l, -o User or the destination. The first one given wins, as in ssh.
     user: ?[]const u8 = null,
-    /// `-p`, `Port`, or the destination's. The first one given wins.
+    /// txd's port, from -p, -o Port or an ssh:// destination. The first one
+    /// given wins, as in ssh.
     port: ?u16 = null,
-    /// The words after the destination, joined with spaces.
+    /// The words after the destination, joined with spaces as ssh joins them.
     command: ?[]const u8 = null,
     mode: Mode = .auto,
-    /// `-t`, `-T` or `RequestTTY`. Null is the default: a terminal for a
-    /// session, none for a command.
     tty: ?bool = null,
-    /// `-4` or `-6`.
     family: ?Family = null,
-    /// `-i` and `IdentityFile`, in order.
     key_files: []const []const u8 = &.{},
-    /// `-F`: ssh's config file, or `none`. The last one given wins, as in
-    /// ssh.
+    /// -F. The last one given wins; "none" passes through to ssh_config.
     ssh_config: ?[]const u8 = null,
-    /// `-e`. Null turns the escape character off.
     escape_char: ?u8 = '~',
-    /// `-n`: stdin from /dev/null.
     no_stdin: bool = false,
-    /// `-G`: print the configuration, and exit.
+    /// -G. git runs its ssh command with -G to tell whether it is OpenSSH.
     print_config: bool = false,
-    /// `--version` or `-V`.
     version: bool = false,
-    /// The letters of ssh's options ignored with a warning.
     ignored: []const u8 = "",
 };
 
 pub const Mode = union(enum) {
-    /// Attaches the host's detached session, or starts one, or runs the
-    /// command.
     auto,
-    /// `--attach ID`.
     attach: u64,
-    /// `--new`.
     new,
-    /// `--list`.
     list,
-    /// `--kill ID`.
     kill: u64,
 };
 
@@ -67,14 +41,12 @@ pub const Family = enum { ip4, ip6 };
 
 pub const Result = union(enum) {
     ok: Args,
-    /// What's wrong with the command line.
     usage: []const u8,
-    /// An option tx doesn't support, as given, such as `-L`.
     unsupported: []const u8,
 };
 
-/// Parses `argv` without its first element. The result points into `argv`
-/// and `arena`.
+/// argv excludes the program name. Strings in the result point into argv or
+/// arena.
 pub fn parse(arena: Allocator, argv: []const []const u8) Allocator.Error!Result {
     var s: State = .{ .arena = arena, .p = .{ .spec = ssh_spec, .args = argv } };
     s.run() catch |err| return switch (err) {
@@ -89,17 +61,16 @@ const State = struct {
     arena: Allocator,
     p: getopt.Parser,
     args: Args = .{},
-    /// Modes and a command exclude each other.
     modes: usize = 0,
     key_files: std.ArrayList([]const u8) = .empty,
     ignored: std.ArrayList(u8) = .empty,
-    /// For `error.Usage` and `error.Unsupported`.
     problem: []const u8 = "",
 
     const Error = error{ Usage, Unsupported, OutOfMemory };
 
     fn run(s: *State) Error!void {
-        // Options, the destination, and unless `--` came, options again.
+        // Options may follow the destination. After --, everything past the
+        // destination is the command.
         try s.options();
         if (s.p.index < s.p.args.len) {
             try s.destination(s.p.args[s.p.index]);
@@ -119,7 +90,6 @@ const State = struct {
         s.args.ignored = s.ignored.items;
     }
 
-    /// Reads options until the first operand, or `--`.
     fn options(s: *State) Error!void {
         while (true) {
             const item = (s.p.next() catch |err| return s.optionError(err)) orelse return;
@@ -138,7 +108,6 @@ const State = struct {
         return s.usage(problem);
     }
 
-    /// One of ssh's options.
     fn short(s: *State, o: getopt.Item.Short) Error!void {
         switch (o.letter) {
             'p' => if (s.args.port == null) {
@@ -159,19 +128,11 @@ const State = struct {
             'G' => s.args.print_config = true,
             'V' => s.args.version = true,
 
-            // Nothing to do in tx: protocol 2, no agent, X11 or GSSAPI
-            // forwarding, compression, verbosity, syslog, forwarded ports
-            // for others, ciphers and MACs (tx uses TLS), the local address,
-            // a log file, and a Match tag.
+            // ssh settings with no counterpart in tx. They pass without a warning.
             '2', 'a', 'x', 'k', 'K', 'C', 'q', 'v', 'y', 'g', 'c', 'm', 'b', 'B', 'E', 'P' => {},
 
-            // Agent and X11 forwarding, and PKCS#11 keys. The connection
-            // goes ahead without them.
             'A', 'X', 'Y', 'I' => try s.ignored.append(s.arena, o.letter),
 
-            // Protocol 1, forwards, jump hosts, no command, going to the
-            // background, connection sharing, tunnels, subsystems such as
-            // sftp, and queries.
             '1', 'L', 'R', 'D', 'W', 'J', 'N', 'f', 'M', 'S', 'O', 'w', 's', 'Q' => {
                 return s.unsupported(try std.fmt.allocPrint(s.arena, "-{c}", .{o.letter}));
             },
@@ -179,7 +140,6 @@ const State = struct {
         }
     }
 
-    /// One of tx's own options.
     fn long(s: *State, name: []const u8) Error!void {
         const mode: ?Mode = if (eql(name, "attach"))
             .{ .attach = try s.sessionId() }
@@ -204,8 +164,8 @@ const State = struct {
         }
     }
 
-    /// `-o`: `Key=value` or `Key value`, the key in any case, as ssh_config
-    /// takes. Keys tx has no use for are ignored.
+    /// -o takes "Keyword=value" or "Keyword value", like an ssh_config line.
+    /// Keywords not named here have no effect.
     fn config(s: *State, text: []const u8) Error!void {
         const trimmed = std.mem.trim(u8, text, " \t");
         const end = std.mem.indexOfAny(u8, trimmed, "= \t") orelse return s.usage("an -o option needs a value");
@@ -228,26 +188,24 @@ const State = struct {
         } else if (oneOf(key, &.{ "LocalForward", "RemoteForward", "DynamicForward" })) {
             return s.unsupported(try std.fmt.allocPrint(s.arena, "-o {s}", .{key}));
         } else if (oneOf(key, &.{ "ProxyCommand", "ProxyJump", "RemoteCommand" })) {
-            // `none` turns them off, as scp passes it.
             if (!eqlIgnoreCase(val, "none")) return s.unsupported(try std.fmt.allocPrint(s.arena, "-o {s}", .{key}));
         } else if (eqlIgnoreCase(key, "SessionType")) {
             if (!eqlIgnoreCase(val, "default")) return s.unsupported(try std.fmt.allocPrint(s.arena, "-o {s}", .{key}));
         }
     }
 
-    /// `[user@]host`, or `ssh://[user@]host[:port]`.
+    /// [USER@]HOST, or ssh://[USER@]HOST[:PORT] with an IPv6 HOST in brackets.
     fn destination(s: *State, text: []const u8) Error!void {
         var rest = text;
         const uri = std.mem.startsWith(u8, rest, "ssh://");
         if (uri) rest = std.mem.trimEnd(u8, rest["ssh://".len..], "/");
 
+        // A user name may contain @. The last one ends it.
         if (std.mem.lastIndexOfScalar(u8, rest, '@')) |at| {
             if (s.args.user == null) s.args.user = rest[0..at];
             rest = rest[at + 1 ..];
         }
 
-        // A URI's port follows the host, which brackets hold if it has
-        // colons.
         if (uri) {
             if (std.mem.startsWith(u8, rest, "[")) {
                 const close = std.mem.indexOfScalar(u8, rest, ']') orelse return s.usage("invalid destination");
@@ -294,7 +252,7 @@ fn parsePort(text: []const u8) ?u16 {
     return if (port == 0) null else port;
 }
 
-/// `-e`: a character, `^X` for a control character, or `none`.
+/// ssh's -e: a character, ^ and a letter for a control character, or none.
 fn escapeChar(text: []const u8) error{Invalid}!?u8 {
     if (std.mem.eql(u8, text, "none")) return null;
     if (text.len == 1) return text[0];
@@ -302,8 +260,7 @@ fn escapeChar(text: []const u8) error{Invalid}!?u8 {
     return error.Invalid;
 }
 
-/// `RequestTTY`: `yes` and `force` ask for a terminal, `no` doesn't, and
-/// `auto` leaves the default.
+/// RequestTTY's values, with force taken as yes.
 fn requestTty(text: []const u8) error{Invalid}!?bool {
     if (eqlIgnoreCase(text, "yes") or eqlIgnoreCase(text, "force")) return true;
     if (eqlIgnoreCase(text, "no")) return false;
@@ -324,7 +281,6 @@ const eqlIgnoreCase = std.ascii.eqlIgnoreCase;
 
 const testing = std.testing;
 
-/// Parses `argv`, which must be valid.
 fn expectArgs(arena: *std.heap.ArenaAllocator, argv: []const []const u8) !Args {
     return switch (try parse(arena.allocator(), argv)) {
         .ok => |a| a,
@@ -349,7 +305,6 @@ test "git's ssh command" {
     try testing.expectEqual(.ip4, a.family.?);
     try testing.expectEqualStrings("git-upload-pack '/srv/repo.git'", a.command.?);
 
-    // git asks whether tx is OpenSSH with -G.
     try testing.expect((try expectArgs(&arena, &.{ "-G", "-p", "2222", "example.com" })).print_config);
 }
 
@@ -371,7 +326,6 @@ test "options group, take joined values, and come after the destination too" {
     try testing.expectEqual(null, a.escape_char);
     try testing.expectEqualStrings("ls -la", a.command.?);
 
-    // After `--`, everything after the destination is the command.
     const ended = try expectArgs(&arena, &.{ "--", "example.com", "-p", "22" });
     try testing.expectEqual(null, ended.port);
     try testing.expectEqualStrings("-p 22", ended.command.?);

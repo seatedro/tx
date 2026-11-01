@@ -1,4 +1,3 @@
-# tx and txd, built as a release is: ReleaseSafe, and static on Linux.
 {
   lib,
   stdenvNoCC,
@@ -17,9 +16,6 @@ let
     ];
   };
 
-  # Zig's name for the platform's target. A target named outright, rather
-  # than the native one, builds for the baseline CPU, and on macOS needs no
-  # SDK.
   target =
     {
       aarch64-linux = "aarch64-linux-musl";
@@ -29,22 +25,22 @@ let
     }
     .${stdenvNoCC.hostPlatform.system};
 
-  # The packages build.zig.zon names, and the lazy ones Ghostty's build asks
-  # for, as zig-pkg holds them. `zig build --fetch` leaves the lazy ones
-  # out; configuring the build, which `zig build -l` does, fetches them.
-  #
-  # When build.zig.zon's dependencies change, so does the hash: set it to
-  # "", build, and copy the hash Nix prints.
+  # build.zig.zon's packages, as Zig fetches them into zig-pkg. A fixed-output
+  # derivation may reach the network; outputHash changes whenever the packages
+  # do.
   deps = stdenvNoCC.mkDerivation {
     name = "tx-zig-pkg";
     inherit src;
     nativeBuildInputs = [ zig ];
 
+    # The sandbox's HOME isn't writable. `zig build -l` builds nothing, and
+    # fetches the packages to run build.zig.
     buildPhase = ''
       export ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig-global-cache
       zig build -l >/dev/null
     '';
     installPhase = "mv zig-pkg $out";
+    # Fixup would edit the fetched files, which must match outputHash.
     dontFixup = true;
 
     outputHashMode = "recursive";
@@ -59,15 +55,11 @@ stdenvNoCC.mkDerivation {
 
   buildPhase = ''
     export ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig-global-cache
-    # A copy, not a link: build steps run in a package's directory, with
-    # paths relative to it that lead back to .zig-cache.
     cp -r ${deps} zig-pkg
     zig build install -j$NIX_BUILD_CORES --prefix $out \
       -Dtarget=${target} -Doptimize=ReleaseSafe -Dstrip -Dversion=${version}
   '';
   dontInstall = true;
-  # There is nothing to fix up: the binaries are static on Linux, and Zig
-  # strips them. Stripping again on macOS would undo their signatures.
   dontFixup = true;
 
   passthru = { inherit deps; };

@@ -1,7 +1,3 @@
-//! The tx wire protocol: message encoding and framing.
-//!
-//! `wire` has the varint and field encodings, `messages` the revision 0
-//! messages, and `frame` the framing of messages on a stream.
 pub const wire = @import("wire.zig");
 pub const messages = @import("messages.zig");
 pub const frame = @import("frame.zig");

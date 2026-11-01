@@ -1,14 +1,12 @@
-/*
- * Replaces picotls's <picotls/openssl.h> when building ngtcp2's picotls adapter
- * (crypto/picotls/picotls.c), which refers to the OpenSSL backend objects by
- * name. These macros map those names to tx's backend. Nothing else includes
- * this header.
- */
+// Replaces picotls' own <picotls/openssl.h> for ngtcp2's picotls glue, whose include path lists
+// src/crypto/include before picotls/include. The glue names the OpenSSL backend's algorithms and
+// recognizes a cipher suite by comparing its aead pointer with them.
 #ifndef TX_PICOTLS_OPENSSL_SHIM_H
 #define TX_PICOTLS_OPENSSL_SHIM_H
 
 #include <tx/picotls_backend.h>
 
+// Turns on the glue's ChaCha20-Poly1305 branches.
 #define PTLS_OPENSSL_HAVE_CHACHA20_POLY1305 1
 
 #define ptls_openssl_random_bytes tx_random_bytes
