@@ -1,10 +1,19 @@
+//! Compiles the terminfo entry a client sends with its Attach, the output of
+//! `infocmp -x $TERM`, so that programs in the session know the client's
+//! TERM. Each entry gets a directory under terminfo_dir named by its hash,
+//! and the session's TERMINFO points at it.
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
+/// The largest entry accepted. tx caps what it sends at the same 64 KiB.
 pub const max_source_len = 64 << 10;
 
+/// Compiles source into a directory under base, unless an earlier install
+/// did, and returns the directory's path, which the caller frees. Fails with
+/// NoEntry when tic doesn't produce the entry source names.
 pub fn install(gpa: Allocator, io: Io, base: []const u8, source: []const u8) ![]u8 {
     if (source.len > max_source_len) return error.TooLong;
 
@@ -16,6 +25,8 @@ pub fn install(gpa: Allocator, io: Io, base: []const u8, source: []const u8) ![]
     const cwd = Io.Dir.cwd();
     if (cwd.access(io, dir, .{})) return dir else |_| {}
 
+    // tic writes into a temporary directory, renamed into place once complete,
+    // so the access check above finds complete directories.
     var suffix: [8]u8 = undefined;
     io.random(&suffix);
     const tmp = try std.fmt.allocPrint(gpa, "{s}.tmp-{x}", .{ dir, suffix });
@@ -31,12 +42,16 @@ pub fn install(gpa: Allocator, io: Io, base: []const u8, source: []const u8) ![]
 
     if (!hasEntry(io, tmp, entryName(source) orelse return error.NoEntry)) return error.NoEntry;
 
+    // When another install of the same entry renamed first, its directory is
+    // used.
     cwd.rename(tmp, cwd, dir, io) catch |err| {
         if (cwd.access(io, dir, .{})) return dir else |_| return err;
     };
     return dir;
 }
 
+// infocmp indents capability lines. The first line that isn't indented or a
+// comment starts with the entry's names, separated by '|'.
 fn entryName(source: []const u8) ?[]const u8 {
     var lines = std.mem.splitScalar(u8, source, '\n');
     while (lines.next()) |line| {
@@ -47,7 +62,10 @@ fn entryName(source: []const u8) ?[]const u8 {
     return null;
 }
 
+// tic files an entry under its first character, or under that character's
+// hex code where filenames are case-insensitive, as on macOS.
 fn hasEntry(io: Io, dir: []const u8, name: []const u8) bool {
+    // The name comes from the client and becomes part of a path.
     if (name.len == 0 or std.mem.indexOfScalar(u8, name, '/') != null) return false;
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const by_letter = std.fmt.bufPrint(&buf, "{s}/{c}/{s}", .{ dir, name[0], name }) catch return false;

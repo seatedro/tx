@@ -1,3 +1,10 @@
+//! Runs a client's command without a terminal, as `shell -c command`, on
+//! socketpairs from session.pty.Pipes. The command's stdout and stderr go to
+//! the client on two uni streams, and its stdin comes from a bidi stream that
+//! the server opens. The Exit goes on the client's main stream, through the
+//! Handler. An Exec outlives a client that goes away, until the command
+//! exits.
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
@@ -13,12 +20,15 @@ const Term = session.pty.Term;
 
 const log = std.log.scoped(.exec);
 
+// Unacked bytes on an output stream above which reading from the command
+// pauses, and at or below which it resumes.
 const high_water = 1 << 20;
 const low_water = 256 << 10;
 
 const read_size = 64 << 10;
 
 pub const Options = struct {
+    /// Runs the command with `-c`. argv[0] is its basename.
     shell: []const u8,
     command: []const u8,
     environ: *const std.process.Environ.Map,
@@ -26,6 +36,8 @@ pub const Options = struct {
     handler: Handler,
 };
 
+/// exited goes to the client, and only while it is attached. freed goes to the
+/// server when the Exec is freed, with the client's context while attached.
 pub const Handler = struct {
     client: *anyopaque,
     exited: *const fn (client: *anyopaque, exit: proto.Exit) void,
@@ -37,6 +49,7 @@ pub const Exec = struct {
     gpa: Allocator,
     loop: *xev.Loop,
     handler: Handler,
+    // Cleared by detach, when the client is gone.
     attached: bool = true,
     pipes: Pipes,
     stdout: Output,
@@ -45,8 +58,12 @@ pub const Exec = struct {
     waiter: std.Thread,
     exited: xev.Async,
     exited_c: xev.Completion = .{},
+    // Set once the command has exited.
     term: ?Term = null,
 
+    /// Spawns the command and opens its streams on conn, stdout and stderr as
+    /// uni streams and then stdin as a bidi stream. They must be the server's
+    /// first streams on conn. The client expects their IDs to be 3, 7 and 1.
     pub fn start(gpa: Allocator, loop: *xev.Loop, conn: *Conn, options: Options) !*Exec {
         const e = try gpa.create(Exec);
         errdefer gpa.destroy(e);
@@ -62,6 +79,8 @@ pub const Exec = struct {
         const stdout = try conn.openStream(.uni);
         const stderr = try conn.openStream(.uni);
         const stdin = try conn.openStream(.bidi);
+        // The server writes nothing on stdin. Its FIN is the stream's first
+        // frame, which tells the client that the stream exists.
         stdin.finish();
 
         const stdout_buf = try gpa.alloc(u8, read_size);
@@ -93,23 +112,30 @@ pub const Exec = struct {
         return e.stdout.stream == stream or e.stderr.stream == stream or e.stdin.stream == stream;
     }
 
+    /// Data the client sent on one of the command's streams. Only stdin's goes
+    /// to the command.
     pub fn received(e: *Exec, stream: *Stream, bytes: []const u8, fin: bool) void {
         if (stream != e.stdin.stream) return stream.consume(bytes.len);
         e.stdin.receive(bytes, fin);
         e.freeIfDone();
     }
 
+    /// The client acked data on stream. A paused output resumes once the
+    /// stream is down to low_water.
     pub fn acked(e: *Exec, stream: *Stream) void {
         if (stream == e.stdout.stream) e.stdout.resume_();
         if (stream == e.stderr.stream) e.stderr.resume_();
     }
 
+    /// Forgets a stream that the endpoint is freeing.
     pub fn streamClosed(e: *Exec, stream: *Stream) void {
         for ([_]*?*Stream{ &e.stdout.stream, &e.stderr.stream, &e.stdin.stream }) |s| {
             if (s.* == stream) s.* = null;
         }
     }
 
+    /// The client is gone. The outputs end and stdin is dropped. The command
+    /// runs on, and the Exec frees itself once it exits.
     pub fn detach(e: *Exec) void {
         e.attached = false;
         e.stdout.detach();
@@ -118,16 +144,22 @@ pub const Exec = struct {
         e.freeIfDone();
     }
 
+    /// Sends SIGKILL to the command's process group. The command leads a
+    /// session of its own.
     pub fn kill(e: *Exec) void {
         if (e.pipes.pid) |pid| _ = std.c.kill(-pid, .KILL);
     }
 
+    /// Kills the command, waits for it, and frees the Exec without waiting for
+    /// its completions on the loop.
     pub fn destroy(e: *Exec) void {
         e.kill();
         e.waiter.join();
         e.finalize();
     }
 
+    // Runs on the waiter thread. waitExited leaves the child unreaped. Its pid,
+    // which kill uses, stays its own until onExited reaps it on the loop.
     fn waitMain(e: *Exec) void {
         e.pipes.waitExited() catch |err| log.warn("waiting for a command failed: {t}", .{err});
         e.exited.notify() catch {};
@@ -136,6 +168,7 @@ pub const Exec = struct {
     fn onExited(e_: ?*Exec, _: *xev.Loop, _: *xev.Completion, _: xev.Async.WaitError!void) xev.CallbackAction {
         const e = e_.?;
         e.waiter.join();
+        // An exit that can't be reaped is reported as status 255.
         e.term = (e.pipes.tryWait() catch null) orelse .{ .unknown = 0 };
 
         e.stdin.end();
@@ -144,6 +177,8 @@ pub const Exec = struct {
         return .disarm;
     }
 
+    // Frees the Exec once the command has exited and no read or write is in
+    // flight.
     fn freeIfDone(e: *Exec) void {
         if (e.term == null) return;
         if (!e.stdout.idle() or !e.stderr.idle() or !e.stdin.idle()) return;
@@ -164,6 +199,8 @@ pub const Exec = struct {
 
 const Output = struct {
     exec: *Exec,
+    // Points into exec.pipes. Pipes.close sets it to -1, which pipes.deinit
+    // skips.
     fd: *posix.fd_t,
     socket: xev.TCP,
     stream: ?*Stream,
@@ -218,17 +255,22 @@ const Output = struct {
     fn detach(o: *Output) void {
         o.stream = null;
         if (o.ended) return;
+        // Shutting the socket down completes the read in flight, and onRead
+        // ends the output.
         if (o.reading) {
             _ = std.c.shutdown(o.fd.*, posix.SHUT.RDWR);
         } else o.end();
     }
 };
 
+// Writes the client's stdin stream to the command. Bytes are consumed on the
+// stream once written, so the stream's flow control window bounds the queue.
 const Input = struct {
     exec: *Exec,
     fd: *posix.fd_t,
     socket: xev.TCP,
     stream: ?*Stream,
+    // Collects input while `writing` is written.
     queue: std.ArrayList(u8) = .empty,
     writing: std.ArrayList(u8) = .empty,
     written: usize = 0,
@@ -288,6 +330,8 @@ const Input = struct {
         i.queue.clearRetainingCapacity();
         i.writing.clearRetainingCapacity();
         i.written = 0;
+        // Shutting the socket down fails the write in flight, and onWrite
+        // closes the fd.
         if (i.write_active) {
             _ = std.c.shutdown(i.fd.*, posix.SHUT.RDWR);
         } else i.closeIfIdle();

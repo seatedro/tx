@@ -1,3 +1,7 @@
+//! The addresses a wildcard listen covers. root.zig binds one endpoint per
+//! address, and calls interfaces again every rescan_ms to follow interfaces
+//! that come and go. Scope.tailnet narrows them to Tailscale's and loopback.
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -5,6 +9,8 @@ const IpAddress = Io.net.IpAddress;
 const PosixAddress = Io.Threaded.PosixAddress;
 const c = std.c;
 
+// struct ifaddrs from <ifaddrs.h>, which std.c doesn't declare. Linux and
+// macOS lay it out the same way.
 const Ifaddrs = extern struct {
     next: ?*Ifaddrs,
     name: [*:0]const u8,
@@ -18,8 +24,10 @@ const Ifaddrs = extern struct {
 extern "c" fn getifaddrs(ifap: *?*Ifaddrs) c_int;
 extern "c" fn freeifaddrs(ifa: ?*Ifaddrs) void;
 
+// IFF_UP from <net/if.h>.
 const iff_up = 0x1;
 
+/// 0.0.0.0 or ::. src/cli/install.zig has its own copy of this check.
 pub fn isWildcard(address: IpAddress) bool {
     return switch (address) {
         .ip4 => |a| std.mem.allEqual(u8, &a.bytes, 0),
@@ -27,10 +35,13 @@ pub fn isWildcard(address: IpAddress) bool {
     };
 }
 
+/// A listen on :: covers IPv4 addresses too. One on 0.0.0.0 covers IPv4 only.
 pub fn covers(wildcard: IpAddress, address: IpAddress) bool {
     return wildcard == .ip6 or address == .ip4;
 }
 
+/// Compares the family and the address bytes. Ports and IPv6 scopes are
+/// ignored.
 pub fn eql(a: IpAddress, b: IpAddress) bool {
     return switch (a) {
         .ip4 => |x| b == .ip4 and std.mem.eql(u8, &x.bytes, &b.ip4.bytes),
@@ -38,6 +49,7 @@ pub fn eql(a: IpAddress, b: IpAddress) bool {
     };
 }
 
+/// Which interfaces a wildcard listen uses. Loopback is in both.
 pub const Scope = enum {
     all,
     tailnet,
@@ -48,6 +60,9 @@ const Entry = struct {
     address: IpAddress,
 };
 
+/// The addresses of up interfaces that wildcard covers under scope, with the
+/// wildcard's port. Link-local IPv6 addresses are left out. The caller frees
+/// the slice.
 pub fn interfaces(gpa: Allocator, wildcard: IpAddress, scope: Scope) ![]IpAddress {
     var list: ?*Ifaddrs = null;
     if (getifaddrs(&list) != 0) return error.GetIfaddrsFailed;
@@ -58,6 +73,7 @@ pub fn interfaces(gpa: Allocator, wildcard: IpAddress, scope: Scope) ![]IpAddres
     return select(gpa, entries, wildcard, scope);
 }
 
+/// Whether an up interface belongs to Tailscale.
 pub fn hasTailnet(gpa: Allocator) !bool {
     var list: ?*Ifaddrs = null;
     if (getifaddrs(&list) != 0) return error.GetIfaddrsFailed;
@@ -69,6 +85,7 @@ pub fn hasTailnet(gpa: Allocator) !bool {
     return false;
 }
 
+// Each Entry's interface name points into list.
 fn upAddresses(gpa: Allocator, list: ?*Ifaddrs) ![]Entry {
     var out: std.ArrayList(Entry) = .empty;
     errdefer out.deinit(gpa);
@@ -101,6 +118,8 @@ fn select(gpa: Allocator, entries: []const Entry, wildcard: IpAddress, scope: Sc
     return out.toOwnedSlice(gpa);
 }
 
+// Tailscale's interface is tailscale0 on Linux. On macOS it is a utun
+// interface, told apart from other tunnels by its Tailscale IPv6 address.
 fn isTailnet(entries: []const Entry, interface: []const u8) bool {
     if (std.mem.startsWith(u8, interface, "tailscale")) return true;
     for (entries) |e| {
@@ -109,6 +128,8 @@ fn isTailnet(entries: []const Entry, interface: []const u8) bool {
     return false;
 }
 
+// Tailscale's IPv6 range, fd7a:115c:a1e0::/48. isTailnetAddress in
+// src/cli/tailscale.zig repeats the prefix.
 fn inTailscaleIp6(address: IpAddress) bool {
     return switch (address) {
         .ip4 => false,
@@ -116,6 +137,10 @@ fn inTailscaleIp6(address: IpAddress) bool {
     };
 }
 
+/// The loopback addresses the host's own name resolves to that wildcard
+/// covers, such as the 127.0.1.1 of Debian's /etc/hosts. getifaddrs gives
+/// lo the address 127.0.0.1. Empty when the name doesn't resolve. The caller
+/// frees the slice.
 pub fn hostLoopback(gpa: Allocator, io: Io, wildcard: IpAddress) ![]IpAddress {
     var name_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
     const name = std.posix.gethostname(&name_buf) catch return &.{};
@@ -142,6 +167,7 @@ fn appendNew(gpa: Allocator, list: *std.ArrayList(IpAddress), address: IpAddress
     try list.append(gpa, address);
 }
 
+// fe80::/10.
 fn isLinkLocal(address: IpAddress) bool {
     return switch (address) {
         .ip4 => false,
