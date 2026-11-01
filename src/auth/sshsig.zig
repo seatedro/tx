@@ -91,8 +91,6 @@ fn verifyRsa(key: ssh.PublicKey.RsaParts, signature_blob: []const u8, data: []co
     }
 }
 
-/// Encodes a raw Ed25519 signature as an ssh-ed25519 signature blob, the form
-/// agents return.
 pub fn signatureBlob(sig: [64]u8) [ssh.signature_blob_len]u8 {
     var blob: [ssh.signature_blob_len]u8 = undefined;
     var w: Writer = .fixed(&blob);
@@ -188,8 +186,6 @@ fn writeFuzzKeyBlob(in: fuzz.Input, w: *Writer, shape: FuzzShape) !void {
 
             try ssh.writeString(w, if (in.chance(3, 1)) "\x01\x00\x01" else in.bytes(buf[0..5]));
 
-            // Moduli fall on a supported length or one byte off it, and some
-            // carry the zero byte an mpint with its top bit set has.
             const lens = ssh.rsa_modulus_lens;
             const len = lens[in.index(lens.len)] + (if (in.chance(3, 1)) 1 else in.int(usize, 0, 2)) - 1;
             const zero: usize = if (in.chance(1, 3)) 1 else 0;

@@ -1,8 +1,3 @@
-//! The OpenSSH formats tx and txd read and write, and the login and resume
-//! proofs built on them. tx makes the proofs and txd checks them. txd looks
-//! login keys up with authorized_keys. tx finds its keys through agent and
-//! private_key, and checks host keys with known_hosts.
-
 pub const ssh = @import("ssh.zig");
 pub const sshsig = @import("sshsig.zig");
 pub const login = @import("login.zig");

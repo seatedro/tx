@@ -26,9 +26,7 @@ pub const DecryptError = error{ Malformed, WrongPassphrase };
 /// frees.
 pub const PrivateKeyFile = struct {
     bytes: []u8,
-    /// From the file's public key list, which needs no passphrase.
     public_key: ssh.Key,
-    /// Null for an unencrypted file.
     kdf: ?Kdf,
     /// The private key list, encrypted when kdf is set. It points into bytes.
     private: []u8,
@@ -38,7 +36,6 @@ pub const PrivateKeyFile = struct {
         rounds: u32,
     };
 
-    /// Decodes an armored key file. A file with more than one key is Malformed.
     pub fn parse(gpa: Allocator, text: []const u8) ParseError!PrivateKeyFile {
         const bytes = try decodeArmor(gpa, text);
         errdefer gpa.free(bytes);

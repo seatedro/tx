@@ -1,8 +1,3 @@
-//! Host keys in OpenSSH known_hosts files. tx reads its own known_hosts and
-//! ~/.ssh/known_hosts into one Known for the name it connects to, and records
-//! keys it learns in its own file with append. Lines count when their key is
-//! ssh-ed25519, the type of txd's host key.
-
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -10,8 +5,6 @@ const HmacSha1 = std.crypto.auth.hmac.HmacSha1;
 const base64 = std.base64.standard;
 const ssh = @import("ssh.zig");
 
-/// The keys known_hosts lines list for one host name. Keys on @revoked lines
-/// go to revoked.
 pub const Known = struct {
     keys: std.ArrayList(ssh.Key) = .empty,
     revoked: std.ArrayList(ssh.Key) = .empty,
@@ -27,7 +20,6 @@ pub const Known = struct {
         return false;
     }
 
-    /// The keys that aren't also revoked. The caller frees the slice.
     pub fn trusted(k: *const Known, gpa: Allocator) Allocator.Error![]ssh.Key {
         var out: std.ArrayList(ssh.Key) = .empty;
         errdefer out.deinit(gpa);
@@ -45,8 +37,6 @@ pub fn hostName(buf: []u8, host: []const u8, port: u16, default_port: u16) error
 
 const max_file_len = 16 << 20;
 
-/// Adds the keys the file at path lists for host to known. A missing file adds
-/// none.
 pub fn readFile(io: Io, gpa: Allocator, path: []const u8, host: []const u8, known: *Known) !void {
     const contents = Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(max_file_len)) catch |err| switch (err) {
         error.FileNotFound => return,
@@ -81,8 +71,6 @@ pub fn find(gpa: Allocator, contents: []const u8, host: []const u8, known: *Know
     }
 }
 
-/// Adds a line for host and key at the end of path, creating the file and its
-/// directory.
 pub fn append(io: Io, path: []const u8, host: []const u8, key: ssh.Key) !void {
     if (std.fs.path.dirname(path)) |dir| try Io.Dir.cwd().createDirPath(io, dir);
 

@@ -11,7 +11,6 @@ const ssh = @import("ssh.zig");
 pub const Match = enum {
     absent,
     allowed,
-    /// The line starts with options.
     restricted,
 };
 
@@ -31,15 +30,12 @@ pub fn check(io: Io, gpa: Allocator, paths: []const []const u8, key: *const ssh.
     return .absent;
 }
 
-/// Looks key up in the contents of an authorized_keys file. Lines whose key
-/// doesn't parse are skipped.
 pub fn find(contents: []const u8, key: *const ssh.PublicKey) Match {
     var lines = std.mem.splitScalar(u8, contents, '\n');
     while (lines.next()) |raw| {
         const line = std.mem.trim(u8, raw, " \t\r");
         if (line.len == 0 or line[0] == '#') continue;
 
-        // Options come before the key type.
         var rest = line;
         const has_options = !isKeyType(firstField(rest));
         if (has_options) rest = skipOptions(rest);

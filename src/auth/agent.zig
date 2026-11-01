@@ -1,8 +1,3 @@
-//! A client for the SSH agent protocol on the agent's Unix socket. tx lists the
-//! agent's keys to choose its identities and asks the agent to sign login
-//! transcripts. TestAgent is an in-process agent for the tests here, in cli and
-//! in e2e.
-
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -15,21 +10,17 @@ const sign_request = 13;
 const sign_response = 14;
 const failure = 5;
 
-// Sign request flags that choose the hash of an RSA signature.
 pub const rsa_sha2_256: u32 = 2;
 pub const rsa_sha2_512: u32 = 4;
 
 // OpenSSH's limit on agent replies (MAX_AGENT_REPLY_LEN in authfd.c).
 const max_message = 256 * 1024;
 
-/// Refused is the agent's SSH_AGENT_FAILURE. Protocol is a malformed or
-/// unexpected reply.
 pub const Error = error{
     Protocol,
     Refused,
 } || Allocator.Error || Io.net.Stream.Reader.Error || Io.net.Stream.Writer.Error;
 
-/// A connection to an SSH agent. Each call blocks until the agent replies.
 pub const Agent = struct {
     io: Io,
     stream: Io.net.Stream,
@@ -45,8 +36,6 @@ pub const Agent = struct {
         a.stream.close(a.io);
     }
 
-    /// Lists the agent's keys as blobs in the agent's order, without their
-    /// comments. The caller deinits the result.
     pub fn identities(a: *Agent, gpa: Allocator) Error!Identities {
         const answer = try a.call(gpa, request_identities, &.{});
         errdefer gpa.free(answer);
@@ -65,8 +54,6 @@ pub const Agent = struct {
         return .{ .answer = answer, .blobs = try blobs.toOwnedSlice(gpa) };
     }
 
-    /// Signs data with the key whose blob is key_blob. Returns the SSH signature
-    /// blob, which the caller frees.
     pub fn sign(a: *Agent, gpa: Allocator, key_blob: []const u8, data: []const u8) Error![]u8 {
         var body: Writer.Allocating = .init(gpa);
         defer body.deinit();
@@ -124,7 +111,6 @@ pub const Agent = struct {
     }
 };
 
-/// The agent's reply and the key blobs sliced from it. deinit frees both.
 pub const Identities = struct {
     answer: []u8,
     blobs: []const []const u8,
@@ -136,17 +122,13 @@ pub const Identities = struct {
     }
 };
 
-/// An SSH agent for tests, listening on a Unix socket. Its thread serves one
-/// connection at a time with keys and rsa_keys, which it borrows.
 pub const TestAgent = struct {
     io: Io,
     server: Io.net.Server,
     thread: std.Thread,
     keys: []const std.crypto.sign.Ed25519.KeyPair,
     rsa_keys: []const TestRsaKey = &.{},
-    /// While set, sign requests get SSH_AGENT_FAILURE.
     refuse: std.atomic.Value(bool) = .init(false),
-    /// The number of signatures made.
     signatures: std.atomic.Value(u32) = .init(0),
     stopping: std.atomic.Value(bool) = .init(false),
 
@@ -220,7 +202,6 @@ pub const TestAgent = struct {
                     if (agent.refuse.load(.acquire) or (kp == null and rsa_key == null)) {
                         try aw.writeByte(failure);
                     } else if (rsa_key) |k| {
-                        // A real agent signs with SHA-1 "ssh-rsa" without the flag.
                         if (flags & rsa_sha2_512 == 0) {
                             try aw.writeByte(failure);
                         } else {
@@ -246,13 +227,10 @@ pub const TestAgent = struct {
     }
 };
 
-/// The private half of an RSA test key, with modulus n and private exponent d
-/// as big-endian bytes.
 pub const TestRsaKey = struct {
     n: []const u8,
     d: []const u8,
 
-    /// ssh.test_rsa_text's key, the public half of test_rsa_key.
     pub fn public(_: *const TestRsaKey) ssh.PublicKey {
         return ssh.parsePublicKeyText(ssh.rsa, ssh.test_rsa_text) catch unreachable;
     }
@@ -288,7 +266,6 @@ pub const TestRsaKey = struct {
     }
 };
 
-/// The private half of ssh.test_rsa_text.
 pub const test_rsa_key: TestRsaKey = .{
     .n = &hexBytes("b70d5f197bce1405a465114168297ca967826b9f84407f9261436a8a7d52aae63f3467476b37c2b6c7e41c78bc0a24c99d5d8d215ad9c8552334828f63e9e08daac7c421ea4a66c12309b2a27e85c4d13489947dabb3ff6dea4906132d94307a31c21d383bf579e3ee67ba420d885b87ef200d688f3edf16a4ef7475f4e3e0db257dc1a060e5e8e17e2b505f32aeb3eea6604a18f2c8f4e7c85528a8487aeab79eea995fa6d2746537ea5e2205b8f744fce58c6542d29919d07530a25d506c37f3ddf5f5dff06378b234c78da546505dcf8c51191617a611dfff6bab7b587b64c968317db892110837748a0d9dc1a54141bb6a7244097a552e7b69a6afd7981d"),
     .d = &hexBytes("09089ba61c0e443e3009fdd342c2f3603fd7b79c78701f6b97a9b64f0dd6bfd0db93283aa5cfab680e4ed359e0fbc62b7dfce12b617aa8708d2b78faff150a6c2b5eaeeef68b43ed699f7fa595c55fbc6c5192d6addbd4f1f573339dcc2cc944aa8278232f90527add67d8910c6e6b87f694d81c8e1f2deec5e67c529aea890cea2dd64fb4b1b58e9ed28d7faad23733c3bb185c7ac077ad6bdce054ec2e63840195b0ddab86d802c7d31f6d321b5eed75e7415d798f98458a1eaa992044873172bc3d495f9dec923a5cefafcbd4fdffa6f63e87ae34a73369c4df93cf5818376454042d041393a940903adab422dd1586672fbacc6045925302e10f6130bea9"),

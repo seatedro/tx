@@ -7,7 +7,6 @@
 const std = @import("std");
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 
-/// The length of the resume key a session sends in Attached.
 pub const key_len = 32;
 pub const proof_len = HmacSha256.mac_length;
 
