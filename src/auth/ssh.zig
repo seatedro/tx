@@ -1,3 +1,7 @@
+//! SSH wire encoding (RFC 4251) and SSH public keys. A Key is a raw Ed25519
+//! public key. A PublicKey is a user key's blob, Ed25519 or RSA. The other
+//! files in auth encode and parse their formats with Reader and writeString.
+
 const std = @import("std");
 const Writer = std.Io.Writer;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -7,26 +11,38 @@ const base64_no_pad = std.base64.standard_no_pad;
 pub const ed25519 = "ssh-ed25519";
 pub const rsa = "ssh-rsa";
 
+/// A raw Ed25519 public key, the form tx keeps host keys in.
 pub const Key = [32]u8;
 
+/// Length of an ssh-ed25519 key blob.
 pub const key_blob_len = 4 + ed25519.len + 4 + 32;
 
+/// Length of an ssh-ed25519 signature blob.
 pub const signature_blob_len = 4 + ed25519.len + 4 + 64;
 
+/// The largest blob a PublicKey holds.
 pub const max_key_blob_len = 1024;
 
+/// The RSA modulus lengths in bytes that PublicKey.parse accepts, for 1024,
+/// 2048, 3072 and 4096-bit keys. std.crypto.Certificate.rsa takes moduli up to
+/// 4096 bits.
 pub const rsa_modulus_lens = [_]usize{ 128, 256, 384, 512 };
 
+/// Malformed is a bad encoding. UnsupportedType is a well-formed key of a type
+/// or size tx doesn't take.
 pub const ParseError = error{
     Malformed,
     UnsupportedType,
 };
 
+/// Writes bytes as an SSH string, a big-endian u32 length followed by the bytes.
 pub fn writeString(w: *Writer, bytes: []const u8) Writer.Error!void {
     try w.writeInt(u32, @intCast(bytes.len), .big);
     try w.writeAll(bytes);
 }
 
+/// Reads SSH wire encoding from a byte slice. Strings come back as slices of
+/// it, and reading past its end is error.Malformed.
 pub const Reader = struct {
     bytes: []const u8,
     pos: usize = 0,
@@ -61,6 +77,7 @@ pub const Reader = struct {
     }
 };
 
+/// The ssh-ed25519 public key blob of key (RFC 8709).
 pub fn keyBlob(key: Key) [key_blob_len]u8 {
     var blob: [key_blob_len]u8 = undefined;
     var w: Writer = .fixed(&blob);
@@ -69,6 +86,7 @@ pub fn keyBlob(key: Key) [key_blob_len]u8 {
     return blob;
 }
 
+/// Parses an ssh-ed25519 key blob. Other key types are UnsupportedType.
 pub fn parseKeyBlob(blob: []const u8) ParseError!Key {
     var r: Reader = .init(blob);
     const key_type = try r.string();
@@ -80,6 +98,7 @@ pub fn parseKeyBlob(blob: []const u8) ParseError!Key {
     return key[0..32].*;
 }
 
+/// Returns the raw signature in an ssh-ed25519 signature blob.
 pub fn parseSignatureBlob(blob: []const u8) ParseError![64]u8 {
     var r: Reader = .init(blob);
     const sig_type = try r.string();
@@ -91,6 +110,8 @@ pub fn parseSignatureBlob(blob: []const u8) ParseError![64]u8 {
     return sig[0..64].*;
 }
 
+/// A user key held as a copy of its SSH blob. It is Ed25519, or RSA with a
+/// modulus length in rsa_modulus_lens.
 pub const PublicKey = struct {
     kind: Kind,
     buf: [max_key_blob_len]u8,
@@ -104,6 +125,7 @@ pub const PublicKey = struct {
         return pk;
     }
 
+    /// Checks blob_bytes and copies them.
     pub fn parse(blob_bytes: []const u8) ParseError!PublicKey {
         var r: Reader = .init(blob_bytes);
         const key_type = try r.string();
@@ -115,6 +137,8 @@ pub const PublicKey = struct {
             const e = trimZeros(try r.string());
             const n = trimZeros(try r.string());
             try r.end();
+
+            // std.crypto.Certificate.rsa takes exponents of at most 4 bytes.
             if (e.len == 0 or e.len > 4) return error.Malformed;
             if (std.mem.indexOfScalar(usize, &rsa_modulus_lens, n.len) == null) return error.UnsupportedType;
             break :kind .rsa;
@@ -144,6 +168,7 @@ pub const PublicKey = struct {
         n: []const u8,
     };
 
+    /// The exponent and modulus as unsigned big-endian bytes, sliced from the blob.
     pub fn rsaParts(pk: *const PublicKey) RsaParts {
         std.debug.assert(pk.kind == .rsa);
         var r: Reader = .init(pk.blob());
@@ -153,12 +178,15 @@ pub const PublicKey = struct {
         return .{ .e = trimZeros(e), .n = trimZeros(n) };
     }
 
+    // An SSH mpint has a leading zero byte when its top bit is set (RFC 4251).
     fn trimZeros(bytes: []const u8) []const u8 {
         const start = std.mem.indexOfNone(u8, bytes, &.{0}) orelse bytes.len;
         return bytes[start..];
     }
 };
 
+/// Parses the key type and base64 fields of an OpenSSH public key line. The
+/// type must match the blob's.
 pub fn parsePublicKeyText(key_type: []const u8, text: []const u8) ParseError!PublicKey {
     if (!std.mem.eql(u8, key_type, ed25519) and !std.mem.eql(u8, key_type, rsa)) return error.UnsupportedType;
 
@@ -179,6 +207,8 @@ fn typeName(kind: PublicKey.Kind) []const u8 {
     };
 }
 
+/// "SHA256:" and the unpadded base64 of a key blob's SHA-256, as ssh-keygen -l
+/// prints it.
 pub const Fingerprint = struct {
     buf: [prefix.len + base64_no_pad.Encoder.calcSize(Sha256.digest_length)]u8,
 
@@ -203,6 +233,7 @@ pub const Fingerprint = struct {
     }
 };
 
+/// The base64 of an Ed25519 key blob, the second field of a public key line.
 pub const KeyText = struct {
     buf: [base64.Encoder.calcSize(key_blob_len)]u8,
 
@@ -217,6 +248,8 @@ pub const KeyText = struct {
     }
 };
 
+/// Decodes the base64 field of an ssh-ed25519 key line. Other key types are
+/// UnsupportedType.
 pub fn parseKeyText(key_type: []const u8, text: []const u8) ParseError!Key {
     if (!std.mem.eql(u8, key_type, ed25519)) return error.UnsupportedType;
 
@@ -252,6 +285,7 @@ test "other key types are reported as unsupported" {
     try testing.expectError(error.UnsupportedType, parseKeyBlob(&blob));
 }
 
+/// A 2048-bit RSA public key for tests. agent.test_rsa_key is its private half.
 pub const test_rsa_text = "AAAAB3NzaC1yc2EAAAADAQABAAABAQC3DV8Ze84UBaRlEUFoKXypZ4Jrn4RAf5JhQ2qKfVKq5j80Z0drN8K2x+QceLwKJMmdXY0hWtnIVSM0go9j6eCNqsfEIepKZsEjCbKifoXE0TSJlH2rs/9t6kkGEy2UMHoxwh04O/V54+5nukINiFuH7yANaI8+3xak73R19OPg2yV9waBg5ejhfitQXzKus+6mYEoY8sj058hVKKhIeuq3nuqZX6bSdGU36l4iBbj3RPzljGVC0pkZ0HUwol1QbDfz3fX13/BjeLI0x42lRlBdz4xRGRYXphHf/2ure1h7ZMloMX24khEIN3SKDZ3BpUFBu2pyRAl6VS57aaav15gd";
 
 test "an RSA key parses and round trips through its blob" {

@@ -1,16 +1,24 @@
+//! Looks a user key up in OpenSSH authorized_keys files for txd's login check.
+//! A line with options, such as from= or restrict, comes back as restricted,
+//! and txd refuses its key.
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const ssh = @import("ssh.zig");
 
+/// How a file lists a key. The first line that lists the key decides.
 pub const Match = enum {
     absent,
     allowed,
+    /// The line starts with options.
     restricted,
 };
 
 const max_file_len = 1 << 20;
 
+/// Looks key up in the first of paths that exists, and reads no file after it.
+/// Read errors other than a missing file are returned.
 pub fn check(io: Io, gpa: Allocator, paths: []const []const u8, key: *const ssh.PublicKey) !Match {
     for (paths) |path| {
         const contents = Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(max_file_len)) catch |err| switch (err) {
@@ -23,12 +31,15 @@ pub fn check(io: Io, gpa: Allocator, paths: []const []const u8, key: *const ssh.
     return .absent;
 }
 
+/// Looks key up in the contents of an authorized_keys file. Lines whose key
+/// doesn't parse are skipped.
 pub fn find(contents: []const u8, key: *const ssh.PublicKey) Match {
     var lines = std.mem.splitScalar(u8, contents, '\n');
     while (lines.next()) |raw| {
         const line = std.mem.trim(u8, raw, " \t\r");
         if (line.len == 0 or line[0] == '#') continue;
 
+        // Options come before the key type.
         var rest = line;
         const has_options = !isKeyType(firstField(rest));
         if (has_options) rest = skipOptions(rest);
@@ -49,6 +60,8 @@ fn firstField(s: []const u8) []const u8 {
     return s[0..end];
 }
 
+// Options are separated by commas and hold no blanks outside double quotes.
+// Inside quotes a backslash escapes the next byte.
 fn skipOptions(s: []const u8) []const u8 {
     var quoted = false;
     var i: usize = 0;
@@ -62,9 +75,12 @@ fn skipOptions(s: []const u8) []const u8 {
             else => {},
         }
     }
+
+    // A backslash ending s leaves i one past s.len.
     return std.mem.trimStart(u8, s[@min(i, s.len)..], " \t");
 }
 
+// OpenSSH's key type names. A first field that isn't one starts the options.
 fn isKeyType(field: []const u8) bool {
     const types = [_][]const u8{
         "ssh-ed25519",

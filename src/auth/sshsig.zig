@@ -1,3 +1,8 @@
+//! SSHSIG signed data (OpenSSH's PROTOCOL.sshsig) and verification of the SSH
+//! signature blobs made over it. The signed bytes are the ones
+//! `ssh-keygen -Y sign` signs. A login signature is made over the SignedData of
+//! login.zig's transcript.
+
 const std = @import("std");
 const Writer = std.Io.Writer;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -11,6 +16,9 @@ const hash_algorithm = "sha512";
 
 pub const max_namespace_len = 64;
 
+/// The SSHSIG data a key signs for message under namespace. Per
+/// PROTOCOL.sshsig, the preamble and namespace stop a signature over it from
+/// verifying as SSH authentication or under another namespace.
 pub const SignedData = struct {
     buf: [magic.len + 4 + max_namespace_len + 4 + 4 + hash_algorithm.len + 4 + Sha512.digest_length]u8,
     len: usize,
@@ -25,6 +33,7 @@ pub const SignedData = struct {
         var w: Writer = .fixed(&d.buf);
         w.writeAll(magic) catch unreachable;
         ssh.writeString(&w, namespace) catch unreachable;
+        // The reserved field.
         ssh.writeString(&w, "") catch unreachable;
         ssh.writeString(&w, hash_algorithm) catch unreachable;
         ssh.writeString(&w, &digest) catch unreachable;
@@ -39,6 +48,9 @@ pub const SignedData = struct {
 
 pub const VerifyError = ssh.ParseError || error{BadSignature};
 
+/// Checks signature_blob over data with key. Ed25519 keys take ssh-ed25519
+/// signatures and RSA keys take rsa-sha2-512 or rsa-sha2-256. Other signature
+/// types are UnsupportedType.
 pub fn verify(key: *const ssh.PublicKey, signature_blob: []const u8, data: *const SignedData) VerifyError!void {
     switch (key.kind) {
         .ed25519 => {
@@ -57,12 +69,18 @@ fn verifyRsa(key: ssh.PublicKey.RsaParts, signature_blob: []const u8, data: []co
     try r.end();
 
     const public_key = rsa.PublicKey.fromBytes(key.e, key.n) catch return error.BadSignature;
+
+    // PKCS1v1_5Signature.verify takes the modulus length at comptime. These
+    // are ssh.rsa_modulus_lens, which PublicKey.parse enforces.
     switch (key.n.len) {
         inline 128, 256, 384, 512 => |len| {
+            // A signature may be shorter than the modulus. OpenSSH's verifier
+            // left-pads it with zeros to the modulus length.
             if (sig.len > len) return error.BadSignature;
             var padded: [len]u8 = @splat(0);
             @memcpy(padded[len - sig.len ..], sig);
 
+            // PROTOCOL.sshsig rules out the SHA-1 "ssh-rsa" for RSA keys.
             if (std.mem.eql(u8, sig_type, "rsa-sha2-512")) {
                 rsa.PKCS1v1_5Signature.verify(len, &padded, data, public_key, Sha512) catch return error.BadSignature;
             } else if (std.mem.eql(u8, sig_type, "rsa-sha2-256")) {
@@ -73,6 +91,8 @@ fn verifyRsa(key: ssh.PublicKey.RsaParts, signature_blob: []const u8, data: []co
     }
 }
 
+/// Encodes a raw Ed25519 signature as an ssh-ed25519 signature blob, the form
+/// agents return.
 pub fn signatureBlob(sig: [64]u8) [ssh.signature_blob_len]u8 {
     var blob: [ssh.signature_blob_len]u8 = undefined;
     var w: Writer = .fixed(&blob);
@@ -168,12 +188,17 @@ fn writeFuzzKeyBlob(in: fuzz.Input, w: *Writer, shape: FuzzShape) !void {
 
             try ssh.writeString(w, if (in.chance(3, 1)) "\x01\x00\x01" else in.bytes(buf[0..5]));
 
+            // Moduli fall on a supported length or one byte off it, and some
+            // carry the zero byte an mpint with its top bit set has.
             const lens = ssh.rsa_modulus_lens;
             const len = lens[in.index(lens.len)] + (if (in.chance(3, 1)) 1 else in.int(usize, 0, 2)) - 1;
             const zero: usize = if (in.chance(1, 3)) 1 else 0;
             buf[0] = 0;
             const n = buf[zero .. zero + len];
             in.fill(n);
+
+            // The top bit keeps the modulus at its length. std.crypto.ff
+            // rejects an even modulus.
             if (in.chance(7, 1)) {
                 n[0] |= 0x80;
                 n[n.len - 1] |= 1;

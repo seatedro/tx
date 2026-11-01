@@ -1,3 +1,8 @@
+//! OpenSSH private key files (openssh-key-v1, PROTOCOL.key) holding one Ed25519
+//! key. A file is unencrypted, or encrypted with aes256-ctr under the bcrypt
+//! KDF, the scheme ssh-keygen uses for a passphrase. tx signs logins with keys
+//! from these files when the agent doesn't hold them.
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Ed25519 = std.crypto.sign.Ed25519;
@@ -17,10 +22,15 @@ pub const ParseError = error{
 
 pub const DecryptError = error{ Malformed, WrongPassphrase };
 
+/// A parsed key file. It owns bytes, the decoded file, which deinit zeroes and
+/// frees.
 pub const PrivateKeyFile = struct {
     bytes: []u8,
+    /// From the file's public key list, which needs no passphrase.
     public_key: ssh.Key,
+    /// Null for an unencrypted file.
     kdf: ?Kdf,
+    /// The private key list, encrypted when kdf is set. It points into bytes.
     private: []u8,
 
     const Kdf = struct {
@@ -28,6 +38,7 @@ pub const PrivateKeyFile = struct {
         rounds: u32,
     };
 
+    /// Decodes an armored key file. A file with more than one key is Malformed.
     pub fn parse(gpa: Allocator, text: []const u8) ParseError!PrivateKeyFile {
         const bytes = try decodeArmor(gpa, text);
         errdefer gpa.free(bytes);
@@ -58,6 +69,7 @@ pub const PrivateKeyFile = struct {
             break :kdf .{ .salt = salt, .rounds = rounds };
         } else return error.UnsupportedCipher;
 
+        // The private key list is padded to the cipher's block size.
         if (kdf != null and private.len % Aes256.block.block_length != 0) return error.Malformed;
 
         return .{ .bytes = bytes, .public_key = public_key, .kdf = kdf, .private = @constCast(private) };
@@ -73,6 +85,8 @@ pub const PrivateKeyFile = struct {
         return f.kdf != null;
     }
 
+    /// Decrypts the private key list with passphrase and returns its key pair.
+    /// An unencrypted file ignores passphrase. The caller zeroes the key pair.
     pub fn decrypt(f: *const PrivateKeyFile, passphrase: []const u8) DecryptError!Ed25519.KeyPair {
         var plain_buf: [512]u8 = undefined;
         defer std.crypto.secureZero(u8, &plain_buf);
@@ -80,8 +94,10 @@ pub const PrivateKeyFile = struct {
         const plain = plain_buf[0..f.private.len];
 
         if (f.kdf) |kdf| {
+            // opensshKdf rejects an empty passphrase as invalid input.
             if (passphrase.len == 0) return error.WrongPassphrase;
 
+            // bcrypt_pbkdf derives the AES-256 key and the CTR IV as one output.
             var key_iv: [32 + 16]u8 = undefined;
             defer std.crypto.secureZero(u8, &key_iv);
             std.crypto.pwhash.bcrypt.opensshKdf(passphrase, kdf.salt, &key_iv, kdf.rounds) catch return error.Malformed;
@@ -92,6 +108,8 @@ pub const PrivateKeyFile = struct {
             @memcpy(plain, f.private);
         }
 
+        // The list starts with the same random u32 twice (PROTOCOL.key).
+        // Equal values show the passphrase was right.
         var r: ssh.Reader = .init(plain);
         const check1 = r.uint32() catch return error.Malformed;
         const check2 = r.uint32() catch return error.Malformed;
@@ -103,6 +121,8 @@ pub const PrivateKeyFile = struct {
         if (!std.mem.eql(u8, key_type, ssh.ed25519) or public.len != 32 or secret.len != 64) return error.Malformed;
         if (!std.mem.eql(u8, public, &f.public_key)) return error.Malformed;
 
+        // OpenSSH's Ed25519 secret is the seed followed by the public key, the
+        // layout of Ed25519.SecretKey.
         const secret_key = Ed25519.SecretKey.fromBytes(secret[0..64].*) catch return error.Malformed;
         return Ed25519.KeyPair.fromSecretKey(secret_key) catch error.Malformed;
     }
@@ -113,6 +133,7 @@ fn decodeArmor(gpa: Allocator, text: []const u8) ParseError![]u8 {
     const body_start = begin + begin_line.len;
     const end = std.mem.indexOfPos(u8, text, body_start, end_line) orelse return error.Malformed;
 
+    // In an unencrypted file the base64 text holds the private key.
     var b64: std.ArrayList(u8) = .empty;
     defer {
         std.crypto.secureZero(u8, b64.items);
