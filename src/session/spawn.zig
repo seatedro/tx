@@ -1,9 +1,15 @@
+//! Starts a session process for txd. spawn double-forks and execs the txd
+//! binary as `txd --session --fd 3`, which txd's main hands to process.run,
+//! with an empty environment and the socket on fd 3. The session process runs
+//! in a POSIX session of its own outside txd's process tree, and outlives txd.
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
 const c = std.c;
 const pty = @import("pty.zig");
 
+/// The session process's socket. The argv in spawn names the same fd.
 pub const socket_fd = 3;
 
 pub const Error = error{
@@ -14,12 +20,20 @@ pub const Error = error{
     Unexpected,
 };
 
+/// Starts the session process with socket on its fd 3, and stderr, when
+/// given, on its fd 2; otherwise it keeps txd's fd 2. Its stdin and stdout are
+/// /dev/null. Returns once the process has exec'd, or with the error that
+/// stopped it.
 pub fn spawn(gpa: Allocator, exe: []const u8, socket: posix.fd_t, stderr: ?posix.fd_t) Error!void {
     const exe_z = try gpa.dupeSentinel(u8, exe, 0);
     defer gpa.free(exe_z);
+    // txd's main matches these four arguments and calls process.run.
     const argv = [_:null]?[*:0]const u8{ "txd", "--session", "--fd", "3" };
     const envp = [_:null]?[*:0]const u8{};
 
+    // The child dup2s onto fds 0 to 4. Its sources sit at 5 and up, so no
+    // dup2 overwrites one, and none is copied onto itself, which would keep
+    // close-on-exec.
     const link = try dupAbove(socket, 5);
     defer _ = c.close(link);
     const log_fd = if (stderr) |fd| try dupAbove(fd, 5) else null;
@@ -48,6 +62,8 @@ pub fn spawn(gpa: Allocator, exe: []const u8, socket: posix.fd_t, stderr: ?posix
     _ = c.sigemptyset(&child.default_action.mask);
     _ = c.sigemptyset(&child.empty_mask);
 
+    // Signals stay blocked from fork until the child has reset their
+    // dispositions, so no handler of txd runs in the child.
     var all_signals: posix.sigset_t = undefined;
     _ = c.sigfillset(&all_signals);
     var old_mask: posix.sigset_t = undefined;
@@ -58,6 +74,8 @@ pub fn spawn(gpa: Allocator, exe: []const u8, socket: posix.fd_t, stderr: ?posix
     _ = c.close(err_fd);
     if (pid == -1) return spawnError(posix.errno(-1));
 
+    // The middle child exits once it has forked the session process. A
+    // nonzero status means its setsid or fork failed.
     var status: c_int = 0;
     while (c.waitpid(pid, &status, 0) == -1) switch (posix.errno(-1)) {
         .INTR => {},
@@ -65,6 +83,8 @@ pub fn spawn(gpa: Allocator, exe: []const u8, socket: posix.fd_t, stderr: ?posix
     };
     if (posix.W.EXITSTATUS(@bitCast(status)) != 0) return error.SystemResources;
 
+    // The session process writes its errno to the pipe when a step fails. End
+    // of file means its exec closed the last write end.
     var errno: u32 = undefined;
     const n = while (true) {
         const rc = c.read(err_pipe[0], std.mem.asBytes(&errno), @sizeOf(u32));
@@ -75,6 +95,8 @@ pub fn spawn(gpa: Allocator, exe: []const u8, socket: posix.fd_t, stderr: ?posix
     return spawnError(@fromBackingInt(@intCast(errno)));
 }
 
+/// What the forked children need, prepared before fork. They make
+/// async-signal-safe calls only until they exec.
 const Child = struct {
     exe: [*:0]const u8,
     argv: [*:null]const ?[*:0]const u8,
@@ -89,6 +111,7 @@ const Child = struct {
     fn run(child: *const Child) noreturn {
         if (c.setsid() == -1) child.fail();
 
+        // The middle child exits at once, and txd reaps it.
         switch (c.fork()) {
             0 => {},
             -1 => c._exit(1),
@@ -102,11 +125,16 @@ const Child = struct {
         for ([_]posix.fd_t{ 0, 1 }) |fd| if (c.dup2(null_fd, fd) == -1) child.fail();
         if (child.log_fd) |fd| if (c.dup2(fd, 2) == -1) child.fail();
         if (c.dup2(child.link, socket_fd) == -1) child.fail();
+
+        // The error pipe moves to fd 4 so that closeFrom can close every fd
+        // above it. dup2 clears close-on-exec, and fcntl sets it again for
+        // exec to close the pipe.
         const err_fd: posix.fd_t = socket_fd + 1;
         if (c.dup2(child.err_fd, err_fd) == -1) child.fail();
         if (c.fcntl(err_fd, posix.F.SETFD, @as(c_int, posix.FD_CLOEXEC)) == -1) child.fail();
         pty.closeFrom(err_fd + 1, child.max_fd);
 
+        // Ignored signals and the signal mask survive exec.
         var sig: u32 = 1;
         while (sig < posix.NSIG) : (sig += 1) {
             _ = c.sigaction(@fromBackingInt(sig), &child.default_action, null);

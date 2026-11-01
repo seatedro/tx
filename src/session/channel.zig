@@ -1,3 +1,9 @@
+//! Channel sends and receives proto frames over a unix stream socket on an xev
+//! loop. txd and the session process use it at both ends of their
+//! connections. Writes queue in memory, and congested and the drained callback
+//! give the owner flow control. A Channel owns its socket, and frees itself
+//! once the socket is closed.
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -6,17 +12,25 @@ const xev = @import("xev");
 const proto = @import("proto");
 const unix = @import("unix.zig");
 
+/// congested() is true while more than this many bytes are queued.
 pub const high_water = 256 << 10;
+/// After congestion, drained is called once the queue falls to this.
 pub const low_water = 64 << 10;
 
+/// A frame with a larger body closes the channel.
 pub const max_message = 1 << 20;
 
 const read_size = 64 << 10;
 
 pub const Handler = struct {
     context: *anyopaque,
+    /// raw, and the slices of the message it decodes to, are valid during the
+    /// call only.
     received: *const fn (context: *anyopaque, channel: *Channel, raw: proto.Decoder.Raw) void,
+    /// The queue fell to low_water after it went past high_water.
     drained: ?*const fn (context: *anyopaque, channel: *Channel) void = null,
+    /// The socket is closed and the channel is about to be freed. It isn't
+    /// called after close().
     closed: *const fn (context: *anyopaque, channel: *Channel) void,
 };
 
@@ -24,12 +38,15 @@ pub const Channel = struct {
     gpa: Allocator,
     loop: *xev.Loop,
     socket: xev.TCP,
+    /// null after close().
     handler: ?Handler,
     decoder: proto.Decoder,
     read_buf: []u8,
     read_c: xev.Completion = .{},
     reading: bool = false,
     paused: bool = false,
+    /// Frames sent while writing is in flight. written counts the bytes of
+    /// writing already on the socket.
     queue: std.ArrayList(u8) = .empty,
     writing: std.ArrayList(u8) = .empty,
     written: usize = 0,
@@ -38,11 +55,15 @@ pub const Channel = struct {
     was_congested: bool = false,
     state: enum {
         open,
+        /// Sending what is queued. The socket is shut down after.
         finishing,
+        /// Shut down. The channel frees itself once its read and write have
+        /// ended.
         closing,
         done,
     } = .open,
 
+    /// Takes ownership of fd when it succeeds, and starts reading.
     pub fn create(gpa: Allocator, loop: *xev.Loop, fd: posix.fd_t, handler: Handler) Allocator.Error!*Channel {
         const ch = try gpa.create(Channel);
         errdefer gpa.destroy(ch);
@@ -58,6 +79,8 @@ pub const Channel = struct {
         return ch;
     }
 
+    /// Queues message. It is dropped unless the channel is open. Running out
+    /// of memory closes the channel.
     pub fn send(ch: *Channel, message: proto.Message) void {
         if (ch.state != .open) return;
         const len = proto.encodedLen(message);
@@ -68,12 +91,14 @@ pub const Channel = struct {
         ch.afterQueue();
     }
 
+    /// Queues bytes that are already framed.
     pub fn sendRaw(ch: *Channel, bytes: []const u8) void {
         if (ch.state != .open) return;
         ch.queue.appendSlice(ch.gpa, bytes) catch return ch.shut();
         ch.afterQueue();
     }
 
+    /// Bytes queued and not yet written.
     pub fn queued(ch: *const Channel) usize {
         return ch.queue.items.len + ch.writing.items.len - ch.written;
     }
@@ -82,6 +107,7 @@ pub const Channel = struct {
         return ch.queued() > high_water;
     }
 
+    /// Stops reading once the messages of the current read are delivered.
     pub fn pauseReading(ch: *Channel) void {
         ch.paused = true;
     }
@@ -91,6 +117,8 @@ pub const Channel = struct {
         ch.startRead();
     }
 
+    /// Sends what is queued, then closes. Messages that arrive after are
+    /// dropped. closed is called at the end.
     pub fn finish(ch: *Channel) void {
         if (ch.state != .open) return;
         ch.state = .finishing;
@@ -99,6 +127,8 @@ pub const Channel = struct {
         ch.freeIfDone();
     }
 
+    /// Closes now and drops what is queued. The handler is called no more,
+    /// closed included.
     pub fn close(ch: *Channel) void {
         if (ch.state == .done) return;
         ch.handler = null;
@@ -169,6 +199,8 @@ pub const Channel = struct {
     fn deliver(ch: *Channel, bytes: []const u8) void {
         if (ch.state != .open) return;
         ch.decoder.feed(bytes);
+
+        // The handler may finish or close the channel between messages.
         while (ch.state == .open) {
             const raw = ch.decoder.nextRaw() catch return ch.shut();
             const h = ch.handler orelse return;
@@ -176,6 +208,8 @@ pub const Channel = struct {
         }
     }
 
+    /// shutdown makes the read and write in flight end, so their completions
+    /// finish. freeIfDone closes the fd after both have.
     fn shut(ch: *Channel) void {
         if (ch.state == .closing or ch.state == .done) return;
         ch.state = .closing;

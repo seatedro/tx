@@ -1,3 +1,9 @@
+//! The session process, `txd --session --fd 3`. txd sends Start on the
+//! inherited socket, and the process starts its Session and listens on
+//! Start.socket_path. txd connects there for each client, and for control
+//! requests such as List and Kill. The process exits once its session has
+//! ended or stopped and every connection has closed.
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -18,9 +24,12 @@ const log = std.log.scoped(.session);
 
 const stop_signals = [_]posix.SIG{ .TERM, .INT, .HUP };
 
+/// The session process's main loop, on the socket txd passed as fd.
 pub fn run(gpa: Allocator, io: Io, fd: posix.fd_t) !u8 {
     unix.ignoreSigpipe();
 
+    // The stop signals are blocked before any thread starts, so every thread
+    // inherits the mask and watchSignals takes them with sigwait.
     var signals: posix.sigset_t = undefined;
     _ = c.sigemptyset(&signals);
     for (stop_signals) |sig| _ = c.sigaddset(&signals, sig);
@@ -42,6 +51,8 @@ pub fn run(gpa: Allocator, io: Io, fd: posix.fd_t) !u8 {
     while (!p.finished()) {
         try loop.run(.once);
 
+        // stopped() turns true when the last of the session's completions
+        // ends, which can be any of them.
         if (p.session) |s| if (s.stopped()) {
             s.destroy();
             p.session = null;
@@ -49,6 +60,8 @@ pub fn run(gpa: Allocator, io: Io, fd: posix.fd_t) !u8 {
         };
     }
 
+    // onSignal disarms once exiting is set, and until_done waits for the
+    // remaining completions.
     p.exiting = true;
     try p.signal.notify();
     try loop.run(.until_done);
@@ -82,13 +95,16 @@ const Process = struct {
     uid: posix.uid_t,
     session: ?*Session = null,
     started: bool = false,
+    /// null once its accept has been canceled and the socket closed.
     listener: ?posix.fd_t = null,
+    /// Owned. Unlinked when the process stops listening.
     socket_path: ?[]u8 = null,
     accept_c: xev.Completion = .{},
     cancel_accept_c: xev.Completion = .{},
     peers: std.ArrayList(*Peer) = .empty,
     signal: xev.Async,
     signal_c: xev.Completion = .{},
+    /// Set by watchSignals and taken by onSignal.
     signaled: std.atomic.Value(bool) = .init(false),
     exiting: bool = false,
 
@@ -130,9 +146,14 @@ const Process = struct {
     fn startSession(p: *Process, m: proto.Start) !void {
         if (m.internal_revision != proto.internal_revision) return error.WrongRevision;
 
+        // The Session options point into m, which lasts while Start is
+        // handled, and into this arena. Session.create needs them only to
+        // spawn the program.
         var arena_state: std.heap.ArenaAllocator = .init(p.gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
+
+        // Start carries argv and environ as NUL-terminated lists.
         var argv: std.ArrayList([]const u8) = .empty;
         var args = std.mem.splitScalar(u8, std.mem.trimEnd(u8, m.argv, "\x00"), 0);
         while (args.next()) |arg| try argv.append(arena, arg);
@@ -199,6 +220,8 @@ const Process = struct {
     }
 
     fn stopListening(p: *Process) void {
+        // The socket file goes first. txd lists sessions by these files, and
+        // uninstall waits for them to go.
         if (p.socket_path) |path| unlink(path);
         if (p.listener == null or p.cancel_accept_c.state() == .active) return;
         p.cancel_accept_c = .{ .op = .{ .cancel = .{ .c = &p.accept_c } } };
@@ -206,6 +229,8 @@ const Process = struct {
     }
 
     fn finishPeers(p: *Process) void {
+        // Finishing a channel can remove its peer with swapRemove, so the walk
+        // goes from the end.
         var i = p.peers.items.len;
         while (i > 0) {
             i -= 1;
@@ -234,18 +259,30 @@ fn unlink(path: []const u8) void {
     _ = c.unlink(buf[0..path.len :0]);
 }
 
+/// One connection to the session process. Its first message decides its role.
+/// Start comes from txd on the inherited socket, Connect opens a client
+/// connection, and other messages are control requests.
 const Peer = struct {
     process: *Process,
     channel: *Channel,
+    /// The socket txd passed at spawn, the one connection that may send
+    /// Start.
     inherited: bool,
     role: enum {
         new,
+        /// Connect arrived. Attach or Resume comes next.
         connected,
         client,
         control,
     } = .new,
+    /// Set when Attached goes out, and cleared by Link.detached. A client
+    /// that isn't attached is ignored.
     attached: bool = false,
+    /// The client sent Detach before its connection closed.
     left: bool = false,
+    /// remote and resume_exporter are copied into the buffers below. The
+    /// channel's buffers that Connect came in don't last until Attach or
+    /// Resume arrives.
     connect: proto.Connect = undefined,
     remote_buf: [64]u8 = undefined,
     exporter_buf: [auth.resume_.exporter_len]u8 = undefined,
@@ -275,6 +312,8 @@ const Peer = struct {
                 @memcpy(peer.remote_buf[0..remote.len], remote);
                 peer.connect = m;
                 peer.connect.remote = peer.remote_buf[0..remote.len];
+                // An exporter of another length is dropped, and a Resume then
+                // fails its proof.
                 peer.connect.resume_exporter = null;
                 if (m.resume_exporter) |e| if (e.len == peer.exporter_buf.len) {
                     @memcpy(&peer.exporter_buf, e);
@@ -388,5 +427,6 @@ const Peer = struct {
 };
 
 test {
+    // run has no tests here; the reference makes the test build compile it.
     _ = &run;
 }

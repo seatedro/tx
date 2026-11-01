@@ -1,3 +1,9 @@
+//! Host runs a program on a pty and feeds its output into a term Primary. A
+//! thread of its own reads and writes the pty master, and trades output and
+//! input with the loop thread through queues under a mutex. It calls notify,
+//! and the owner then calls processOutput on the loop thread, which owns the
+//! Primary.
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -23,10 +29,15 @@ pub const Options = struct {
     size: term.log.Resize,
     terminal: TerminalOptions = .{},
 
+    /// Called on the host thread when output is waiting, the pty has closed,
+    /// or the program has exited.
     notify: *const fn (context: ?*anyopaque) void,
     context: ?*anyopaque = null,
+    /// Bytes of output queued for the loop thread past which the host thread
+    /// stops reading the pty.
     output_limit: usize = 256 * 1024,
 
+    /// Limits of the session's Primary.
     pub const TerminalOptions = struct {
         max_scrollback_bytes: ?usize = 10_000_000,
         max_scrollback_lines: ?usize = null,
@@ -35,6 +46,9 @@ pub const Options = struct {
     };
 };
 
+// The largest read from the pty and the largest log record. An Output frame
+// carries one record and must decode under max_message (1 MiB) in the channel
+// and the client.
 const max_record = 16 * 1024;
 
 pub const Host = struct {
@@ -42,28 +56,43 @@ pub const Host = struct {
     io: Io,
     pty: Pty,
     primary: *Primary,
+    /// Whether the Primary answers the program's queries through the pty.
+    /// Session clears it while a client is attached; that client's terminal
+    /// sees the same output and answers.
     answer_queries: bool = true,
+    /// The last client's dark or light preference, for color scheme reports.
     dark: ?bool = null,
+    /// Set by processOutput once the program has exited and its last output
+    /// is in the Primary. reap comes next.
     finished: bool = false,
+    /// The batch processOutput swapped out of queues.output.
     taken: std.ArrayList(u8) = .empty,
 
     notify: *const fn (context: ?*anyopaque) void,
     context: ?*anyopaque,
     output_limit: usize,
+    /// Wakes the host thread out of poll.
     wake: Wake,
     thread: ?std.Thread = null,
+    /// Guards queues.
     mutex: Io.Mutex = .init,
     queues: Queues = .{},
 
     const Queues = struct {
         output: std.ArrayList(u8) = .empty,
+        /// Bytes before input_start have been written to the pty.
         input: std.ArrayList(u8) = .empty,
         input_start: usize = 0,
+        /// The pty reached end of file or failed. The host thread reads and
+        /// writes it no more.
         closed: bool = false,
+        /// The program has exited. Set after its last output was queued.
         exited: bool = false,
+        /// Set by destroy to make the thread return.
         stopping: bool = false,
     };
 
+    /// Starts the program on a pty, and the thread that runs the pty.
     pub fn create(gpa: Allocator, io: Io, options: Options) !*Host {
         const self = try gpa.create(Host);
         errdefer gpa.destroy(self);
@@ -78,6 +107,7 @@ pub const Host = struct {
             .log_capacity = t.log_capacity,
         });
         errdefer primary.destroy();
+        // Primary.create takes no cell size; the resize sets it.
         if (options.size.cell_size_px != null) try primary.resize(options.size);
 
         var wake: Wake = try .init();
@@ -110,6 +140,8 @@ pub const Host = struct {
         return self;
     }
 
+    /// Kills the program if it hasn't been reaped, joins the thread, and frees
+    /// the Host.
     pub fn destroy(self: *Host) void {
         const gpa = self.gpa;
         if (self.thread) |thread| {
@@ -119,6 +151,7 @@ pub const Host = struct {
 
             self.wake.notify();
 
+            // The thread may be blocked in waitExited until the program exits.
             self.pty.kill(.KILL) catch {};
             thread.join();
         }
@@ -132,14 +165,20 @@ pub const Host = struct {
         gpa.destroy(self);
     }
 
+    /// Feeds the output the host thread queued into the Primary and its log,
+    /// and sets finished once the program has exited.
     pub fn processOutput(self: *Host) term.log.AppendError!void {
         self.mutex.lockUncancelable(self.io);
         std.mem.swap(std.ArrayList(u8), &self.queues.output, &self.taken);
         const exited = self.queues.exited;
         self.mutex.unlock(self.io);
 
+        // The host thread stopped reading at output_limit. Waking it makes it
+        // poll the pty again.
         if (self.taken.items.len >= self.output_limit) self.wake.notify();
 
+        // exited is set after the last output was queued, so this batch holds
+        // the rest of it.
         self.finished = exited;
 
         defer self.taken.clearRetainingCapacity();
@@ -151,6 +190,8 @@ pub const Host = struct {
         }
     }
 
+    /// Joins the host thread and reaps the program. It blocks until the
+    /// program exits; the owner calls it once finished is set.
     pub fn reap(self: *Host) pty_pkg.WaitError!pty_pkg.Term {
         if (self.thread) |thread| {
             thread.join();
@@ -160,22 +201,30 @@ pub const Host = struct {
         return self.pty.wait();
     }
 
+    /// Queues bytes for the program. They are dropped once the pty has
+    /// closed.
     pub fn sendInput(self: *Host, bytes: []const u8) Allocator.Error!void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const q = &self.queues;
         if (q.closed or bytes.len == 0) return;
 
+        // The thread polls for POLLOUT while input is pending.
         const was_empty = q.input_start == q.input.items.len;
         try q.input.appendSlice(self.gpa, bytes);
         if (was_empty) self.wake.notify();
     }
 
+    /// Logs the size in the Primary and sets it on the pty.
     pub fn resize(self: *Host, size: term.log.Resize) !void {
         try self.primary.resize(size);
         try self.pty.resize(ptySize(size));
     }
 
+    /// Takes the default colors, palette and dark preference of a client's
+    /// Attach, which the Primary uses to answer color queries. client/report.zig
+    /// packs them: colors as 0xRRGGBB, the palette as {index, r, g, b} entries
+    /// for indexes below 16.
     pub fn setColors(self: *Host, m: proto.Attach) void {
         const colors = &self.primary.terminal.colors;
         if (m.foreground) |rgb| colors.foreground.default = toRgb(rgb);
@@ -226,6 +275,9 @@ pub const Host = struct {
             var events: i16 = 0;
             if (want_read) events |= posix.POLL.IN;
             if (want_write) events |= posix.POLL.OUT;
+            // poll skips an fd of -1. exit_fd is -1 except on Darwin, where the
+            // held slave keeps the master from reaching end of file until the
+            // program's exit is seen.
             var fds = [_]posix.pollfd{
                 .{ .fd = self.wake.read_fd, .events = posix.POLL.IN, .revents = 0 },
                 .{ .fd = if (events == 0) -1 else fd, .events = events, .revents = 0 },
@@ -268,6 +320,8 @@ pub const Host = struct {
         if (eof) q.closed = true;
         self.mutex.unlock(self.io);
 
+        // processOutput takes the whole queue, so a notification is due when
+        // the queue was empty, and at end of file.
         if (eof or (was_empty and len > 0)) self.notify(self.context);
     }
 
@@ -278,6 +332,7 @@ pub const Host = struct {
         while (q.input_start < q.input.items.len) {
             const n = self.pty.write(q.input.items[q.input_start..]) catch |err| switch (err) {
                 error.WouldBlock, error.SystemResources => break,
+                // The pty refuses input; what is queued is dropped.
                 error.BrokenPipe, error.Unexpected => {
                     q.input_start = q.input.items.len;
                     break;
@@ -313,10 +368,14 @@ pub const Host = struct {
         const stopping = self.queues.stopping;
         self.mutex.unlock(self.io);
 
+        // While stopping, destroy is joining this thread and the owner takes
+        // no notification.
         if (!stopping) self.notify(self.context);
     }
 };
 
+/// The window's pixel size from the cell size. winsize's pixel fields are u16,
+/// and larger sizes saturate.
 fn ptySize(size: term.log.Resize) pty_pkg.Size {
     const cell = size.cell_size_px orelse return .{ .cols = size.cols, .rows = size.rows };
     return .{

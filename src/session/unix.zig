@@ -1,3 +1,7 @@
+//! Unix stream sockets for the connections between txd and session processes,
+//! made by pair, listen and connect. Every socket is close-on-exec, in the
+//! blocking mode xev's backend needs, with larger buffers.
+
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
@@ -18,6 +22,8 @@ pub const Error = error{
     Unexpected,
 };
 
+/// A write to a socket whose peer has closed then fails with EPIPE and raises
+/// no SIGPIPE.
 pub fn ignoreSigpipe() void {
     var action: posix.Sigaction = .{ .handler = .{ .handler = posix.SIG.IGN }, .mask = undefined, .flags = 0 };
     _ = c.sigemptyset(&action.mask);
@@ -32,6 +38,8 @@ pub fn pair() Error![2]posix.fd_t {
     return fds;
 }
 
+/// Binds and listens on path. It fails with error.AddressInUse when the file
+/// exists.
 pub fn listen(path: []const u8) Error!posix.fd_t {
     const address = try unixAddress(path);
     const fd = try socket();
@@ -41,6 +49,9 @@ pub fn listen(path: []const u8) Error!posix.fd_t {
     return fd;
 }
 
+/// Connects to path without blocking. On Linux a listener with a full backlog
+/// makes it fail with error.WouldBlock. A socket file with no listener makes
+/// it fail with error.ConnectionRefused.
 pub fn connect(path: []const u8) Error!posix.fd_t {
     const address = try unixAddress(path);
 
@@ -57,6 +68,8 @@ pub fn connect(path: []const u8) Error!posix.fd_t {
     return fd;
 }
 
+/// Prepares a socket that unix.zig didn't create, such as the inherited fd 3
+/// or an accepted connection.
 pub fn adopt(fd: posix.fd_t) Error!void {
     return prepare(fd);
 }
@@ -77,6 +90,7 @@ pub fn peerUid(fd: posix.fd_t) Error!posix.uid_t {
 
 extern "c" fn getpeereid(fd: posix.fd_t, uid: *posix.uid_t, gid: *posix.gid_t) c_int;
 
+/// Session sockets take connections from their own user.
 pub fn acceptsPeer(peer: posix.uid_t, self: posix.uid_t) bool {
     return peer == self;
 }
@@ -97,6 +111,9 @@ fn socketType() c_uint {
     return if (native_os == .linux) posix.SOCK.STREAM | posix.SOCK.CLOEXEC else posix.SOCK.STREAM;
 }
 
+/// Sets close-on-exec, the blocking mode and the buffer sizes. Sockets are
+/// blocking under io_uring only; libxev notes that nonblocking ones there can
+/// complete with EAGAIN over and over.
 fn prepare(fd: posix.fd_t) Error!void {
     if (c.fcntl(fd, posix.F.SETFD, @as(c_int, posix.FD_CLOEXEC)) == -1) return socketError(posix.errno(-1));
     try setNonblocking(fd, xev.backend != .io_uring);

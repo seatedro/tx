@@ -1,3 +1,10 @@
+//! A Session owns the Host that runs a session process's program, and links
+//! one attached client to it on the process's xev loop. It sends the client
+//! the Primary's log as Output, or a Rebuild of the screen, and passes the
+//! client's input and resizes to the Host. It runs the stop, kill and hangup
+//! timers that end the program. process.zig connects clients to it through
+//! Link.
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -11,15 +18,22 @@ const pty = @import("pty.zig");
 
 const log = std.log.scoped(.session);
 
+// Rebuild frames carry at most this many bytes, to decode under max_message
+// (1 MiB) in the channel and the client.
 const rebuild_part = 256 << 10;
 
+/// Time the program has after the SIGHUP of stop or kill before it is killed.
 pub const stop_grace_ms = 1000;
 
+/// Time a hangup session waits for its lost client before the program's
+/// process group gets SIGHUP.
 pub const hangup_grace_ms = 5 * 60 * 1000;
 
 const max_cols = 1024;
 const max_rows = 1024;
 
+/// The Exit for a program's status. A signal is reported as 128 plus its
+/// number, as shells do.
 pub fn exitMessage(t: pty.Term) proto.Exit {
     return switch (t) {
         .exited => |code| .{ .status = code },
@@ -28,23 +42,32 @@ pub fn exitMessage(t: pty.Term) proto.Exit {
     };
 }
 
+/// null when either dimension is 0. Otherwise the size is clamped to max_cols
+/// by max_rows.
 pub fn boundedSize(cols: u16, rows: u16, cell: ?term.log.Resize.CellSize) ?term.log.Resize {
     if (cols == 0 or rows == 0) return null;
     return .{ .cols = @min(cols, max_cols), .rows = @min(rows, max_rows), .cell_size_px = cell };
 }
 
+/// null unless both dimensions are known.
 pub fn cellSize(width: ?u32, height: ?u32) ?term.log.Resize.CellSize {
     return .{ .width = width orelse return null, .height = height orelse return null };
 }
 
+/// The attached client's connection. process.zig's Peer implements it over a
+/// Channel.
 pub const Link = struct {
     context: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
+        /// Queues a message for the client.
         send: *const fn (context: *anyopaque, message: proto.Message) void,
+        /// Sends what is queued, then closes the connection.
         finish: *const fn (context: *anyopaque) void,
+        /// Whether output waits for Session.drained.
         congested: *const fn (context: *anyopaque) bool,
+        /// The session has dropped the link and sends it nothing more.
         detached: *const fn (context: *anyopaque) void,
     };
 
@@ -66,6 +89,8 @@ pub const Options = struct {
     cwd: std.process.Child.Cwd = .inherit,
     size: term.log.Resize,
     terminal: host_pkg.Options.TerminalOptions = .{},
+    /// Called once the program has exited, after the attached client, if
+    /// any, got Exit.
     ended: ?Callback = null,
 
     pub const Callback = struct {
@@ -74,6 +99,7 @@ pub const Options = struct {
     };
 };
 
+/// The message that follows Connect on a client connection.
 pub const First = union(enum) {
     attach: proto.Attach,
     @"resume": proto.Resume,
@@ -89,27 +115,49 @@ pub const Session = struct {
     link: ?Link = null,
     remote_buf: [64]u8 = undefined,
     remote_len: usize = 0,
+    /// No client has attached yet. The first one reads the log from its first
+    /// record, without a Rebuild.
     fresh: bool = true,
+    /// The next log record to send the client.
     next_seq: u64 = 0,
+    /// A Rebuild to send before more Output. It waits while Primary.rebuild
+    /// reports Unfinished.
     rebuild_pending: ?term.rebuild.Kind = null,
+    /// Drawn for each connection and sent in Attached. A Resume proves the key
+    /// with the exporter secret of its own connection.
     resume_key: [auth.resume_.key_len]u8 = undefined,
+    /// Input bytes taken since the last Attach. A resuming client resends its
+    /// input past this offset.
     input_offset: u64 = 0,
+    /// The link is congested. Output waits in the Host until drained.
     paused: bool = false,
+    /// Notified by the Host from its thread, by end, and when stop's grace
+    /// period is over.
     wake: xev.Async,
     wake_c: xev.Completion = .{},
     grace: xev.Timer,
     grace_c: xev.Completion = .{},
+    /// stop's grace period is over. The owner destroys the session once
+    /// stopped() is true.
     grace_over: bool = false,
     kill_timer: xev.Timer,
     kill_c: xev.Completion = .{},
+    /// Taken from the first client's Attach. The program's process group
+    /// gets SIGHUP when its client leaves, or hangup_grace_ms after the
+    /// client's connection is lost.
     hangup: bool = false,
     hangup_timer: xev.Timer,
     hangup_c: xev.Completion = .{},
     hangup_cancel_c: xev.Completion = .{},
+    /// When the client's connection was last lost.
     detached_at: Io.Timestamp = .zero,
     started: Io.Timestamp,
+    /// The program has exited and been reaped.
     ended: bool = false,
 
+    /// Starts the program. The session frees itself after the program has
+    /// exited and Options.ended has been called. After stop, the owner
+    /// destroys it once stopped() is true.
     pub fn create(gpa: Allocator, io: Io, loop: *xev.Loop, options: Options) !*Session {
         const s = try gpa.create(Session);
         errdefer gpa.destroy(s);
@@ -150,6 +198,7 @@ pub const Session = struct {
         return s;
     }
 
+    /// Kills the program and frees the session.
     pub fn destroy(s: *Session) void {
         s.host.destroy();
         s.wake.deinit();
@@ -163,6 +212,9 @@ pub const Session = struct {
         return s.link != null;
     }
 
+    /// Attaches link, and takes the session from any other client, which gets
+    /// an Error. A Resume whose proof fails is refused. The client gets
+    /// Attached, then Output from the log or a Rebuild of the screen.
     pub fn connect(s: *Session, link: Link, c: proto.Connect, first: First) void {
         const size = boundedSize(c.cols, c.rows, cellSize(c.cell_width_px, c.cell_height_px)) orelse
             term.log.Resize{ .cols = 80, .rows = 24 };
@@ -176,6 +228,8 @@ pub const Session = struct {
         const start: Start, const how: How = switch (first) {
             .attach => if (s.fresh) .{ .new, .attached } else .{ .{ .rebuild = .attach }, .attached },
             .@"resume" => |m| start: {
+                // txd puts the exporter secret of the client's connection in
+                // Connect. A proof made on another connection fails.
                 const exporter = c.resume_exporter orelse &.{};
                 if (exporter.len != auth.resume_.exporter_len or
                     !auth.resume_.verify(&s.resume_key, exporter[0..auth.resume_.exporter_len], s.id, m.proof))
@@ -223,6 +277,7 @@ pub const Session = struct {
 
     const How = enum { attached, resumed };
 
+    /// Takes Input and Resize from the attached client.
     pub fn handle(s: *Session, message: proto.Message) void {
         switch (message) {
             .input => |m| {
@@ -234,10 +289,15 @@ pub const Session = struct {
         }
     }
 
+    /// The attached client's connection closed. left is true when the client
+    /// sent Detach.
     pub fn disconnect(s: *Session, left: bool) void {
         s.detach();
         if (!s.hangup) return;
         if (left) return s.hangUp();
+
+        // A timer started by an earlier loss may be running. It reads
+        // detached_at when it fires.
         s.detached_at = Io.Clock.boot.now(s.io);
         if (s.hangup_c.state() != .active) s.hangup_timer.run(s.loop, &s.hangup_c, hangup_grace_ms, Session, s, onHangupTimer);
     }
@@ -259,6 +319,8 @@ pub const Session = struct {
             return .disarm;
         }
 
+        // The timer may date from an earlier loss. It runs again for the time
+        // left after the latest one.
         const gone_ms = s.detached_at.durationTo(Io.Clock.boot.now(s.io)).toMilliseconds();
         if (gone_ms < hangup_grace_ms) {
             s.hangup_timer.run(s.loop, &s.hangup_c, @intCast(hangup_grace_ms - gone_ms), Session, s, onHangupTimer);
@@ -268,12 +330,14 @@ pub const Session = struct {
         return .disarm;
     }
 
+    /// The link's queue fell to its low water mark. Output resumes.
     pub fn drained(s: *Session) void {
         if (!s.paused) return;
         s.paused = false;
         s.process();
     }
 
+    /// SessionInfo without pid, which process.zig adds.
     pub fn info(s: *const Session) proto.SessionInfo {
         const t = &s.host.primary.terminal;
         return .{
@@ -302,6 +366,7 @@ pub const Session = struct {
         s.rebuild_pending = null;
         s.host.answer_queries = true;
 
+        // With no client, output goes on into the Primary.
         s.drained();
     }
 
@@ -311,6 +376,8 @@ pub const Session = struct {
 
     fn pump(s: *Session) void {
         const link = s.link orelse return;
+        // When Primary.rebuild reports Unfinished, the Rebuild stays pending
+        // and pump tries again after more output.
         if (s.rebuild_pending) |kind| {
             s.sendRebuild(link, kind);
             if (s.rebuild_pending != null) return;
@@ -328,9 +395,13 @@ pub const Session = struct {
             s.next_seq = record.seq + 1;
         }
 
+        // While paused, output stays queued in the Host, whose thread stops
+        // reading the pty at output_limit.
         if (link.vtable.congested(link.context)) s.paused = true;
     }
 
+    /// The client can continue from seq when the log still holds seq, and
+    /// every resize from seq on is to the client's size.
     fn canContinue(s: *const Session, seq: u64, size: term.log.Resize) bool {
         var it = s.host.primary.log.iterator(seq) catch return false;
         while (it.next()) |record| switch (record.payload) {
@@ -350,6 +421,8 @@ pub const Session = struct {
                 return link.fail(.protocol, "out of memory");
             },
         };
+        // The Rebuild covers the log up to here. The client continues from
+        // next_seq, which every part carries.
         s.rebuild_pending = null;
         s.next_seq = s.host.primary.log.nextSeq();
 
@@ -370,6 +443,8 @@ pub const Session = struct {
         if (s.host.finished) s.reap();
     }
 
+    /// Called on the host thread. The Async wakes the loop thread, which runs
+    /// onWake.
     fn onHostNotify(context: ?*anyopaque) void {
         const s: *Session = @ptrCast(@alignCast(context.?));
         s.wake.notify() catch |err| log.warn("session {d}: wakeup failed: {t}", .{ s.id, err });
@@ -379,6 +454,8 @@ pub const Session = struct {
         const s = s_.?;
         result catch |err| log.warn("session {d}: wakeup failed: {t}", .{ s.id, err });
 
+        // After stop's grace period, output is left alone and the wait ends,
+        // so that stopped() can see every completion dead.
         if (!s.grace_over) s.process();
 
         if (s.ended or s.grace_over) {
@@ -418,9 +495,12 @@ pub const Session = struct {
             s.loop.add(&s.hangup_cancel_c);
         }
 
+        // onWake then frees the session once the other completions are dead.
         s.wake.notify() catch {};
     }
 
+    /// Sends the program SIGHUP. After stop_grace_ms, stopped() turns true and
+    /// the owner destroys the session, which kills the program.
     pub fn stop(s: *Session) void {
         if (s.ended) return;
 
@@ -428,10 +508,13 @@ pub const Session = struct {
         s.grace.run(s.loop, &s.grace_c, stop_grace_ms, Session, s, onGraceOver);
     }
 
+    /// stop's grace period is over and no completion is pending.
     pub fn stopped(s: *const Session) bool {
         return s.grace_over and !s.ended and s.wake_c.state() == .dead and s.grace_c.state() == .dead and s.kill_c.state() == .dead and s.hangup_c.state() == .dead;
     }
 
+    /// Sends the program SIGHUP, and SIGKILL after stop_grace_ms if it still
+    /// runs. The session ends when the program exits.
     pub fn kill(s: *Session) void {
         if (s.ended or s.kill_c.state() == .active) return;
         s.host.pty.kill(.HUP) catch {};
@@ -453,6 +536,9 @@ pub const Session = struct {
         return .disarm;
     }
 
+    /// Frees the session once it has ended and no completion is pending. Each
+    /// callback calls it before it disarms; libxev marks a completion dead
+    /// before it runs the callback.
     fn freeIfEnded(s: *Session) void {
         if (s.ended and s.wake_c.state() == .dead and s.grace_c.state() == .dead and s.kill_c.state() == .dead and
             s.hangup_c.state() == .dead and s.hangup_cancel_c.state() == .dead) s.destroy();
