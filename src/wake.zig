@@ -1,17 +1,11 @@
-//! A self-pipe that wakes a thread blocked in poll. The thread polls read_fd
-//! beside the fds it waits on, and another thread calls notify. The client's
-//! tty Reader and Writer, its passphrase prompt and the session host use it.
-
 const std = @import("std");
 const posix = std.posix;
 const c = std.c;
 
-/// Owns both ends of the pipe; deinit closes them.
 pub const Wake = struct {
     read_fd: posix.fd_t,
     write_fd: posix.fd_t,
 
-    /// Both ends are nonblocking and close-on-exec.
     pub fn init() error{ ProcessFdQuotaExceeded, SystemFdQuotaExceeded, Unexpected }!Wake {
         var fds: [2]posix.fd_t = undefined;
 
@@ -56,7 +50,6 @@ pub const Wake = struct {
         while (posix.errno(c.write(wake.write_fd, &byte, 1)) == .INTR) {}
     }
 
-    /// Empties the pipe so that the next poll blocks until another notify.
     pub fn drain(wake: *Wake) void {
         var buf: [64]u8 = undefined;
 

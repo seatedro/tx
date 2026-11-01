@@ -1,8 +1,3 @@
-//! Fetches a server's host key without trusting it. A Racer that accepts
-//! any key connects, and the connection closes once the handshake is done.
-//! cli/tx.zig calls it when tx's known_hosts has no trusted key for the
-//! host.
-
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -24,8 +19,6 @@ pub const Result = union(enum) {
     };
 };
 
-/// The key and address of the first of servers to complete a handshake, or
-/// why none did.
 pub fn hostKey(gpa: Allocator, io: Io, servers: []const IpAddress, idle_timeout_ns: u64) !Result {
     transport.crypto.init(io);
 

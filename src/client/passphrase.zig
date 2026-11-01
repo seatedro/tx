@@ -1,7 +1,3 @@
-//! Prompts for a key file's passphrase on the controlling terminal,
-//! /dev/tty, with echo off. session.zig's default Options.passphrase calls
-//! it on the signing thread.
-
 const std = @import("std");
 const posix = std.posix;
 const c = std.c;
@@ -52,8 +48,6 @@ pub fn ask(prompt: []const u8, buf: []u8, cancel_fd: posix.fd_t) Error!?[]u8 {
         var byte: [1]u8 = undefined;
         if (c.read(fd, &byte, 1) != 1) return wipe(buf, null);
 
-        // Ctrl-C and Ctrl-D cancel, Backspace and Delete erase a byte, and
-        // Ctrl-U erases them all.
         switch (byte[0]) {
             '\r', '\n' => return buf[0..len],
             0x03, 0x04 => return wipe(buf, null),

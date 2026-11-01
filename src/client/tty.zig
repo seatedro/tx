@@ -1,10 +1,3 @@
-//! The client's local terminal and stdio. RawMode saves the terminal's
-//! attributes and switches it to raw mode. Reader and Writer move bytes from
-//! and to an fd, each on its own thread; session.zig uses them for the
-//! terminal and for an exec's stdin, stdout and stderr. Signals waits for
-//! SIGWINCH and the terminating signals on another thread. Each thread
-//! reports events to a callback, and session.zig passes them to its loop.
-
 const std = @import("std");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
@@ -15,7 +8,6 @@ const c = std.c;
 const native_os = builtin.os.tag;
 const Wake = @import("wake").Wake;
 
-/// The pixel sizes are 0 when the terminal doesn't report them.
 pub const Size = struct {
     cols: u16,
     rows: u16,
@@ -91,7 +83,6 @@ pub fn makeRaw(attrs: posix.termios) posix.termios {
     return raw;
 }
 
-/// The signals Signals waits for.
 pub const handled_signals = [_]posix.SIG{ .WINCH, .HUP, .TERM, .QUIT };
 
 /// Blocks handled_signals in the calling thread and returns the old mask.
@@ -122,8 +113,6 @@ fn signalsBlocked() bool {
     return true;
 }
 
-/// A thread that takes handled_signals with sigwait. start asserts that the
-/// calling thread blocks them; see blockSignals.
 pub const Signals = struct {
     options: Options,
     thread: std.Thread,
@@ -131,13 +120,11 @@ pub const Signals = struct {
     old_winch: posix.Sigaction,
 
     pub const Event = union(enum) {
-        /// The size of options.fd after a SIGWINCH.
         resize: Size,
         terminate: posix.SIG,
     };
 
     pub const Options = struct {
-        /// The terminal whose size a resize reports.
         fd: posix.fd_t,
         /// Restored on the signal thread before a terminate event.
         raw_mode: ?*const RawMode = null,
@@ -221,8 +208,6 @@ pub const StartError = std.Thread.SpawnError || error{
     SystemFdQuotaExceeded,
 };
 
-/// Reads an fd on its own thread and passes each chunk to a callback. The
-/// thread exits after end_of_file or failed.
 pub const Reader = struct {
     options: Options,
     wake: Wake,
@@ -290,9 +275,6 @@ pub const Reader = struct {
     }
 };
 
-/// Queues bytes for an fd and writes them on its own thread. Events report
-/// the queue rising above high_water, falling back to low_water, and a
-/// failed write.
 pub const Writer = struct {
     gpa: Allocator,
     io: Io,
@@ -335,7 +317,6 @@ pub const Writer = struct {
     };
 
     pub const StopMode = enum {
-        /// Write out the queue first, blocking while the fd can't take it.
         drain,
         discard,
     };
@@ -400,7 +381,6 @@ pub const Writer = struct {
             w.options.callback(w.options.context, .above_high_water);
         }
 
-        // The thread waits for a notify only while the queue is empty.
         if (was_empty) w.wake.notify();
     }
 
@@ -413,7 +393,6 @@ pub const Writer = struct {
     fn run(w: *Writer) void {
         const fd = w.options.fd;
 
-        // Cleared on POLLNVAL, as in Reader.run.
         var poll_fd = true;
 
         while (true) {
@@ -431,8 +410,6 @@ pub const Writer = struct {
                 continue;
             }
 
-            // Waiting in poll, the thread sees a stop while the fd isn't
-            // writable.
             if (poll_fd) switch (waitFor(fd, posix.POLL.OUT, w.wake.read_fd)) {
                 .ready => {},
                 .woken => {
@@ -525,8 +502,6 @@ pub fn getAttrs(fd: posix.fd_t, attrs: *posix.termios) TerminalError!void {
     if (rc != 0) return terminalError(posix.errno(-1));
 }
 
-/// Applies attrs once queued output is written (TCSADRAIN), and returns the
-/// errno.
 pub fn setAttrs(fd: posix.fd_t, attrs: *const posix.termios) posix.E {
     while (true) {
         const rc = if (native_os == .linux)

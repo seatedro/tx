@@ -23,10 +23,8 @@ pub const Escape = struct {
     state: State = .line_start,
 
     const State = enum {
-        /// Before any input, or after CR or LF.
         line_start,
         mid_line,
-        /// The escape character was held at the start of a line.
         pending,
     };
 

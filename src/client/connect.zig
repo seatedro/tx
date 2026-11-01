@@ -1,10 +1,3 @@
-//! Races QUIC connections to a server's addresses, in the manner of Happy
-//! Eyeballs (RFC 8305). Each attempt has its own Endpoint and starts
-//! attempt_delay_ms after the one before it, or as soon as that one fails.
-//! The first handshake to complete wins, the other attempts stop, and the
-//! winner's events go to Options.handler. session.zig connects through a
-//! Racer, and scan.zig uses one to fetch a host key.
-
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -27,7 +20,6 @@ pub const attempt_delay_ms = 250;
 pub const Options = struct {
     /// Tried in order; must not be empty.
     addresses: []const IpAddress,
-    /// The host keys a handshake accepts.
     accept: quic.Client.Accept,
     idle_timeout_ns: u64 = 30 * std.time.ns_per_s,
     handshake_timeout_ns: ?u64 = null,
@@ -47,10 +39,8 @@ pub const Racer = struct {
     loop: *xev.Loop,
     options: Options,
     attempts: std.ArrayList(*Attempt) = .empty,
-    /// The index of the next address to try.
     next: usize = 0,
     winner: ?*Attempt = null,
-    /// Attempts started and not failed yet.
     live: usize = 0,
     stopping: bool = false,
     timer: xev.Timer,
@@ -106,7 +96,6 @@ pub const Racer = struct {
         return r.timer_c.state() == .dead and r.timer_reset_c.state() == .dead and r.timer_cancel_c.state() == .dead;
     }
 
-    /// The host key the winner presented.
     pub fn presentedKey(r: *const Racer) ?[32]u8 {
         const winner = r.winner orelse return null;
         return winner.tls.presentedKey();
@@ -306,8 +295,6 @@ pub fn interleave(out: []IpAddress, addresses: []const IpAddress) []IpAddress {
     return out[0..n];
 }
 
-/// firsts and others are cursors through addresses for the first family and
-/// for the other one.
 fn nextOf(
     addresses: []const IpAddress,
     first_family: std.meta.Tag(IpAddress),

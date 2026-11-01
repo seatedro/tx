@@ -1,16 +1,9 @@
-//! Sharing the local clipboard with a session. A Provider is the local
-//! clipboard, and pasteboard.zig implements one for macOS. session.zig
-//! offers the clipboard's types to the server and writes the host's copies
-//! into it. It answers the host's reads only within paste_window_ms of a
-//! paste keystroke, which hasPaste detects.
-
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 /// How long after a paste keystroke the host may read the clipboard.
 pub const paste_window_ms = 5000;
 
-/// How often the session checks the clipboard's change count.
 pub const poll_ms = 500;
 
 /// The most clipboard data sent or accepted; server/clipboard.zig's
@@ -20,14 +13,12 @@ pub const max_data_len = 64 << 20;
 /// The local clipboard. The session calls it on its loop thread.
 pub const Provider = struct {
     context: ?*anyopaque = null,
-    /// A count that changes whenever the clipboard's contents do.
     change: *const fn (context: ?*anyopaque) u64,
     /// The MIME types on offer, each followed by a NUL. The caller frees
     /// the result.
     types: *const fn (context: ?*anyopaque, gpa: Allocator) Allocator.Error![]u8,
     /// The data for mime, or null when there is none. The caller frees it.
     read: *const fn (context: ?*anyopaque, gpa: Allocator, mime: []const u8) Allocator.Error!?[]u8,
-    /// Replaces the contents with items and returns the new change count.
     write: *const fn (context: ?*anyopaque, items: []const Item) u64,
 };
 

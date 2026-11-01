@@ -10,17 +10,13 @@ const clipboard = @import("clipboard.zig");
 
 const log = std.log.scoped(.pasteboard);
 
-/// An Objective-C object.
 const Id = *opaque {};
-/// An Objective-C selector.
 const Sel = *opaque {};
 
 const utf8_text = "public.utf8-plain-text";
 const png = "public.png";
 const tiff = "public.tiff";
 
-/// Pasteboard text goes under each of these MIME types and X11 selection
-/// targets.
 const text_mimes = [_][]const u8{ "text/plain;charset=utf-8", "text/plain", "UTF8_STRING", "TEXT", "STRING" };
 
 /// Markers from the nspasteboard.org conventions for data that clipboard
@@ -41,7 +37,6 @@ pub const Pasteboard = struct {
     rt: Runtime,
     board: Id,
 
-    /// The general pasteboard, or null when the runtime can't be loaded.
     pub fn general() ?Pasteboard {
         const rt = Runtime.load() orelse return null;
         const pool = rt.push();
@@ -51,8 +46,6 @@ pub const Pasteboard = struct {
         return .{ .rt = rt, .board = rt.call(Id, board, "retain", .{}) };
     }
 
-    /// A named pasteboard, which the test uses to leave the user's
-    /// clipboard alone.
     fn named(name: []const u8) ?Pasteboard {
         const rt = Runtime.load() orelse return null;
         const pool = rt.push();
@@ -155,7 +148,6 @@ pub const Pasteboard = struct {
     }
 };
 
-/// Functions from libobjc.
 const Runtime = struct {
     getClass: *const fn ([*:0]const u8) callconv(.c) ?Id,
     registerName: *const fn ([*:0]const u8) callconv(.c) Sel,
@@ -223,7 +215,6 @@ const Runtime = struct {
         return rt.stringOwned(text);
     }
 
-    /// An autoreleased NSString holding a copy of text.
     fn stringOwned(rt: Runtime, text: []const u8) ?Id {
         const class_ = rt.class("NSString") orelse return null;
         const allocated = rt.call(Id, class_, "alloc", .{});
@@ -231,8 +222,6 @@ const Runtime = struct {
         return rt.call(Id, s, "autorelease", .{});
     }
 
-    /// call for initWithBytes:length:encoding:, the one three-argument
-    /// method used.
     fn call3(rt: Runtime, comptime Ret: type, target: Id, comptime selector: [:0]const u8, a: [*]const u8, b: usize, c: usize) Ret {
         const f: *const fn (Id, Sel, [*]const u8, usize, usize) callconv(.c) Ret = @ptrCast(@alignCast(rt.msgSend));
         return f(target, rt.registerName(selector), a, b, c);

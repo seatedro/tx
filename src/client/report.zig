@@ -10,24 +10,18 @@ const tty = @import("tty.zig");
 
 pub const Rgb = struct { r: u8, g: u8, b: u8 };
 
-/// Each field is null when the terminal didn't answer for it.
 pub const Colors = struct {
     foreground: ?Rgb = null,
     background: ?Rgb = null,
-    /// The 16 ANSI colors.
     palette: [16]?Rgb = @splat(null),
-    /// From the terminal's color scheme report.
     dark: ?bool = null,
 };
 
-/// 0xRRGGBB, as Attach carries a color.
 pub fn packRgb(rgb: ?Rgb) ?u32 {
     const color = rgb orelse return null;
     return @as(u32, color.r) << 16 | @as(u32, color.g) << 8 | color.b;
 }
 
-/// The known palette entries as 4-byte {index, r, g, b} records, the form
-/// Attach.palette carries. Null when there are none.
 pub fn paletteBytes(colors: *const Colors, buf: *[64]u8) ?[]const u8 {
     var len: usize = 0;
     for (colors.palette, 0..) |entry, i| {
@@ -90,12 +84,9 @@ fn nowMs() i64 {
     return @as(i64, ts.sec) * 1000 + @divTrunc(ts.nsec, 1_000_000);
 }
 
-/// Separates the terminal's replies from typed bytes.
 const Parser = struct {
     colors: Colors = .{},
-    /// The DA1 reply arrived; later bytes are typed input.
     done: bool = false,
-    /// An escape sequence still arriving.
     partial: std.ArrayList(u8) = .empty,
 
     fn feed(p: *Parser, gpa: std.mem.Allocator, bytes: []const u8, typed: *std.ArrayList(u8)) !void {
