@@ -78,7 +78,6 @@ void tx_tls_server_free(tx_tls_server *s) {
 struct tx_tls_client {
   ptls_context_t ctx;
   tx_ed25519_verifier verifier;
-  // The client's copy of the accepted keys. The verifier points into it.
   uint8_t (*keys)[32];
 };
 
@@ -142,7 +141,6 @@ static tx_tls_session *session_new(ptls_context_t *ctx, int is_server,
     free(s);
     return NULL;
   }
-  // ngtcp2's picotls callbacks find the connection through conn_ref.
   *ptls_get_data_ptr(s->cptls.ptls) = conn_ref;
   s->extensions[0].type = UINT16_MAX;
   s->extensions[1].type = UINT16_MAX;

@@ -1,8 +1,3 @@
-//! Limits on pending connections, which a server endpoint has accepted and not
-//! yet admitted. endpoint.zig checks each new connection here and holds a place
-//! for it until Conn.admit or the connection closes. Past the limits, a new
-//! connection gets a Retry or is dropped.
-
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const IpAddress = std.Io.net.IpAddress;
@@ -14,8 +9,6 @@ pub const Limits = struct {
     /// From this many pending connections on, a client must answer a Retry,
     /// which proves it receives at its address.
     retry_from: u32 = 16,
-    /// How long a connection may stay pending. The endpoint then calls
-    /// Handler.pendingExpired.
     timeout_ns: u64 = 60 * std.time.ns_per_s,
 };
 
@@ -44,15 +37,12 @@ pub const Source = struct {
     }
 };
 
-/// Endpoints that share a Pending share its limits.
 pub const Pending = struct {
     gpa: Allocator,
     limits: Limits,
     total: u32 = 0,
     sources: std.AutoHashMapUnmanaged(Source, u32) = .empty,
-    /// Key for the Retry tokens the endpoints issue and check.
     retry_secret: [32]u8,
-    /// Retry packets sent.
     retries: u64 = 0,
 
     pub const Admission = enum { accept, retry, drop };
@@ -67,7 +57,6 @@ pub const Pending = struct {
         p.sources.deinit(p.gpa);
     }
 
-    /// validated is whether the connection came with a valid Retry token.
     pub fn check(p: *const Pending, source: Source, validated: bool) Admission {
         if (p.total >= p.limits.max) return .drop;
         if ((p.sources.get(source) orelse 0) >= p.limits.max_per_source) return .drop;
@@ -82,7 +71,6 @@ pub const Pending = struct {
         p.total += 1;
     }
 
-    /// Undoes an earlier add for source.
     pub fn remove(p: *Pending, source: Source) void {
         const count = p.sources.getPtr(source).?;
         count.* -= 1;

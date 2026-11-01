@@ -1,6 +1,3 @@
-//! Tests for endpoint.zig. Client and server endpoints run on one xev loop
-//! over loopback.
-
 const std = @import("std");
 const testing = std.testing;
 const Io = std.Io;
@@ -72,7 +69,6 @@ const Keys = struct {
     server: quic.Server,
     client: quic.Client,
 
-    /// With pin_other, the client accepts a key the server doesn't have.
     fn init(pin_other: bool) !Keys {
         crypto.init(testing.io);
         const identity = Ed25519.KeyPair.generate(testing.io);
@@ -327,8 +323,6 @@ test "closing a connection reports the code to the peer" {
     _ = try client.connect(server.local);
 
     try h.runUntil(&sender, Sender.isConnected);
-    // Outside endpoint callbacks, close runs the closed handler before it
-    // returns.
     sender.conn.?.close(7);
     try testing.expectEqual(CloseReason.local, sender.reason.?);
     const Closed = struct {
