@@ -1,3 +1,7 @@
+//! Tests for quic.zig. Connections run over loopback UDP sockets without an
+//! event loop. Each round flushes both ends, then reads each socket until it
+//! has been quiet for 1 ms.
+
 const std = @import("std");
 const testing = std.testing;
 const Io = std.Io;
@@ -163,9 +167,13 @@ test "client accepting the server key connects and a stream echoes" {
     client.conn.?.exportSecret(&other_secret, "EXPORTER-tx-other");
     try testing.expectEqual(client_secret, server_secret);
     try testing.expect(!std.mem.eql(u8, &client_secret, &other_secret));
+
+    // Each end counts its side of the hybrid key exchange.
     try testing.expect(c.tx_tls_mlkem_exchanges() >= mlkem_before + 2);
 }
 
+/// Runs a handshake between new connections and returns the client's error.
+/// The server connection's send and receive errors are ignored.
 fn handshake(client_tls: *const quic.Client, server_tls: *const quic.Server) !void {
     const io = testing.io;
     const gpa = testing.allocator;

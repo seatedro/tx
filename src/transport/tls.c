@@ -16,6 +16,8 @@ static ptls_cipher_suite_t *suites_chacha_first[] = {&tx_chacha20poly1305sha256,
 
 static ptls_iovec_t alpn = {(uint8_t *)TX_TLS_ALPN, sizeof(TX_TLS_ALPN) - 1};
 
+// QUIC requires ALPN (RFC 9001 section 8.1). A client that doesn't offer tx/1 fails the handshake
+// with no_application_protocol.
 static int on_client_hello(ptls_on_client_hello_t *self, ptls_t *tls,
                            ptls_on_client_hello_parameters_t *params) {
   (void)self;
@@ -34,6 +36,7 @@ struct tx_tls_server {
   ptls_context_t ctx;
   tx_ed25519_signer signer;
   uint8_t spki[TX_ED25519_SPKI_LEN];
+  // With raw public keys, the certificate is the key's SubjectPublicKeyInfo.
   ptls_iovec_t cert;
 };
 
@@ -54,6 +57,7 @@ tx_tls_server *tx_tls_server_new(const uint8_t secret_key[64], const uint8_t pub
   s->ctx.sign_certificate = &s->signer.super;
   s->ctx.on_client_hello = &client_hello_cb;
   s->ctx.use_raw_public_keys = 1;
+  // picotls keeps the exporter secret only when asked, and tx_tls_session_export needs it.
   s->ctx.use_exporter = 1;
   s->ctx.server_cipher_preference = 1;
   if (ngtcp2_crypto_picotls_configure_server_context(&s->ctx) != 0) {
@@ -70,9 +74,11 @@ void tx_tls_server_free(tx_tls_server *s) {
   free(s);
 }
 
+// Every session of a client shares its verifier, which records the key each server presents.
 struct tx_tls_client {
   ptls_context_t ctx;
   tx_ed25519_verifier verifier;
+  // The client's copy of the accepted keys. The verifier points into it.
   uint8_t (*keys)[32];
 };
 
@@ -120,6 +126,8 @@ int tx_tls_client_presented_key(const tx_tls_client *c, uint8_t out[32]) {
 
 struct tx_tls_session {
   ngtcp2_crypto_picotls_ctx cptls;
+  // ngtcp2 writes the QUIC transport parameters into extensions[0]. picotls stops at an entry
+  // of type UINT16_MAX, and extensions[1] stays that terminator.
   ptls_raw_extension_t extensions[2];
 };
 
@@ -134,6 +142,7 @@ static tx_tls_session *session_new(ptls_context_t *ctx, int is_server,
     free(s);
     return NULL;
   }
+  // ngtcp2's picotls callbacks find the connection through conn_ref.
   *ptls_get_data_ptr(s->cptls.ptls) = conn_ref;
   s->extensions[0].type = UINT16_MAX;
   s->extensions[1].type = UINT16_MAX;

@@ -1,3 +1,9 @@
+//! QUIC connections over one UDP socket on an xev loop. A server endpoint
+//! routes datagrams by destination connection ID and admits new connections
+//! through pending.zig. A client endpoint carries one connection. Streams keep
+//! written bytes until the peer acknowledges them. Connections flush, and
+//! closed ones are freed, when the outermost call into the endpoint returns.
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -16,25 +22,46 @@ pub const Role = union(enum) {
 };
 
 pub const CloseReason = union(enum) {
+    /// Conn.close, or Endpoint.stop.
     local,
     peer: quic.Connection.CloseCode,
+    /// Nothing arrived within the idle timeout, or the handshake timed out.
     idle_timeout,
+    /// TLS failed, as when a client refuses the server's key.
     handshake_failed,
     failed,
 };
 
+/// Callbacks run inside the endpoint. Stream data they write goes out after
+/// they return, and connections they close are freed then. streamClosed and
+/// closed run as the outermost call ends. Calls made from them flush and free
+/// at once, as calls from outside the endpoint do.
 pub const Handler = struct {
     ctx: ?*anyopaque = null,
+    /// The handshake completed.
     connected: ?*const fn (ctx: ?*anyopaque, conn: *Conn) void = null,
+    /// The peer opened a stream.
     streamOpened: ?*const fn (ctx: ?*anyopaque, stream: *Stream) void = null,
+    /// The peer can't send past the stream's window until bytes are passed to
+    /// Stream.consume. Without this handler, the endpoint consumes them.
     data: ?*const fn (ctx: ?*anyopaque, stream: *Stream, bytes: []const u8, fin: bool) void = null,
+    /// The peer acknowledged more of the stream. Stream.buffered is updated
+    /// before this runs.
     acked: ?*const fn (ctx: ?*anyopaque, stream: *Stream) void = null,
+    /// The peer reset the stream.
     reset: ?*const fn (ctx: ?*anyopaque, stream: *Stream, app_error_code: u64) void = null,
+    /// The stream is freed when this returns.
     streamClosed: ?*const fn (ctx: ?*anyopaque, stream: *Stream) void = null,
+    /// Runs after streamClosed for each of the connection's streams. conn is
+    /// freed when this returns.
     closed: ?*const fn (ctx: ?*anyopaque, conn: *Conn, reason: CloseReason) void = null,
+    /// The connection is still pending at the end of limits.timeout_ns. The
+    /// endpoint closes it expired_grace_ns later unless it is admitted.
     pendingExpired: ?*const fn (ctx: ?*anyopaque, conn: *Conn) void = null,
 };
 
+/// role and pending must outlive the Endpoint. idle_timeout_ns through
+/// connection_window go to quic.Connection.Options.
 pub const Options = struct {
     local: IpAddress,
     role: Role,
@@ -44,12 +71,19 @@ pub const Options = struct {
     keep_alive_ns: ?u64 = null,
     stream_window: u64 = 8 << 20,
     connection_window: u64 = 32 << 20,
+    /// SO_RCVBUF, in bytes. Linux caps it at net.core.rmem_max.
     receive_buffer: c_int = 4 << 20,
+    /// Limits on connections that haven't been admitted. Used by servers. Null
+    /// admits every connection.
     pending: ?*pending.Pending = null,
 };
 
+/// How long a connection stays open after pendingExpired before the endpoint
+/// closes it.
 pub const expired_grace_ns = std.time.ns_per_s;
 
+/// The length of the connection IDs a server's connections issue, chosen in
+/// quic.Connection.accept. Short-header packets don't encode the length.
 const cid_len = 16;
 
 pub const Endpoint = struct {
@@ -58,28 +92,38 @@ pub const Endpoint = struct {
     loop: *xev.Loop,
     options: Options,
     udp: xev.UDP,
+    /// The bound address, with the port the OS chose when options.local had
+    /// port 0.
     local: IpAddress,
     conns: std.ArrayList(*Conn) = .empty,
+    /// Every connection ID a server's connections answer to.
     routes: std.AutoHashMapUnmanaged(Cid, *Conn) = .empty,
 
     recv_c: xev.Completion = .{},
     recv_state: xev.UDP.State = undefined,
+    /// Holds the largest UDP payload.
     recv_buf: [65536]u8 = undefined,
 
     timer: xev.Timer,
     timer_c: xev.Completion = .{},
     timer_cancel_c: xev.Completion = .{},
 
+    /// Cancels for recv_c and timer_c.
     stop_c: [2]xev.Completion = .{ .{}, .{} },
 
+    /// Each outgoing datagram is written here and sent before the next.
     out: [quic.max_datagram_size]u8 = undefined,
     depth: u32 = 0,
     stopping: bool = false,
 
+    /// Binds options.local and starts receiving. The loop keeps pointers into
+    /// the Endpoint, which must not move.
     pub fn init(self: *Endpoint, gpa: Allocator, io: Io, loop: *xev.Loop, options: Options) !void {
         const udp = try xev.UDP.init(options.local);
         errdefer _ = std.c.close(udp.fd);
 
+        // xev's UDP.bind sets SO_REUSEPORT, which lets two sockets bind one
+        // port. A plain bind reports a port in use as AddressInUse.
         var addr: PosixAddress = undefined;
         const addr_len = Io.Threaded.addressToPosix(&options.local, &addr);
         if (std.c.bind(udp.fd, &addr.any, addr_len) != 0) return switch (std.posix.errno(-1)) {
@@ -106,6 +150,7 @@ pub const Endpoint = struct {
         self.receive();
     }
 
+    /// Call once isStopped returns true.
     pub fn deinit(self: *Endpoint) void {
         std.debug.assert(self.conns.items.len == 0);
         self.conns.deinit(self.gpa);
@@ -115,6 +160,9 @@ pub const Endpoint = struct {
         self.* = undefined;
     }
 
+    /// Closes every connection with code 0 and cancels the receive and the
+    /// timer. The cancels complete as the loop runs, and isStopped reports
+    /// when they have.
     pub fn stop(self: *Endpoint) void {
         self.begin();
         defer self.end();
@@ -132,6 +180,8 @@ pub const Endpoint = struct {
         return true;
     }
 
+    /// Starts the handshake with remote. A client endpoint carries one
+    /// connection at a time.
     pub fn connect(self: *Endpoint, remote: IpAddress) !*Conn {
         self.begin();
         defer self.end();
@@ -175,6 +225,10 @@ pub const Endpoint = struct {
         self.loop.add(cancel_c);
     }
 
+    // begin and end bracket each entry into the endpoint. The outermost end
+    // flushes, frees closed connections and streams, and re-arms the timer.
+    // ngtcp2 forbids its write calls inside its callbacks, and handlers up the
+    // stack may still hold a Conn or Stream.
     fn begin(self: *Endpoint) void {
         self.depth += 1;
     }
@@ -259,6 +313,8 @@ pub const Endpoint = struct {
                 .retry => return self.sendRetry(p, &hd, from),
                 .drop => return,
             }
+            // The new connection holds this place until it is admitted or
+            // freed.
             p.add(source.?) catch return;
         }
 
@@ -278,6 +334,8 @@ pub const Endpoint = struct {
             self.gpa.destroy(conn);
             return self.releasePending(source);
         };
+        // The client sends to the DCID it chose until it learns the server's
+        // connection ID.
         self.addRoute(vc.dcid[0..vc.dcidlen], conn);
 
         var ids: [quic.Connection.max_connection_ids]c.ngtcp2_cid = undefined;
@@ -304,6 +362,7 @@ pub const Endpoint = struct {
         var it = self.routes.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.* == conn) {
+                // Removing invalidates the iterator.
                 self.routes.removeByPtr(entry.key_ptr);
                 it = self.routes.iterator();
             }
@@ -323,6 +382,8 @@ pub const Endpoint = struct {
                 if (data.len == 0 and !fin) continue :stream;
 
                 const w = conn.quic.sendStream(&self.out, stream.id, data, fin) catch |err| switch (err) {
+                    // The stream's sending side is shut or gone. Its unsent
+                    // bytes and FIN are dropped.
                     error.StreamClosed => {
                         stream.send.sent = stream.send.end;
                         stream.fin_sent = true;
@@ -336,6 +397,8 @@ pub const Endpoint = struct {
                 const d = w.datagram orelse return;
                 self.sendDatagram(d);
 
+                // None of the stream's data went out. Flow control holds it, or
+                // other frames filled the packet.
                 if (w.blocked or (w.consumed == 0 and !w.fin)) continue :stream;
             }
         }
@@ -346,6 +409,9 @@ pub const Endpoint = struct {
         }
     }
 
+    /// d must have been written into out. xev makes the socket blocking on
+    /// io_uring, and MSG_DONTWAIT keeps sendto from waiting. QUIC loss
+    /// recovery covers a datagram dropped on EAGAIN or ENOBUFS.
     fn sendDatagram(self: *Endpoint, d: quic.Datagram) void {
         var to: PosixAddress = undefined;
         const to_len = Io.Threaded.addressToPosix(&d.to, &to);
@@ -380,6 +446,7 @@ pub const Endpoint = struct {
             conn.streams.deinit(self.gpa);
 
             if (self.options.handler.closed) |f| f(self.options.handler.ctx, conn, reason);
+            // Frees the pending place of a connection that was never admitted.
             conn.admit();
             conn.quic.deinit();
             self.gpa.destroy(conn);
@@ -398,6 +465,7 @@ pub const Endpoint = struct {
         }
         const ns = next orelse return;
 
+        // Rounding up keeps the timer from firing before the deadline.
         const ms = std.math.divCeil(u64, ns, std.time.ns_per_ms) catch unreachable;
         self.timer.reset(self.loop, &self.timer_c, &self.timer_cancel_c, ms, Endpoint, self, onTimer);
     }
@@ -413,6 +481,9 @@ pub const Endpoint = struct {
         const now = Io.Clock.awake.now(self.io);
         for (self.conns.items) |conn| {
             if (conn.closing != null) continue;
+
+            // The first deadline runs pendingExpired and starts the grace
+            // period. The second closes the connection.
             if (conn.pending) |*p| if (now.nanoseconds >= p.deadline.nanoseconds) {
                 if (p.expired) {
                     conn.close(0);
@@ -432,24 +503,33 @@ pub const Endpoint = struct {
     }
 };
 
+/// A connection on an Endpoint. The endpoint frees it after Handler.closed.
 pub const Conn = struct {
     endpoint: *Endpoint,
     quic: *quic.Connection = undefined,
+    /// Where the latest datagram from the peer came from.
     remote: IpAddress,
     streams: std.AutoHashMapUnmanaged(i64, *Stream) = .empty,
+    /// Free for the Handler's use.
     context: ?*anyopaque = null,
     established: bool = false,
     flush_pending: bool = false,
+    /// Set once the connection is closed. The outermost end frees it.
     closing: ?CloseReason = null,
+    /// On the boot clock.
     received_at: Io.Timestamp,
+    /// Set while the connection counts against options.pending.
     pending: ?Pending = null,
 
     const Pending = struct {
         source: pending.Source,
+        /// On the awake clock.
         deadline: Io.Timestamp,
+        /// pendingExpired has run, and deadline ends the grace period.
         expired: bool = false,
     };
 
+    /// Takes the connection out of the pending limits and drops its deadline.
     pub fn admit(conn: *Conn) void {
         const p = conn.pending orelse return;
         conn.pending = null;
@@ -458,6 +538,8 @@ pub const Conn = struct {
 
     pub const StreamKind = enum { bidi, uni };
 
+    /// Fails with error.StreamLimit while the peer allows no more streams of
+    /// the kind.
     pub fn openStream(conn: *Conn, kind: StreamKind) !*Stream {
         const id = switch (kind) {
             .bidi => try conn.quic.openBidiStream(),
@@ -466,10 +548,15 @@ pub const Conn = struct {
         return conn.addStream(id);
     }
 
+    /// Time since the latest datagram from the peer, or since the connection
+    /// began. The boot clock keeps counting while the machine sleeps.
     pub fn silence(conn: *const Conn) Io.Duration {
         return conn.received_at.durationTo(Io.Clock.boot.now(conn.endpoint.io));
     }
 
+    /// Sends CONNECTION_CLOSE with app_error_code. When called outside
+    /// endpoint callbacks, close runs Handler.closed and frees conn before
+    /// returning.
     pub fn close(conn: *Conn, app_error_code: u64) void {
         if (conn.closing != null) return;
 
@@ -492,6 +579,8 @@ pub const Conn = struct {
             else => .failed,
         };
 
+        // A connection that is closing, draining or idle sends no
+        // CONNECTION_CLOSE (RFC 9000 sections 10.1 and 10.2).
         switch (err) {
             error.Closed, error.IdleTimeout => {},
             else => if (conn.quic.writeClose(&e.out, .{ .transport = conn.quic.errorCode() })) |d| {
@@ -519,6 +608,7 @@ pub const Conn = struct {
             while (it.next()) |entry| {
                 const stream = entry.value_ptr.*;
                 if (!stream.closed) continue;
+                // Removing invalidates the iterator.
                 conn.streams.removeByPtr(entry.key_ptr);
                 if (handler.streamClosed) |f| f(handler.ctx, stream);
                 stream.deinit();
@@ -585,15 +675,22 @@ pub const Conn = struct {
     }
 };
 
+/// A stream of a Conn. Calls on it made outside endpoint callbacks flush at
+/// once, and a failed flush can close and free the connection and its streams
+/// before the call returns.
 pub const Stream = struct {
     conn: *Conn,
     id: i64,
+    /// Free for the Handler's use.
     context: ?*anyopaque = null,
     send: SendQueue = .{},
     fin: bool = false,
     fin_sent: bool = false,
+    /// ngtcp2 closed the stream. The outermost end frees it.
     closed: bool = false,
 
+    /// Writes to a closed stream or connection are dropped. finish must not
+    /// have been called.
     pub fn write(stream: *Stream, bytes: []const u8) Allocator.Error!void {
         std.debug.assert(!stream.fin);
 
@@ -602,21 +699,25 @@ pub const Stream = struct {
         stream.requestFlush();
     }
 
+    /// Sends FIN after the queued bytes.
     pub fn finish(stream: *Stream) void {
         stream.fin = true;
         stream.requestFlush();
     }
 
+    /// Bytes written and not yet acknowledged by the peer.
     pub fn buffered(stream: *const Stream) u64 {
         return stream.send.end - stream.send.acked;
     }
 
+    /// Returns flow-control credit for n bytes passed to Handler.data.
     pub fn consume(stream: *Stream, n: usize) void {
         if (stream.closed or stream.conn.closing != null) return;
         stream.conn.quic.consume(stream.id, n) catch {};
         stream.requestFlush();
     }
 
+    /// Aborts the stream with app_error_code, as quic.Connection.resetStream.
     pub fn reset(stream: *Stream, app_error_code: u64) void {
         if (stream.closed or stream.conn.closing != null) return;
         stream.conn.quic.resetStream(stream.id, app_error_code) catch {};
@@ -626,6 +727,8 @@ pub const Stream = struct {
     fn requestFlush(stream: *Stream) void {
         const e = stream.conn.endpoint;
         stream.conn.flush_pending = true;
+
+        // Flushes now unless an endpoint call is already running.
         e.begin();
         e.end();
     }
@@ -637,9 +740,13 @@ pub const Stream = struct {
     }
 };
 
+/// A stream's outgoing bytes from stream offset base on, in chunks.
+/// ngtcp2 retransmits from these bytes, and a chunk is freed once all of it is
+/// acknowledged.
 const SendQueue = struct {
     chunks: std.ArrayList(*[chunk_len]u8) = .empty,
 
+    // Stream offsets, with base <= acked <= sent <= end.
     base: u64 = 0,
     acked: u64 = 0,
     sent: u64 = 0,
@@ -677,6 +784,7 @@ const SendQueue = struct {
     }
 
     fn ack(q: *SendQueue, gpa: Allocator, offset: u64, len: u64) void {
+        // ngtcp2 reports acknowledgements as a growing prefix of the stream.
         std.debug.assert(offset == q.acked);
         q.acked = offset + len;
 

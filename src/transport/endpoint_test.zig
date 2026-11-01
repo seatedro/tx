@@ -1,3 +1,6 @@
+//! Tests for endpoint.zig. Client and server endpoints run on one xev loop
+//! over loopback.
+
 const std = @import("std");
 const testing = std.testing;
 const Io = std.Io;
@@ -29,6 +32,8 @@ const Harness = struct {
     tick_c: xev.Completion = .{},
     ticking: bool = true,
 
+    /// A 10 ms tick keeps loop.run(.once) returning, and runUntil and runFor
+    /// check their deadlines between runs.
     fn init(h: *Harness) !void {
         h.* = .{ .loop = try .init(.{}), .tick = try .init() };
         h.tick.run(&h.loop, &h.tick_c, 10, Harness, h, onTick);
@@ -67,6 +72,7 @@ const Keys = struct {
     server: quic.Server,
     client: quic.Client,
 
+    /// With pin_other, the client accepts a key the server doesn't have.
     fn init(pin_other: bool) !Keys {
         crypto.init(testing.io);
         const identity = Ed25519.KeyPair.generate(testing.io);
@@ -321,6 +327,8 @@ test "closing a connection reports the code to the peer" {
     _ = try client.connect(server.local);
 
     try h.runUntil(&sender, Sender.isConnected);
+    // Outside endpoint callbacks, close runs the closed handler before it
+    // returns.
     sender.conn.?.close(7);
     try testing.expectEqual(CloseReason.local, sender.reason.?);
     const Closed = struct {
@@ -390,6 +398,8 @@ test "a peer keeps opening streams as its earlier ones close" {
     _ = try client.connect(server.local);
     try h.runUntil(&sender, Sender.isConnected);
 
+    // More streams than the 100 a peer may have open at once
+    // (initial_max_streams_uni in quic.zig).
     for (0..250) |i| {
         const deadline = nowMs() + timeout_ms;
         const stream = while (true) {
