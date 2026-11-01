@@ -1,3 +1,6 @@
+# home-manager module that runs txd as a systemd user service on Linux and a
+# launchd agent on macOS, with the settings `txd --install` writes
+# (src/cli/install.zig). `self` is the tx flake, for the default package.
 self:
 {
   config,
@@ -50,6 +53,8 @@ in
           Service = {
             ExecStart = lib.escapeShellArgs args;
             Restart = "on-failure";
+            # Session processes share txd's cgroup and keep running when the
+            # service stops.
             KillMode = "process";
           };
           Install.WantedBy = [ "default.target" ];

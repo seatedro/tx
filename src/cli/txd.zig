@@ -1,3 +1,9 @@
+//! txd's main. `txd --session --fd N` runs a session process, as
+//! session/spawn.zig execs it. `--uninstall` removes the service
+//! (install.zig). Otherwise txd loads or creates its host key (keyfile.zig),
+//! then installs the service or runs the server from src/server. Its files
+//! live under the directories in paths.zig.
+
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
@@ -12,8 +18,11 @@ const keyfile = @import("keyfile.zig");
 const paths = @import("paths.zig");
 const Scope = server_pkg.addresses.Scope;
 
+/// Matches default_port in src/cli/tx.zig, the port tx connects to when none
+/// is given.
 pub const default_port = 8739;
 
+/// The variables sessions take from txd's environment, besides LC_*.
 const inherited = [_][]const u8{ "HOME", "USER", "LOGNAME", "SHELL", "PATH", "TZ", "LANG" };
 
 pub fn main(init: std.process.Init) !u8 {
@@ -21,11 +30,13 @@ pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
+    // session/spawn.zig execs session processes with exactly these arguments.
     if (args.len == 4 and std.mem.eql(u8, args[1], "--session") and std.mem.eql(u8, args[2], "--fd")) {
         const fd = std.fmt.parseInt(std.posix.fd_t, args[3], 10) catch return usage("invalid fd");
         return session.process.run(gpa, io, fd);
     }
 
+    // The server's wildcard `::` covers IPv4 addresses too.
     var listen: Io.net.IpAddress = try .parseIp6("::", default_port);
     var scope: ?Scope = null;
     var key_path: ?[]const u8 = null;
@@ -75,6 +86,7 @@ pub fn main(init: std.process.Init) !u8 {
         return 0;
     }
 
+    // The TLS backend takes its randomness from io and panics without it.
     transport.crypto.init(io);
 
     const path = key_path orelse try paths.state(gpa, init.environ_map, "host_key");
@@ -96,12 +108,15 @@ pub fn main(init: std.process.Init) !u8 {
         const arena = init.arena.allocator();
         const exe = try install.exePath(arena, io, init.environ_map, args[0]);
 
+        // The service always gets a --listen, which fixes the scope chosen now.
         var service_args: std.ArrayList([]const u8) = .empty;
         const listen_text = listen_arg orelse switch (listen_scope) {
             .tailnet => "tailnet",
             .all => try std.fmt.allocPrint(arena, "{f}", .{listen}),
         };
         try service_args.appendSlice(arena, &.{ "--listen", listen_text });
+
+        // systemd and launchd start the service in another working directory.
         if (key_path) |p| {
             const cwd = try std.process.currentPathAlloc(io, arena);
             try service_args.appendSlice(arena, &.{ "--key", try std.fs.path.resolve(arena, &.{ cwd, p }) });
@@ -123,6 +138,7 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("txd: host key {s}, which tx shows the first time it connects\n", .{fingerprint.slice()});
         return 0;
     }
+
     const tx_authorized_keys = try paths.config(gpa, init.environ_map, "authorized_keys");
     defer gpa.free(tx_authorized_keys);
     const ssh_authorized_keys = try paths.home(gpa, init.environ_map, ".ssh/authorized_keys");
@@ -141,6 +157,8 @@ pub fn main(init: std.process.Init) !u8 {
     defer gpa.free(terminfo_dir);
 
     const shell = init.environ_map.get("SHELL") orelse "/bin/sh";
+
+    // A '-' in front of argv[0] makes the shell a login shell.
     const login_name = try std.fmt.allocPrint(gpa, "-{s}", .{std.fs.path.basename(shell)});
     defer gpa.free(login_name);
 
@@ -148,6 +166,10 @@ pub fn main(init: std.process.Init) !u8 {
     defer gpa.free(runtime_dir);
     const wayland_socket = try std.fs.path.join(gpa, &.{ runtime_dir, "wayland-1" });
     defer gpa.free(wayland_socket);
+
+    // On Linux, /proc/self/exe names the binary this txd runs, even after the
+    // file at its path is replaced. Session processes then run the server's
+    // own build.
     const session_exe = if (builtin.os.tag == .linux)
         try gpa.dupe(u8, "/proc/self/exe")
     else
@@ -191,6 +213,8 @@ pub fn main(init: std.process.Init) !u8 {
     return 0;
 }
 
+/// The port of a `tailnet` or `tailnet:PORT` argument. null when text is
+/// neither form; an inner null when PORT isn't a valid port.
 fn parseTailnet(text: []const u8) ?(?u16) {
     if (std.mem.eql(u8, text, "tailnet")) return default_port;
     if (!std.mem.startsWith(u8, text, "tailnet:")) return null;
