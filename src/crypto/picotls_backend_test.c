@@ -1,3 +1,5 @@
+// C side of the tests in root.zig. Each entry point at the bottom returns its number of failed
+// checks and describes them on stderr.
 #include <tx/picotls_backend.h>
 
 #include <picotls/minicrypto.h>
@@ -29,6 +31,8 @@ static void print_hex(const char *label, const uint8_t *p, size_t n) {
 
 static int failures = 0;
 
+// Compares as many bytes as want_hex holds. Only a tx mismatch counts as a failure. minicrypto's
+// output is printed with it to tell a bad vector from a tx bug.
 static void check(const char *name, const uint8_t *tx, const uint8_t *mini, const char *want_hex) {
   uint8_t want[256];
   size_t n = unhex(want, want_hex);
@@ -156,6 +160,8 @@ static void kat_rfc9001_chacha(void) {
   seal(&ptls_minicrypto_chacha20poly1305, key_b, iv_b, 654360564, header, 4, pt, 1, ct_b);
   check("RFC 9001 A.5 payload ciphertext", ct_a, ct_b, "655e5cd55c41f69080575d7999c25a5bfb");
 
+  // ChaCha20 header protection (RFC 9001 section 5.4.4) takes the sample as the IV and encrypts
+  // zeros.
   unhex(sample, "5e5cd55c41f69080575d7999c25a5bfb");
   ptls_cipher_context_t *c = ptls_cipher_new(&tx_chacha20, 1, hp_a);
   ptls_cipher_init(c, sample);
@@ -168,6 +174,7 @@ static void kat_rfc9001_chacha(void) {
   check("RFC 9001 A.5 header protection mask", mask_a, mask_b, "aefefe7d03");
 }
 
+// minicrypto has no ML-KEM.
 static ptls_key_exchange_algorithm_t *tx_kx[] = {&tx_x25519, NULL};
 static ptls_key_exchange_algorithm_t *mini_kx[] = {&ptls_minicrypto_x25519, NULL};
 
@@ -196,6 +203,9 @@ static int roundtrip(ptls_t *from, ptls_t *to, const char *msg) {
   return ok;
 }
 
+// Runs a TLS 1.3 handshake in memory with raw public keys, then sends a record each way.
+// client_tx and server_tx choose tx or minicrypto algorithms for each side. Both sides sign and
+// verify with tx's Ed25519, which minicrypto lacks.
 static void tls_pair(const char *name, int client_tx, int server_tx, int chacha,
                      const uint8_t secret_key[64], const uint8_t pub[32]) {
   uint8_t spki[TX_ED25519_SPKI_LEN];
@@ -254,6 +264,8 @@ static void tls_pair(const char *name, int client_tx, int server_tx, int chacha,
   tx_ed25519_signer_dispose(&signer);
 }
 
+// The cloudflare.com test checks key exchange and record protection. It accepts any certificate
+// and CertificateVerify.
 static int accept_sign(void *ctx, uint16_t algo, ptls_iovec_t data, ptls_iovec_t sig) {
   (void)ctx, (void)algo, (void)data, (void)sig;
   return 0;
@@ -268,6 +280,7 @@ static int accept_cert(ptls_verify_certificate_t *self, ptls_t *tls, const char 
   return 0;
 }
 
+// Offered in signature_algorithms. picotls rejects a CertificateVerify in any scheme not listed.
 static const uint16_t web_algos[] = {
     PTLS_SIGNATURE_ECDSA_SECP256R1_SHA256, PTLS_SIGNATURE_RSA_PSS_RSAE_SHA256,
     PTLS_SIGNATURE_RSA_PKCS1_SHA256, PTLS_SIGNATURE_ED25519, UINT16_MAX};
@@ -281,6 +294,7 @@ static void hybrid_cloudflare(void) {
     return;
   }
   int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+  // Keeps a silent server from hanging the test.
   struct timeval tv = {5, 0};
   setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
   if (connect(fd, ai->ai_addr, ai->ai_addrlen) != 0) {
@@ -293,6 +307,7 @@ static void hybrid_cloudflare(void) {
   freeaddrinfo(ai);
 
   ptls_verify_certificate_t verifier = {accept_cert, web_algos};
+  // The only group offered. The handshake fails unless the server accepts X25519MLKEM768.
   ptls_key_exchange_algorithm_t *kx[] = {&tx_x25519mlkem768, NULL};
   ptls_cipher_suite_t *suites[] = {&tx_aes128gcmsha256, &tx_chacha20poly1305sha256, NULL};
   ptls_context_t ctx = {.random_bytes = tx_random_bytes,
@@ -322,6 +337,8 @@ static void hybrid_cloudflare(void) {
       off += consumed;
     }
   }
+
+  // The ptls_handshake call that completes the handshake leaves the client Finished in out.
   if (out.off)
     send(fd, out.base, out.off, 0);
   out.off = 0;
@@ -380,6 +397,8 @@ int tx_crypto_test_backend_interop(const uint8_t secret_key[64], const uint8_t p
   return failures;
 }
 
+// Returns -1, which root.zig treats as a skip, unless TX_TEST_NETWORK is set. The test-network
+// build step sets it.
 int tx_crypto_test_cloudflare(void) {
   if (getenv("TX_TEST_NETWORK") == NULL)
     return -1;
