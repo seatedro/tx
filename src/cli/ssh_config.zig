@@ -13,16 +13,12 @@ const Environ = std.process.Environ;
 const paths = @import("paths.zig");
 
 pub const Options = struct {
-    /// The host as typed. Host patterns match it, and %n expands to it.
     host: []const u8,
     user: ?[]const u8 = null,
     port: ?u16 = null,
-    /// txd's port, for when neither port nor tx's config gives one.
     default_port: u16,
     identity_files: []const []const u8 = &.{},
-    /// Used when no -i or IdentityFile line names a key file.
     default_identity_files: []const []const u8 = &.{},
-    /// -F: a path, or "none" to read no ssh config.
     ssh_config: ?[]const u8 = null,
     environ: *const Environ.Map,
     /// The mask Match exec's shell starts with. The caller has blocked
@@ -33,16 +29,12 @@ pub const Options = struct {
 pub const Resolved = struct {
     /// HostName, or the host as typed, lowercased unless it is an IP address.
     hostname: []const u8,
-    /// null when nothing names a user.
     user: ?[]const u8,
     port: u16,
-    /// Expanded paths, or the defaults when nothing names a key file.
     identity_files: []const []const u8,
     identities_only: bool,
-    /// null when no IdentityAgent line applies.
     identity_agent: ?IdentityAgent,
     proxy_jump: ?[]const u8,
-    /// Messages about Match criteria tx doesn't evaluate.
     warnings: []const []const u8,
 };
 
@@ -53,7 +45,6 @@ pub const IdentityAgent = union(enum) {
 
 pub const Result = union(enum) {
     ok: Resolved,
-    /// The problem, prefixed with where it is, such as a file and line.
     bad: []const u8,
 };
 
@@ -89,10 +80,8 @@ const user_tokens = "dhilLnpu";
 /// where a relative Include path starts.
 const Kind = enum { tx, ssh };
 
-/// Where a problem is, for messages.
 const Origin = struct {
     name: []const u8,
-    /// null for the file as a whole.
     line: ?usize = null,
 
     pub fn format(o: Origin, w: *Io.Writer) Io.Writer.Error!void {
@@ -101,20 +90,16 @@ const Origin = struct {
     }
 };
 
-/// A value that expands once the host name and user are final, with its
-/// origin for errors.
 const Setting = struct {
     value: []const u8,
     origin: Origin,
 };
 
-/// The values of %h and %r.
 const Context = struct {
     host: []const u8,
     user: []const u8 = "",
 };
 
-/// This machine's side, for ~ and the %u, %d, %i, %l and %L tokens.
 const Local = struct {
     user: ?[]const u8,
     home: ?[]const u8,
@@ -149,7 +134,6 @@ const Parser = struct {
     options: Options,
     local: Local,
 
-    // The first value found for each setting.
     hostname: ?[]const u8 = null,
     user: ?Setting = null,
     port: ?u16 = null,
@@ -159,7 +143,6 @@ const Parser = struct {
     proxy_jump: ?[]const u8 = null,
 
     warnings: std.ArrayList([]const u8) = .empty,
-    /// Match criteria already warned about.
     warned: std.ArrayList([]const u8) = .empty,
     problem: []const u8 = "",
 
@@ -260,7 +243,6 @@ const Parser = struct {
         /// A missing file is an error, as for -F.
         required: bool = false,
         check_owner: bool = true,
-        /// How many Includes deep the file is.
         depth: usize = 0,
     };
 
@@ -326,7 +308,6 @@ const Parser = struct {
             const value = try p.single(at, keyword, args);
             if (active.* and p.user == null) p.user = .{ .value = value, .origin = at };
         } else if (eqlIgnoreCase(keyword, "Port")) {
-            // ssh's Port is sshd's.
             if (kind == .ssh) return;
             const value = try p.single(at, keyword, args);
             const port = std.fmt.parseInt(u16, value, 10) catch 0;
@@ -369,7 +350,6 @@ const Parser = struct {
         return matched;
     }
 
-    /// A Match line applies when every criterion on it holds.
     fn matchLine(p: *Parser, at: Origin, words: []const []const u8) ParseError!bool {
         var result = true;
         var criteria: usize = 0;
@@ -442,7 +422,6 @@ const Parser = struct {
         try p.warnings.append(p.arena, try std.fmt.allocPrint(p.arena, "{f}: Match {s} isn't supported; its block doesn't apply", .{ at, name }));
     }
 
-    /// Runs command with /bin/sh. It holds when the shell exits with 0.
     fn exec(p: *Parser, at: Origin, command: []const u8) ParseError!bool {
         // A child inherits this thread's signal mask. signal_mask replaces it
         // for the spawn.
@@ -525,8 +504,6 @@ const Parser = struct {
             return p.globFrom(at, found, try std.fs.path.join(p.arena, &.{ dir, component }), after);
         }
 
-        // A missing directory, or a file where a directory was wanted,
-        // matches nothing.
         var d = Io.Dir.cwd().openDir(p.io, dir, .{ .iterate = true }) catch |err| switch (err) {
             error.Canceled => |e| return e,
             else => return,
@@ -621,7 +598,6 @@ const Parser = struct {
         }
     }
 
-    /// %h and %r from the values found so far, for use while the files are read.
     fn parseContext(p: *Parser) Context {
         return .{ .host = p.currentHost(), .user = p.currentUser() };
     }

@@ -1,10 +1,3 @@
-//! tx's main. It takes ssh's command line (args.zig), so git and rsync can
-//! run it as their ssh, and resolves the host from tx's and ssh's config
-//! (ssh_config.zig). It picks login keys from the SSH agent and key files,
-//! decides which txd host keys to trust (tailscale.zig on first contact),
-//! then runs client.session and reports how it ended. As in ssh, the exit
-//! status is the remote command's, or 255 when tx fails.
-
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
@@ -37,8 +30,6 @@ const usage_text =
 
 const connect_timeout_ns = 15 * std.time.ns_per_s;
 
-/// Printed when txd doesn't answer. With --txd, install.sh also runs
-/// txd --install.
 const install_command = "curl -fsSL https://github.com/seatedro/tx/releases/latest/download/install.sh | sh -s -- --txd";
 
 /// Used when no -i or IdentityFile names a key file. tx reads only Ed25519
@@ -106,7 +97,6 @@ pub fn main(init: std.process.Init) !u8 {
         .kill => |id| command = .{ .kill = id },
     }
 
-    // The destination as typed, for the reattach hint.
     var destination_buf: [512]u8 = undefined;
     const destination = if (args.user) |u| std.fmt.bufPrint(&destination_buf, "{s}@{s}", .{ u, args.host }) catch args.host else args.host;
 
@@ -115,7 +105,6 @@ pub fn main(init: std.process.Init) !u8 {
     const tx_known_hosts = try paths.config(gpa, environ, "known_hosts");
     defer gpa.free(tx_known_hosts);
 
-    // An empty user logs in to the account txd runs as.
     const login_user = user orelse "";
     if (login_user.len > auth.login.max_user_len) return fail("invalid user name", .{});
 
@@ -202,7 +191,6 @@ pub fn main(init: std.process.Init) !u8 {
             return 255;
         },
         .refused => |refusal| {
-            // server/root.zig's message lists the detached sessions.
             if (refusal.code == @backingInt(proto.ErrorCode.several_detached)) {
                 return fail("{s}; pick one with --attach ID, or start another with --new", .{refusal.message.slice()});
             }
@@ -221,7 +209,6 @@ pub fn main(init: std.process.Init) !u8 {
     }
 }
 
-/// host is the resolved host name, and named is the host as typed.
 fn noAnswer(host: []const u8, named: []const u8, port: u16, reason: CloseReason) void {
     std.debug.print(
         \\tx: no answer from txd on {s} port {d}: {t}
@@ -231,8 +218,6 @@ fn noAnswer(host: []const u8, named: []const u8, port: u16, reason: CloseReason)
     , .{ host, port, reason, named, install_command });
 }
 
-/// The locale variables that have values, as NAME=value entries that each end
-/// in NUL. The server's clientEnviron reads this format.
 fn localeVariables(arena: Allocator, environ: *const std.process.Environ.Map) !?[]const u8 {
     var out: std.ArrayList(u8) = .empty;
     var it = environ.iterator();
@@ -337,7 +322,6 @@ fn resolve(io: Io, host: []const u8, port: u16, family: ?args_pkg.Family, out: *
         error.Canceled => |e| return e,
     }
     if (n == 0) return error.UnknownHostName;
-    // Alternates the address families for connect.zig's race.
     return client.connect.interleave(out, found[0..n]);
 }
 
@@ -501,7 +485,6 @@ fn publicKeyOf(gpa: Allocator, io: Io, path: []const u8) !auth.ssh.PublicKey {
 
 fn publicKeyFile(gpa: Allocator, io: Io, path: []const u8) !auth.ssh.PublicKey {
     const text = try Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 << 10));
-    // path may name a private key file.
     defer {
         std.crypto.secureZero(u8, text);
         gpa.free(text);
@@ -558,8 +541,6 @@ test writeConfig {
     , w.buffered());
 }
 
-/// The terminfo entry for term, with extended capabilities, for the server to
-/// compile with tic. null when infocmp fails or the entry is too long.
 fn terminfoSource(arena: Allocator, io: Io, term: []const u8) ?[]const u8 {
     const result = std.process.run(arena, io, .{
         .argv = &.{ "infocmp", "-x", term },
@@ -592,7 +573,6 @@ fn keyFilePublicKey(gpa: Allocator, io: Io, path: []const u8) !auth.ssh.PublicKe
 }
 
 const Trust = union(enum) {
-    /// Allocated with gpa.
     keys: []auth.Key,
     declined,
     no_answer: CloseReason,
@@ -657,8 +637,6 @@ fn trustedKeys(
     return .{ .keys = keys };
 }
 
-/// Called when tx's known_hosts has no trusted key for the host. A listed key
-/// is then one that ~/.ssh/known_hosts lists.
 fn firstContact(known: *const auth.known_hosts.Known, key: auth.Key) enum { revoked, listed, unknown } {
     if (known.isRevoked(key)) return .revoked;
     for (known.keys.items) |k| if (std.mem.eql(u8, &k, &key)) return .listed;
@@ -725,8 +703,6 @@ fn usage(reason: []const u8) u8 {
     return 255;
 }
 
-// cli-test's root is this file. These references bring in the other files'
-// tests.
 test {
     _ = &main;
     _ = args_pkg;

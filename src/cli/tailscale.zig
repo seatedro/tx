@@ -24,7 +24,6 @@ pub fn ownNode(arena: Allocator, io: Io, address: IpAddress) ?[]const u8 {
     return ownNodeIn(arena, output, address);
 }
 
-/// The first CLI that starts gives the answer.
 fn status(arena: Allocator, io: Io) ?[]const u8 {
     for (clis) |cli| {
         const result = std.process.run(arena, io, .{
@@ -37,7 +36,6 @@ fn status(arena: Allocator, io: Io) ?[]const u8 {
     return null;
 }
 
-/// The parts of `tailscale status --json` that tx reads. Peer is keyed by node key.
 const Status = struct {
     Self: ?Node = null,
     Peer: ?std.json.ArrayHashMap(Node) = null,
@@ -74,12 +72,10 @@ fn hasAddress(node: Node, address: IpAddress) bool {
     return false;
 }
 
-/// DNSName is fully qualified, with a trailing dot.
 fn name(node: Node) []const u8 {
     return std.mem.trimEnd(u8, node.DNSName, ".");
 }
 
-/// Compares the addresses and ignores the ports.
 fn sameIp(a: IpAddress, b: IpAddress) bool {
     return switch (a) {
         .ip4 => |x| b == .ip4 and std.mem.eql(u8, &x.bytes, &b.ip4.bytes),

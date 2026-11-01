@@ -1,8 +1,3 @@
-//! tx's command line. tx takes ssh's options so git and rsync can run it as
-//! their ssh. Its own long options --attach, --new, --list and --kill choose
-//! what to do with sessions, and --version prints the version. getopt.zig
-//! splits the arguments; tx.zig acts on the Args.
-
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const getopt = @import("getopt.zig");
@@ -12,7 +7,6 @@ const getopt = @import("getopt.zig");
 const ssh_spec = "1246ab:c:e:fgi:kl:m:no:p:qstvxAB:CD:E:F:GI:J:KL:MNO:P:QR:S:TVw:W:XYy";
 
 pub const Args = struct {
-    /// The destination's host as typed, before ssh_config's HostName.
     host: []const u8 = "",
     /// From -l, -o User or the destination. The first one given wins, as in ssh.
     user: ?[]const u8 = null,
@@ -22,26 +16,19 @@ pub const Args = struct {
     /// The words after the destination, joined with spaces as ssh joins them.
     command: ?[]const u8 = null,
     mode: Mode = .auto,
-    /// true for -t, false for -T, null for auto. -o RequestTTY sets it too.
     tty: ?bool = null,
     family: ?Family = null,
-    /// -i and -o IdentityFile, in order.
     key_files: []const []const u8 = &.{},
     /// -F. The last one given wins; "none" passes through to ssh_config.
     ssh_config: ?[]const u8 = null,
-    /// null after -e none.
     escape_char: ?u8 = '~',
     no_stdin: bool = false,
     /// -G. git runs its ssh command with -G to tell whether it is OpenSSH.
     print_config: bool = false,
     version: bool = false,
-    /// Letters of ssh features tx lacks and connects without. tx.zig warns
-    /// about each one.
     ignored: []const u8 = "",
 };
 
-/// auto runs the command if there is one, and otherwise reattaches to the
-/// detached session or starts one.
 pub const Mode = union(enum) {
     auto,
     attach: u64,
@@ -54,9 +41,7 @@ pub const Family = enum { ip4, ip6 };
 
 pub const Result = union(enum) {
     ok: Args,
-    /// The problem, to print with the usage text.
     usage: []const u8,
-    /// The option as written, such as "-L" or "-o LocalForward".
     unsupported: []const u8,
 };
 
@@ -76,7 +61,6 @@ const State = struct {
     arena: Allocator,
     p: getopt.Parser,
     args: Args = .{},
-    /// Mode options and commands given. More than one is a usage error.
     modes: usize = 0,
     key_files: std.ArrayList([]const u8) = .empty,
     ignored: std.ArrayList(u8) = .empty,
@@ -147,13 +131,11 @@ const State = struct {
             // ssh settings with no counterpart in tx. They pass without a warning.
             '2', 'a', 'x', 'k', 'K', 'C', 'q', 'v', 'y', 'g', 'c', 'm', 'b', 'B', 'E', 'P' => {},
 
-            // Features tx lacks and can connect without.
             'A', 'X', 'Y', 'I' => try s.ignored.append(s.arena, o.letter),
 
             '1', 'L', 'R', 'D', 'W', 'J', 'N', 'f', 'M', 'S', 'O', 'w', 's', 'Q' => {
                 return s.unsupported(try std.fmt.allocPrint(s.arena, "-{c}", .{o.letter}));
             },
-            // getopt returns only letters in ssh_spec.
             else => unreachable,
         }
     }

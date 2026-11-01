@@ -20,17 +20,11 @@ pub const Error = error{
 };
 
 pub const Parser = struct {
-    /// getopt's option string: each letter, followed by ':' if it takes a value.
     spec: []const u8,
     args: []const []const u8,
-    /// The argument next reads from.
     index: usize = 0,
-    /// The next letter's position in a group such as -tp22, or 0 at the start
-    /// of an argument.
     offset: usize = 0,
-    /// Set when parsing stopped at --.
     ended: bool = false,
-    /// The last letter read, for error messages.
     letter: u8 = 0,
 
     /// The next option, or null at the first operand or after --. A letter
@@ -78,14 +72,12 @@ pub const Parser = struct {
         return .{ .short = .{ .letter = letter, .value = try p.value() } };
     }
 
-    /// Takes the next argument whole, such as a long option's value.
     pub fn value(p: *Parser) Error![]const u8 {
         if (p.index == p.args.len) return error.MissingValue;
         defer p.index += 1;
         return p.args[p.index];
     }
 
-    /// Once next returns null, these are the operands.
     pub fn rest(p: *const Parser) []const []const u8 {
         return p.args[p.index..];
     }
