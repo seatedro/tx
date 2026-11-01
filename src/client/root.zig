@@ -1,3 +1,7 @@
+//! The client module, the tx side of a connection to txd. session.run is
+//! the client's whole run; the other files are its parts, exported for
+//! cli/tx.zig and the end-to-end tests.
+
 pub const tty = @import("tty.zig");
 pub const escape = @import("escape.zig");
 pub const session = @import("session.zig");
@@ -24,5 +28,6 @@ test {
     _ = report;
     _ = clipboard;
     _ = pasteboard;
+    // No test here calls run; referencing it gets it compiled.
     _ = &session.run;
 }

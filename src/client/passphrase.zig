@@ -1,3 +1,7 @@
+//! Prompts for a key file's passphrase on the controlling terminal,
+//! /dev/tty, with echo off. session.zig's default Options.passphrase calls
+//! it on the signing thread.
+
 const std = @import("std");
 const posix = std.posix;
 const c = std.c;
@@ -7,6 +11,9 @@ pub const Error = error{
     NoTerminal,
 };
 
+/// Returns the passphrase as a slice of buf, which the caller wipes after
+/// use. Bytes past buf.len are dropped. Returns null, with buf wiped, when
+/// the user cancels or cancel_fd becomes readable.
 pub fn ask(prompt: []const u8, buf: []u8, cancel_fd: posix.fd_t) Error!?[]u8 {
     const fd = c.open("/dev/tty", .{ .ACCMODE = .RDWR, .NOCTTY = true, .CLOEXEC = true });
     if (fd == -1) return error.NoTerminal;
@@ -14,6 +21,8 @@ pub fn ask(prompt: []const u8, buf: []u8, cancel_fd: posix.fd_t) Error!?[]u8 {
 
     var saved: posix.termios = undefined;
     tty.getAttrs(fd, &saved) catch return error.NoTerminal;
+    // Without ICANON and ISIG, the editing keys and Ctrl-C arrive as bytes
+    // and the switch below handles them.
     var attrs = saved;
     attrs.lflag.ECHO = false;
     attrs.lflag.ICANON = false;
@@ -43,6 +52,8 @@ pub fn ask(prompt: []const u8, buf: []u8, cancel_fd: posix.fd_t) Error!?[]u8 {
         var byte: [1]u8 = undefined;
         if (c.read(fd, &byte, 1) != 1) return wipe(buf, null);
 
+        // Ctrl-C and Ctrl-D cancel, Backspace and Delete erase a byte, and
+        // Ctrl-U erases them all.
         switch (byte[0]) {
             '\r', '\n' => return buf[0..len],
             0x03, 0x04 => return wipe(buf, null),

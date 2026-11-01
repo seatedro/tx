@@ -1,3 +1,12 @@
+//! The client's run, from the first connection to an Outcome. run races the
+//! server's addresses (connect.zig) and logs in by signing a transcript of
+//! the connection with an SSH agent key or a key file. It then attaches to a
+//! session, or runs a command, lists or kills sessions. While attached it
+//! moves bytes between the local terminal (tty.zig) and the session, and
+//! after a lost connection it reconnects and resumes the session with the
+//! key from Attached. The work runs on one xev loop; the tty, signal and
+//! signing threads post to Run.inbox and wake it.
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -23,32 +32,56 @@ const CloseReason = transport.endpoint.CloseReason;
 const log = std.log.scoped(.client);
 
 pub const Options = struct {
+    /// Raced in order; see connect.interleave.
     servers: []const IpAddress,
+    /// The keys the server may present.
     host_keys: []const [32]u8,
+    /// Empty logs in as the account txd runs as.
     user: []const u8 = "",
+    /// Probed in order; the first one the server accepts signs the login.
+    /// Must not be empty.
     identities: []const Identity,
+    /// The SSH agent's socket, needed when an identity's source is .agent.
     agent: ?[]const u8 = null,
+    /// Asks for a key file's passphrase, on the signing thread. Returns null
+    /// to cancel, and must return once cancel_fd is readable.
     passphrase: *const fn (path: []const u8, buf: []u8, cancel_fd: posix.fd_t) ?[]u8 = askPassphrase,
+    /// Print the session's id on the terminal when first attached.
     show_session_id: bool = false,
     command: Command = .attach,
+    /// Attach to this session.
     session_id: ?u64 = null,
+    /// Start a new session that runs this command.
     session_command: ?[]const u8 = null,
+    /// Attach to the detached session if there is one, or start a new one.
+    /// The server refuses when several are detached.
     reuse_detached: bool = false,
     in_fd: posix.fd_t = posix.STDIN_FILENO,
     out_fd: posix.fd_t = posix.STDOUT_FILENO,
     err_fd: posix.fd_t = posix.STDERR_FILENO,
     term: []const u8,
     colorterm: ?[]const u8 = null,
+    /// The terminfo source (infocmp output) for term.
     terminfo: ?[]const u8 = null,
     colors: report.Colors = .{},
+    /// Input typed before the run, sent once attached. Up to max_held_input
+    /// bytes are kept.
     typed: []const u8 = "",
+    /// NAME=value locale variables, each followed by a NUL.
     locale: ?[]const u8 = null,
+    /// null turns the escape off.
     escape_char: ?u8 = '~',
     idle_timeout_ns: u64 = 30 * std.time.ns_per_s,
+    /// For the first connection. Reconnects use
+    /// reconnect_handshake_timeout_ns.
     handshake_timeout_ns: ?u64 = null,
     keep_alive_ns: u64 = 2 * std.time.ns_per_s,
+    /// While attached, a connection that receives nothing for this long is
+    /// closed, and the session resumed on a new one.
     silence_timeout_ns: u64 = 6 * std.time.ns_per_s,
+    /// How long a reconnect runs before a notice appears on the terminal.
     notice_delay_ms: u64 = 3000,
+    /// The local clipboard to share with the session; null shares none.
     clipboard: ?clipboard.Provider = null,
 };
 
@@ -56,6 +89,8 @@ pub const Command = union(enum) {
     attach,
     list,
     kill: u64,
+    /// Runs a command without a terminal, over the run's in, out and err
+    /// fds.
     exec: []const u8,
 };
 
@@ -73,15 +108,29 @@ fn askPassphrase(path: []const u8, buf: []u8, cancel_fd: posix.fd_t) ?[]u8 {
     return passphrase.ask(prompt, buf, cancel_fd) catch null;
 }
 
+/// How a run ended. cli/tx.zig turns each into a message and an exit
+/// status.
 pub const Outcome = union(enum) {
+    /// The session's program or the command exited.
     exited: Exit,
+    /// The client left the session running, after the escape, the end of
+    /// input, a signal or a failed write to the terminal. Carries the
+    /// session's id, or null before any Attached.
     detached: ?u64,
+    /// No attempt completed a handshake.
     no_connection: CloseReason,
+    /// The connection ended with nothing to resume, or broke locally.
     disconnected: CloseReason,
+    /// The server presented this key, which host_keys doesn't hold.
     host_key_refused: [32]u8,
+    /// The server sent an Error, or the client stopped with code 0 after a
+    /// failed login or an unexpected message.
     refused: Refusal,
+    /// Allocated with run's gpa; the caller frees it.
     listed: []Listed,
     killed: u64,
+    /// An exec ended without its exit status, after a signal or a failed
+    /// write to the local stdout or stderr.
     ended,
 
     pub const Listed = struct {
@@ -89,6 +138,7 @@ pub const Outcome = union(enum) {
         cols: u16,
         rows: u16,
         running_s: u64,
+        /// The attached client's address; null when detached.
         attached_from: ?Name,
         title: ?Name,
     };
@@ -103,6 +153,7 @@ pub const Outcome = union(enum) {
         message: Name,
     };
 
+    /// A fixed-size copy of a string, cut to max_len bytes.
     pub const Name = struct {
         buf: [max_len]u8 = undefined,
         len: usize = 0,
@@ -121,40 +172,59 @@ pub const Outcome = union(enum) {
     };
 };
 
+// The capacity exceeds high_water plus stream_window. Above high water a
+// stream's bytes stay unconsumed, so flow control stops the server before
+// the queue fills.
 const writer_options = .{
     .capacity = 4 << 20,
     .high_water = 1 << 20,
     .low_water = 256 << 10,
 };
 
+// The flow-control window of each stream and of the connection.
 const stream_window = 2 << 20;
 
+// In exec mode the reader thread waits while this much input is waiting for
+// the stdin stream.
 const max_pending_stdin = 256 << 10;
 
+// pumpStdin stops while the stdin stream holds this many unacked bytes.
 const stdin_high_water = 1 << 20;
 
+// The largest message body on the main stream. The session's Rebuild parts
+// (rebuild_part, 256 KiB) and Output records fit.
 const max_message = 1 << 20;
 
+// The delay before each reconnect; the last one repeats.
 const retry_delays_ms = [_]u64{ 0, 1000, 2000, 4000, 8000 };
 
 const reconnect_handshake_timeout_ns = 5 * std.time.ns_per_s;
 
+// Input typed while not attached is kept up to this size, and the rest
+// dropped.
 const max_held_input = 64 << 10;
 
+// Sent input kept for resending after a resume.
 const max_sent_input = 64 << 10;
 
 const silence_check_ms = 500;
 
+// The largest ClipboardCopy header ahead of a copy's data.
 const max_copy_header = 16 << 10;
 
 fn nowMs(io: Io) i64 {
     return Io.Clock.awake.now(io).toMilliseconds();
 }
 
+/// Connects, carries out options.command and returns how it ended. Errors
+/// are failures to set up, or to start the local terminal or the exec's
+/// I/O.
 pub fn run(gpa: Allocator, io: Io, options: Options) !Outcome {
     std.debug.assert(options.identities.len > 0);
     transport.crypto.init(io);
 
+    // The threads started below inherit the mask, and tty.Signals waits
+    // for these signals.
     const old_mask = tty.blockSignals();
     defer {
         var ignored: posix.sigset_t = undefined;
@@ -164,6 +234,7 @@ pub fn run(gpa: Allocator, io: Io, options: Options) !Outcome {
     var loop: xev.Loop = try .init(.{});
     defer loop.deinit();
 
+    // Threads and callbacks hold pointers to r, so it stays in this frame.
     var r: Run = undefined;
     try r.init(gpa, io, &loop, options);
     defer r.deinit();
@@ -179,30 +250,48 @@ const Run = struct {
     loop: *xev.Loop,
     options: Options,
     size: tty.Size,
+    /// The current race. Earlier racers wait in retired until their
+    /// endpoints have stopped.
     racer: *connect.Racer,
     retired: std.ArrayList(*connect.Racer) = .empty,
+    /// The winning connection; null between connections.
     conn: ?*Conn = null,
+    /// The terminal's attributes, saved at init for attach. Raw mode starts
+    /// after the login.
     raw: ?tty.RawMode,
+    /// Raw mode is on, and the terminal's reader and writer run.
     terminal: bool = false,
     hello_size: tty.Size = undefined,
+    /// The main stream, a bidi stream the client opens on each connection
+    /// for all messages.
     stream: ?*Stream = null,
     decoder: proto.Decoder,
     escape: escape.Escape,
 
+    /// The tty, signal and signing threads post here and notify wake, and
+    /// onWake takes their events on the loop.
     inbox: Inbox = .{},
     wake: xev.Async,
     wake_c: xev.Completion = .{},
     writer: tty.Writer = undefined,
     reader: tty.Reader = undefined,
     signals: tty.Signals = undefined,
+    /// Bytes of the main stream left unconsumed while the writer is above
+    /// high water.
     held: usize = 0,
     session_id: ?u64 = null,
+    /// From the last Attached. Once it's set, a lost connection is resumed.
     resume_key: ?[auth.resume_.key_len]u8 = null,
+    /// The seq of the next Output; Resume asks to continue from it.
     next_seq: u64 = 0,
+    /// Attached arrived on the current connection.
     attached: bool = false,
     listing: std.ArrayList(Outcome.Listed) = .empty,
     exec: Exec = .{},
+    /// Input typed while not attached, sent after Attached.
     held_input: std.ArrayList(u8) = .empty,
+    /// The latest max_sent_input bytes of input sent, for resending after a
+    /// resume. sent_input_offset is the input offset of its first byte.
     sent_input: std.ArrayList(u8) = .empty,
     sent_input_offset: u64 = 0,
     reconnect: Reconnect = .{},
@@ -219,9 +308,13 @@ const Run = struct {
     clip_timer: xev.Timer,
     clip_c: xev.Completion = .{},
     clip_cancel_c: xev.Completion = .{},
+    /// The identity being probed.
     key_index: usize = 0,
+    /// Set while the signing thread runs.
     signer: ?Signer = null,
+    /// Set once; the loop in run stops then.
     outcome: ?Outcome = null,
+    /// An error for run to return in place of the outcome.
     failure: ?anyerror = null,
 
     const Exec = struct {
@@ -229,10 +322,16 @@ const Run = struct {
         stdout: Output = .{},
         stderr: Output = .{},
         stdin: ?*Stream = null,
+        /// Local input reached its end.
         input_ended: bool = false,
         stdin_done: bool = false,
+        /// From Exit. The run ends once stdout and stderr have ended too.
         exit: ?Outcome.Exit = null,
 
+        // Exec.start in server/exec.zig opens stdout, stderr, then stdin as
+        // the connection's first server-initiated streams. RFC 9000 section
+        // 2.1 numbers the server's first two unidirectional streams 3 and
+        // 7, and its first bidirectional stream 1.
         const stdout_id = 3;
         const stderr_id = 7;
         const stdin_id = 1;
@@ -240,15 +339,22 @@ const Run = struct {
         const Output = struct {
             writer: tty.Writer = undefined,
             stream: ?*Stream = null,
+            /// Bytes left unconsumed while the writer is above high water.
             held: usize = 0,
             fin: bool = false,
         };
     };
 
     const Clip = struct {
+        /// The change count last offered, or last written by a copy from the
+        /// host.
         offered: ?u64 = null,
+        /// The change count after the host's last copy, which isn't offered
+        /// back.
         written: ?u64 = null,
+        /// When input last held a paste keystroke (clipboard.hasPaste).
         pasted_ms: ?i64 = null,
+        /// ClipboardCopy streams still arriving.
         copies: std.ArrayList(*Copy) = .empty,
 
         const Copy = struct {
@@ -260,14 +366,17 @@ const Run = struct {
     const Reconnect = struct {
         active: bool = false,
         tries: usize = 0,
+        /// The notice is on the screen, so Resume asks for a repaint.
         notice_shown: bool = false,
     };
 
     const Signer = struct {
         thread: std.Thread,
         identity: Identity,
+        /// The login transcript to sign.
         data: auth.sshsig.SignedData,
         agent: ?auth.Agent,
+        /// Notified to end a passphrase prompt.
         cancel: Wake,
     };
 
@@ -277,6 +386,7 @@ const Run = struct {
         KeyFile,
     };
 
+    /// Guarded by mutex.
     const Inbox = struct {
         mutex: Io.Mutex = .init,
         input: std.ArrayList(u8) = .empty,
@@ -287,7 +397,10 @@ const Run = struct {
         output_failed: bool = false,
         stdout_low: bool = false,
         stderr_low: bool = false,
+        /// Broadcast when the loop takes input, for a reader thread waiting
+        /// on max_pending_stdin.
         room: Io.Condition = .init,
+        /// Set at deinit so a waiting reader thread returns.
         closed: bool = false,
         signature: ?(SignError![]u8) = null,
     };
@@ -344,6 +457,8 @@ const Run = struct {
                 .closed = onClosed,
             },
         }) catch |err| {
+            // The attempts that failed to start may still be closing on the
+            // loop.
             racer.stop();
             r.retired.append(r.gpa, racer) catch {};
             return err;
@@ -373,6 +488,7 @@ const Run = struct {
         r.signals.stop();
         if (r.terminal) r.writer.stop(.drain);
         if (r.exec.started) {
+            // Wakes a reader thread waiting for room in the inbox.
             {
                 r.inbox.mutex.lockUncancelable(r.io);
                 defer r.inbox.mutex.unlock(r.io);
@@ -384,6 +500,8 @@ const Run = struct {
             r.exec.stderr.writer.stop(.drain);
         }
 
+        // A shut down socket ends a pending agent call, and cancel ends a
+        // passphrase prompt.
         if (r.signer) |*signer| {
             if (signer.agent) |*agent| agent.stream.shutdown(r.io, .both) catch {};
             signer.cancel.notify();
@@ -396,7 +514,10 @@ const Run = struct {
         cancelTimer(r.loop, &r.notice_c, &r.notice_cancel_c);
         cancelTimer(r.loop, &r.silence_c, &r.silence_cancel_c);
         cancelTimer(r.loop, &r.clip_c, &r.clip_cancel_c);
+        // onWake disarms when it runs with an outcome set.
         if (r.wake_c.state() == .active) r.wake.notify() catch {};
+        // Stopped endpoints and canceled completions finish before their
+        // memory is freed.
         r.loop.run(.until_done) catch {};
         for (r.retired.items) |racer| destroyRacer(r.gpa, racer);
         r.retired.deinit(r.gpa);
@@ -431,6 +552,8 @@ const Run = struct {
         return @ptrCast(@alignCast(ctx.?));
     }
 
+    /// The first outcome stays. The server takes the connection's close as
+    /// the client leaving.
     fn finish(r: *Run, outcome: Outcome) void {
         if (r.outcome == null) r.outcome = outcome;
         if (r.conn) |conn| conn.close(0);
@@ -460,6 +583,8 @@ const Run = struct {
         const r = fromCtx(ctx);
         r.conn = conn;
         r.decoder.reset();
+        // Each connection opens a main stream and sends Hello on it. A
+        // Resume follows when there is a session to resume, else the login.
         r.stream = conn.openStream(.bidi) catch return r.finish(.{ .disconnected = .failed });
 
         r.hello_size = r.size;
@@ -478,9 +603,13 @@ const Run = struct {
     }
 
     fn sendResume(r: *Run, conn: *Conn, key: *const [auth.resume_.key_len]u8) void {
+        // The proof ties the resume key to this connection's TLS exporter
+        // and to the session.
         var exporter: [auth.resume_.exporter_len]u8 = undefined;
         conn.quic.exportSecret(&exporter, auth.resume_.exporter_label);
         const proof = auth.resume_.proof(key, &exporter, r.session_id.?);
+        // Without a next_seq the session sends a repaint, which clears the
+        // notice off the screen.
         r.send(.{ .@"resume" = .{
             .session_id = r.session_id.?,
             .next_seq = if (r.reconnect.notice_shown) null else r.next_seq,
@@ -488,6 +617,8 @@ const Run = struct {
         } });
     }
 
+    /// Asks whether the server takes the current key, before anything is
+    /// signed with it.
     fn probe(r: *Run) void {
         const key = &r.options.identities[r.key_index].key;
         r.send(.{ .auth_probe = .{ .user = r.options.user, .key = key.blob() } });
@@ -511,6 +642,9 @@ const Run = struct {
     fn startSigning(r: *Run) void {
         const conn = r.conn orelse return;
 
+        // The signature binds the login to this connection's TLS exporter
+        // and to the host key the server presented. The server builds the
+        // same transcript with its own key to verify it.
         var transcript: auth.login.Transcript = .{
             .exporter = undefined,
             .host_key = r.racer.presentedKey().?,
@@ -530,6 +664,8 @@ const Run = struct {
             return r.finish(.{ .disconnected = .failed });
         };
 
+        // Signing runs on its own thread, since an agent call or a
+        // passphrase prompt blocks.
         r.signer = .{
             .thread = undefined,
             .identity = identity,
@@ -614,6 +750,8 @@ const Run = struct {
         };
         defer r.gpa.free(sig);
 
+        // The command follows the signature without waiting for AuthOk. The
+        // server reads them in order and answers a failed login with Error.
         r.send(.{ .auth_signature = .{ .user = r.options.user, .key = identity.key.blob(), .signature = sig } });
         var palette_buf: [64]u8 = undefined;
         r.send(switch (r.options.command) {
@@ -627,6 +765,9 @@ const Run = struct {
                     .background = report.packRgb(r.options.colors.background),
                     .palette = report.paletteBytes(&r.options.colors, &palette_buf),
                     .dark = r.options.colors.dark,
+                    // A session made for a command sends SIGHUP to it when
+                    // this client leaves, or hangup_grace_ms after the
+                    // client is lost.
                     .hangup = r.options.session_command != null,
                 },
             },
@@ -670,6 +811,8 @@ const Run = struct {
 
     fn onAuthOk(r: *Run) void {
         if (r.options.command != .attach) return;
+        // Until now no reader ran, and a passphrase prompt had the terminal
+        // to itself.
         r.startTerminal() catch |err| {
             r.failure = err;
             r.finish(.{ .disconnected = .failed });
@@ -687,6 +830,8 @@ const Run = struct {
 
     fn onData(ctx: ?*anyopaque, stream: *Stream, bytes: []const u8, fin: bool) void {
         const r = fromCtx(ctx);
+        // The server opens the other streams: clipboard copies when
+        // attached, the command's stdio for exec.
         if (stream != r.stream) {
             if (r.options.command == .attach) return r.onCopyData(stream, bytes, fin);
             return r.onExecData(stream, bytes, fin);
@@ -698,8 +843,12 @@ const Run = struct {
             r.handle(message orelse break);
         }
 
+        // Unconsumed bytes hold back the server through flow control until
+        // the terminal catches up.
         if (r.terminal and r.writer.aboveHighWater()) r.held += bytes.len else stream.consume(bytes.len);
 
+        // The server finishes the main stream after an Error or a session's
+        // Exit.
         if (fin) r.finish(.{ .disconnected = .{ .peer = .{ .application = 0 } } });
     }
 
@@ -711,6 +860,8 @@ const Run = struct {
         const output = switch (stream.id) {
             Exec.stdout_id => &r.exec.stdout,
             Exec.stderr_id => &r.exec.stderr,
+            // The server finishes its side of stdin at once, and the FIN
+            // shows the client the stream to write input on.
             Exec.stdin_id => {
                 stream.consume(bytes.len);
                 if (r.exec.stdin == null) {
@@ -728,6 +879,7 @@ const Run = struct {
         output.stream = stream;
         output.writer.write(bytes) catch |err| switch (err) {
             error.Failed => return r.finish(.ended),
+            // See writer_options.
             error.QueueFull => unreachable,
         };
         if (output.writer.aboveHighWater()) output.held += bytes.len else stream.consume(bytes.len);
@@ -753,6 +905,7 @@ const Run = struct {
                 defer r.inbox.mutex.unlock(r.io);
                 chunk = r.inbox.input;
                 r.inbox.input = .empty;
+                // Wakes a reader thread waiting on max_pending_stdin.
                 r.inbox.room.broadcast(r.io);
             }
             if (chunk.items.len == 0) {
@@ -796,12 +949,14 @@ const Run = struct {
                 r.resume_key = m.resume_key[0..auth.resume_.key_len].*;
                 r.session_id = m.session_id;
                 r.attached = true;
+                // The silence check stops while not attached.
                 if (r.silence_c.state() != .active) r.silence_timer.run(r.loop, &r.silence_c, silence_check_ms, Run, r, onSilenceTimer);
                 if (resumed) {
                     r.reconnected();
                     r.resendInput(m.input_offset);
                 }
 
+                // Resizes since Hello weren't sent.
                 if (!std.meta.eql(r.size, r.hello_size)) r.sendResize();
 
                 if (r.options.show_session_id and !resumed) {
@@ -812,12 +967,15 @@ const Run = struct {
                 if (r.held_input.items.len > 0) r.sendInput(r.held_input.items);
                 r.held_input.clearAndFree(r.gpa);
 
+                // The server keeps an offer per connection, so each
+                // connection gets the clipboard offered.
                 r.clip.offered = null;
                 r.offerClipboard();
             },
             .rebuild => |m| {
                 if (!r.terminal) return r.refuse("the server sent a rebuild before the login");
                 r.writeTerminal(m.bytes) catch return;
+                // A Rebuild's seq is the seq of the Output after it.
                 r.next_seq = m.seq;
             },
             .output => |m| {
@@ -854,6 +1012,8 @@ const Run = struct {
                 r.finishExecIfDone();
             },
             .@"error" => |m| {
+                // A refused resume means the session is gone, or another
+                // attach gave it a new resume key.
                 if (r.reconnect.active and m.code == @backingInt(proto.ErrorCode.auth)) {
                     var buf: [128]u8 = undefined;
                     const text = std.fmt.bufPrint(&buf, "can't resume session {d}: it ended, or was attached elsewhere", .{r.session_id.?}) catch unreachable;
@@ -867,6 +1027,7 @@ const Run = struct {
 
     fn writeTerminal(r: *Run, bytes: []const u8) error{Failed}!void {
         r.writer.write(bytes) catch |err| switch (err) {
+            // The local terminal is gone; the session goes on without it.
             error.Failed => {
                 r.finish(.{ .detached = r.session_id });
                 return error.Failed;
@@ -887,12 +1048,15 @@ const Run = struct {
         }
         if (r.outcome != null) return;
 
+        // A connection from a retired racer, closing after the current race
+        // was won.
         if (!current and r.racer.winner != null) return;
 
         if (r.racer.winner == null) if (r.racer.refusedKey()) |key| {
             return r.finish(.{ .host_key_refused = key });
         };
 
+        // After an Attached, every loss is retried, with no limit on tries.
         if (r.resume_key != null) return r.retry(reason);
         r.outcome = if (r.racer.winner == null) .{ .no_connection = reason } else .{ .disconnected = reason };
     }
@@ -923,6 +1087,7 @@ const Run = struct {
         r.racer.stop();
         r.retired.append(r.gpa, r.racer) catch {};
         r.racer = racer;
+        // Retired racers are freed once their endpoints have stopped.
         var i: usize = 0;
         while (i < r.retired.items.len) {
             if (!r.retired.items[i].isStopped()) {
@@ -955,6 +1120,9 @@ const Run = struct {
         result catch return .disarm;
         if (r.outcome != null or !r.reconnect.active or !r.terminal) return .disarm;
 
+        // ?2026l ends a synchronized update the lost connection may have
+        // left open. The notice goes on the bottom row in reverse video,
+        // between a cursor save and restore.
         var buf: [128]u8 = undefined;
         const notice = std.fmt.bufPrint(&buf, "\x1b[?2026l\x1b7\x1b[{d};1H\x1b[0m\x1b[7m tx: connection lost, reconnecting. ~. detaches \x1b[0m\x1b[K\x1b8", .{r.size.rows}) catch unreachable;
         r.writeTerminal(notice) catch return .disarm;
@@ -967,6 +1135,7 @@ const Run = struct {
         if (!r.attached) return;
         if (r.clip_c.state() != .active) r.clip_timer.run(r.loop, &r.clip_c, clipboard.poll_ms, Run, r, onClipTimer);
 
+        // A change the host's own copy made isn't offered back.
         const change = provider.change(provider.context);
         if (r.clip.offered == change) return;
         r.clip.offered = change;
@@ -985,6 +1154,9 @@ const Run = struct {
         return .disarm;
     }
 
+    /// Answers on a new uni stream: a ClipboardData header, then the data
+    /// up to FIN. A read is refused unless the user pasted within
+    /// paste_window_ms and the clipboard is still the one offered.
     fn answerClipboard(r: *Run, m: proto.ClipboardRequest) void {
         const conn = r.conn orelse return;
         const provider = r.options.clipboard orelse return;
@@ -997,6 +1169,8 @@ const Run = struct {
 
         const refused = data == null or data.?.len > clipboard.max_data_len;
         const header: proto.Message = .{ .clipboard_data = .{ .id = m.id, .refused = refused } };
+        // server/root.zig reads at most max_answer_header (64) bytes of
+        // header.
         var buf: [64]u8 = undefined;
         var w: Io.Writer = .fixed(&buf);
         proto.encode(&w, header) catch unreachable;
@@ -1006,6 +1180,8 @@ const Run = struct {
         stream.finish();
     }
 
+    /// Gathers a copy from the host, sent on a server-opened uni stream, and
+    /// writes it to the clipboard at FIN.
     fn onCopyData(r: *Run, stream: *Stream, bytes: []const u8, fin: bool) void {
         stream.consume(bytes.len);
         const copy = for (r.clip.copies.items) |copy| {
@@ -1033,6 +1209,9 @@ const Run = struct {
         if (m != .clipboard_copy) return error.WrongType;
         const copy = m.clipboard_copy;
 
+        // mimes is NUL-separated, and lens holds an 8-byte big-endian length
+        // for each. The data follow the header back to back. The server
+        // sends at most server/clipboard.zig's max_copy_types (16) types.
         var items: [16]clipboard.Item = undefined;
         var count: usize = 0;
         var data = bytes[header_len..];
@@ -1077,6 +1256,9 @@ const Run = struct {
         }
     }
 
+    /// offset is Attached.input_offset, the count of input bytes the session
+    /// has received. What was sent after it goes again, as far as
+    /// sent_input reaches.
     fn resendInput(r: *Run, offset: u64) void {
         const end = r.sent_input_offset + r.sent_input.items.len;
         if (offset >= end) return;
@@ -1099,6 +1281,9 @@ const Run = struct {
             defer r.inbox.mutex.unlock(r.io);
             switch (event) {
                 .data => |bytes| {
+                    // For exec, input waits for the stdin stream, and the
+                    // reader thread waits here once the inbox holds
+                    // max_pending_stdin.
                     while (r.options.command == .exec and r.inbox.input.items.len >= max_pending_stdin and !r.inbox.closed) {
                         r.inbox.room.waitUncancelable(r.io, &r.inbox.mutex);
                     }
@@ -1174,6 +1359,7 @@ const Run = struct {
             r.inbox.mutex.lockUncancelable(r.io);
             defer r.inbox.mutex.unlock(r.io);
             const box = &r.inbox;
+            // For exec, pumpStdin takes the input when the stream has room.
             if (!exec) {
                 input = box.input;
                 box.input = .empty;
@@ -1232,6 +1418,7 @@ const Run = struct {
     fn forwardInput(r: *Run, input: []const u8) void {
         if (clipboard.hasPaste(input)) r.clip.pasted_ms = nowMs(r.io);
 
+        // Escape.feed can emit one byte more than its input.
         var out: [4097]u8 = undefined;
         var rest = input;
 

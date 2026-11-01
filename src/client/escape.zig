@@ -1,3 +1,8 @@
+//! ssh's escape sequences in typed input. The escape character at the start
+//! of a line is held back. A '.' after it returns .disconnect, a second
+//! escape character sends one, and any other byte sends both. session.zig
+//! passes the terminal Reader's input through an Escape.
+
 const std = @import("std");
 const assert = std.debug.assert;
 
@@ -5,21 +10,29 @@ pub const Action = enum {
     disconnect,
 };
 
+/// forward is the input to send, a slice of feed's out. With an action, the
+/// input after the sequence is dropped.
 pub const Result = struct {
     forward: []u8,
     action: ?Action = null,
 };
 
 pub const Escape = struct {
+    /// null turns escapes off.
     char: ?u8 = '~',
     state: State = .line_start,
 
     const State = enum {
+        /// Before any input, or after CR or LF.
         line_start,
         mid_line,
+        /// The escape character was held at the start of a line.
         pending,
     };
 
+    /// out must hold input.len + 1 bytes, since a held escape character
+    /// comes out with the byte after it. The state carries over between
+    /// calls.
     pub fn feed(e: *Escape, input: []const u8, out: []u8) Result {
         assert(out.len >= input.len + 1);
 

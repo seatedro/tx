@@ -1,17 +1,33 @@
+//! Sharing the local clipboard with a session. A Provider is the local
+//! clipboard, and pasteboard.zig implements one for macOS. session.zig
+//! offers the clipboard's types to the server and writes the host's copies
+//! into it. It answers the host's reads only within paste_window_ms of a
+//! paste keystroke, which hasPaste detects.
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+/// How long after a paste keystroke the host may read the clipboard.
 pub const paste_window_ms = 5000;
 
+/// How often the session checks the clipboard's change count.
 pub const poll_ms = 500;
 
+/// The most clipboard data sent or accepted; server/clipboard.zig's
+/// max_copy_len is the same.
 pub const max_data_len = 64 << 20;
 
+/// The local clipboard. The session calls it on its loop thread.
 pub const Provider = struct {
     context: ?*anyopaque = null,
+    /// A count that changes whenever the clipboard's contents do.
     change: *const fn (context: ?*anyopaque) u64,
+    /// The MIME types on offer, each followed by a NUL. The caller frees
+    /// the result.
     types: *const fn (context: ?*anyopaque, gpa: Allocator) Allocator.Error![]u8,
+    /// The data for mime, or null when there is none. The caller frees it.
     read: *const fn (context: ?*anyopaque, gpa: Allocator, mime: []const u8) Allocator.Error!?[]u8,
+    /// Replaces the contents with items and returns the new change count.
     write: *const fn (context: ?*anyopaque, items: []const Item) u64,
 };
 
@@ -20,6 +36,9 @@ pub const Item = struct {
     data: []const u8,
 };
 
+/// Whether input holds a paste keystroke: Ctrl-V as a byte, the start of a
+/// bracketed paste, or Ctrl-V encoded by the kitty keyboard protocol or by
+/// xterm's modifyOtherKeys. A kitty key release doesn't count.
 pub fn hasPaste(input: []const u8) bool {
     if (std.mem.indexOfScalar(u8, input, 0x16) != null) return true;
     if (std.mem.indexOf(u8, input, "\x1b[200~") != null) return true;
@@ -38,6 +57,8 @@ pub fn hasPaste(input: []const u8) bool {
     return false;
 }
 
+/// kitty: CSI code[:alternates] ; modifiers[:event] u, where code 118 is
+/// 'v' and event 3 is a release.
 fn isCtrlV(params: []const u8) bool {
     var fields = std.mem.splitScalar(u8, params, ';');
     const key = fields.next() orelse return false;
@@ -49,6 +70,7 @@ fn isCtrlV(params: []const u8) bool {
     return value >= 1 and (value - 1) & ctrl_bit != 0;
 }
 
+/// xterm: CSI 27 ; modifiers ; code ~
 fn isModifyOtherKeysCtrlV(params: []const u8) bool {
     var fields = std.mem.splitScalar(u8, params, ';');
     if (!std.mem.eql(u8, fields.next() orelse return false, "27")) return false;
@@ -57,6 +79,8 @@ fn isModifyOtherKeysCtrlV(params: []const u8) bool {
     return value >= 1 and (value - 1) & ctrl_bit != 0;
 }
 
+/// Both encodings send the modifiers as 1 plus a bit set, in which Ctrl
+/// is 4.
 const ctrl_bit = 4;
 
 fn firstCode(key: []const u8) []const u8 {

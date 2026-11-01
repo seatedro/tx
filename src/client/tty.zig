@@ -1,3 +1,10 @@
+//! The client's local terminal and stdio. RawMode saves the terminal's
+//! attributes and switches it to raw mode. Reader and Writer move bytes from
+//! and to an fd, each on its own thread; session.zig uses them for the
+//! terminal and for an exec's stdin, stdout and stderr. Signals waits for
+//! SIGWINCH and the terminating signals on another thread. Each thread
+//! reports events to a callback, and session.zig passes them to its loop.
+
 const std = @import("std");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
@@ -8,6 +15,7 @@ const c = std.c;
 const native_os = builtin.os.tag;
 const Wake = @import("wake").Wake;
 
+/// The pixel sizes are 0 when the terminal doesn't report them.
 pub const Size = struct {
     cols: u16,
     rows: u16,
@@ -52,6 +60,8 @@ pub const RawMode = struct {
     }
 };
 
+/// Raw mode as OpenSSH's enter_raw_mode sets it. A read returns as soon as
+/// one byte is available.
 pub fn makeRaw(attrs: posix.termios) posix.termios {
     var raw = attrs;
 
@@ -81,8 +91,13 @@ pub fn makeRaw(attrs: posix.termios) posix.termios {
     return raw;
 }
 
+/// The signals Signals waits for.
 pub const handled_signals = [_]posix.SIG{ .WINCH, .HUP, .TERM, .QUIT };
 
+/// Blocks handled_signals in the calling thread and returns the old mask.
+/// A thread that leaves one unblocked can receive it, and Signals doesn't
+/// see it then. Threads inherit the mask, so call this before any thread
+/// starts.
 pub fn blockSignals() posix.sigset_t {
     const set = signalSet();
     var old: posix.sigset_t = undefined;
@@ -97,6 +112,7 @@ fn signalSet() posix.sigset_t {
 }
 
 fn signalsBlocked() bool {
+    // Blocking an empty set reads the current mask.
     const empty = posix.sigemptyset();
     var mask: posix.sigset_t = undefined;
     _ = c.pthread_sigmask(posix.SIG.BLOCK, &empty, &mask);
@@ -106,6 +122,8 @@ fn signalsBlocked() bool {
     return true;
 }
 
+/// A thread that takes handled_signals with sigwait. start asserts that the
+/// calling thread blocks them; see blockSignals.
 pub const Signals = struct {
     options: Options,
     thread: std.Thread,
@@ -113,14 +131,18 @@ pub const Signals = struct {
     old_winch: posix.Sigaction,
 
     pub const Event = union(enum) {
+        /// The size of options.fd after a SIGWINCH.
         resize: Size,
         terminate: posix.SIG,
     };
 
     pub const Options = struct {
+        /// The terminal whose size a resize reports.
         fd: posix.fd_t,
+        /// Restored on the signal thread before a terminate event.
         raw_mode: ?*const RawMode = null,
         context: ?*anyopaque = null,
+        /// Called on the signal thread.
         callback: *const fn (context: ?*anyopaque, event: Event) void,
     };
 
@@ -128,6 +150,10 @@ pub const Signals = struct {
         assert(signalsBlocked());
         s.* = .{ .options = options, .thread = undefined, .stopping = .init(false), .old_winch = undefined };
 
+        // SIGWINCH's default action is to ignore it, and POSIX lets a system
+        // discard a blocked signal whose action is to ignore it. With a
+        // handler it stays pending for sigwait. The handler never runs, since
+        // every thread blocks the signal.
         const action: posix.Sigaction = .{ .handler = .{ .handler = ignore }, .mask = posix.sigemptyset(), .flags = 0 };
         _ = c.sigaction(.WINCH, &action, &s.old_winch);
         errdefer _ = c.sigaction(.WINCH, &s.old_winch, null);
@@ -137,6 +163,7 @@ pub const Signals = struct {
 
     pub fn stop(s: *Signals) void {
         s.stopping.store(true, .release);
+        // Wakes sigwait; the thread sees stopping and returns.
         _ = c.pthread_kill(s.thread.getHandle(), .WINCH);
         s.thread.join();
         _ = c.sigaction(.WINCH, &s.old_winch, null);
@@ -164,6 +191,8 @@ pub const Signals = struct {
                 else => {
                     if (s.options.raw_mode) |raw| raw.restore();
 
+                    // A second terminating signal gets the default action,
+                    // which ends the process.
                     if (terminating) defaultAction(sig);
                     terminating = true;
 
@@ -177,6 +206,8 @@ pub const Signals = struct {
         var action: posix.Sigaction = .{ .handler = .{ .handler = posix.SIG.DFL }, .mask = posix.sigemptyset(), .flags = 0 };
         _ = c.sigaction(sig, &action, null);
 
+        // The signal stays pending while this thread blocks it; unblocking
+        // it delivers it.
         _ = c.raise(sig);
         var set = posix.sigemptyset();
         posix.sigaddset(&set, sig);
@@ -190,6 +221,8 @@ pub const StartError = std.Thread.SpawnError || error{
     SystemFdQuotaExceeded,
 };
 
+/// Reads an fd on its own thread and passes each chunk to a callback. The
+/// thread exits after end_of_file or failed.
 pub const Reader = struct {
     options: Options,
     wake: Wake,
@@ -197,6 +230,7 @@ pub const Reader = struct {
     buf: [16 * 1024]u8,
 
     pub const Event = union(enum) {
+        /// Valid only during the callback.
         data: []const u8,
         end_of_file,
         failed: ReadError,
@@ -207,6 +241,7 @@ pub const Reader = struct {
     pub const Options = struct {
         fd: posix.fd_t,
         context: ?*anyopaque = null,
+        /// Called on the reader thread. The next read waits until it returns.
         callback: *const fn (context: ?*anyopaque, event: Event) void,
     };
 
@@ -226,6 +261,9 @@ pub const Reader = struct {
     fn run(r: *Reader) void {
         const fd = r.options.fd;
 
+        // Cleared when poll rejects the fd with POLLNVAL. Reads then block
+        // without watching the wake fd, and stop waits for the next read to
+        // return.
         var poll_fd = true;
 
         while (true) {
@@ -252,6 +290,9 @@ pub const Reader = struct {
     }
 };
 
+/// Queues bytes for an fd and writes them on its own thread. Events report
+/// the queue rising above high_water, falling back to low_water, and a
+/// failed write.
 pub const Writer = struct {
     gpa: Allocator,
     io: Io,
@@ -260,6 +301,7 @@ pub const Writer = struct {
     thread: std.Thread,
 
     mutex: Io.Mutex,
+    /// A ring of options.capacity bytes; the queue is len bytes from head.
     buf: []u8,
     head: usize,
     len: usize,
@@ -286,10 +328,14 @@ pub const Writer = struct {
         high_water: usize = 1024 * 1024,
         low_water: usize = 256 * 1024,
         context: ?*anyopaque = null,
+        /// Called with the writer's lock held, so it must not call into the
+        /// Writer. above_high_water comes on the thread calling write, the
+        /// other events on the writer thread.
         callback: *const fn (context: ?*anyopaque, event: Event) void,
     };
 
     pub const StopMode = enum {
+        /// Write out the queue first, blocking while the fd can't take it.
         drain,
         discard,
     };
@@ -332,6 +378,8 @@ pub const Writer = struct {
         w.* = undefined;
     }
 
+    /// Copies bytes into the queue. QueueFull leaves the queue as it was.
+    /// Failed means a write to the fd failed, and the queue was dropped.
     pub fn write(w: *Writer, bytes: []const u8) error{ QueueFull, Failed }!void {
         w.mutex.lockUncancelable(w.io);
         defer w.mutex.unlock(w.io);
@@ -352,6 +400,7 @@ pub const Writer = struct {
             w.options.callback(w.options.context, .above_high_water);
         }
 
+        // The thread waits for a notify only while the queue is empty.
         if (was_empty) w.wake.notify();
     }
 
@@ -364,9 +413,12 @@ pub const Writer = struct {
     fn run(w: *Writer) void {
         const fd = w.options.fd;
 
+        // Cleared on POLLNVAL, as in Reader.run.
         var poll_fd = true;
 
         while (true) {
+            // The chunk stays valid after unlock, since write() fills only
+            // past head + len and only this thread moves head.
             w.mutex.lockUncancelable(w.io);
             const stopping = w.stopping;
             const chunk = w.buf[w.head..][0..@min(w.len, w.buf.len - w.head, max_write)];
@@ -379,6 +431,8 @@ pub const Writer = struct {
                 continue;
             }
 
+            // Waiting in poll, the thread sees a stop while the fd isn't
+            // writable.
             if (poll_fd) switch (waitFor(fd, posix.POLL.OUT, w.wake.read_fd)) {
                 .ready => {},
                 .woken => {
@@ -433,6 +487,8 @@ const Ready = enum {
     unsupported,
 };
 
+/// Waits for events on fd or for wake_fd to become readable. A failed poll
+/// returns .ready, and the read or write that follows reports the error.
 fn waitFor(fd: posix.fd_t, events: i16, wake_fd: posix.fd_t) Ready {
     var fds = [_]posix.pollfd{
         .{ .fd = wake_fd, .events = posix.POLL.IN, .revents = 0 },
@@ -459,6 +515,9 @@ fn waitForWake(wake_fd: posix.fd_t) void {
 }
 
 pub fn getAttrs(fd: posix.fd_t, attrs: *posix.termios) TerminalError!void {
+    // On Linux, std's termios has the kernel's layout, with 19 control
+    // characters. glibc's struct termios has 32, so glibc's tcgetattr would
+    // write past it. The TCGETS and TCSETSW ioctls use the kernel's layout.
     const rc = if (native_os == .linux)
         ioctl(fd, std.os.linux.T.CGETS, @intFromPtr(attrs))
     else
@@ -466,6 +525,8 @@ pub fn getAttrs(fd: posix.fd_t, attrs: *posix.termios) TerminalError!void {
     if (rc != 0) return terminalError(posix.errno(-1));
 }
 
+/// Applies attrs once queued output is written (TCSADRAIN), and returns the
+/// errno.
 pub fn setAttrs(fd: posix.fd_t, attrs: *const posix.termios) posix.E {
     while (true) {
         const rc = if (native_os == .linux)
@@ -490,9 +551,13 @@ fn closeFd(fd: posix.fd_t) void {
     _ = c.close(fd);
 }
 
+// std.c.ioctl takes the request as a c_int, and Darwin's TIOCSWINSZ
+// (0x80087467) doesn't fit in one.
 extern "c" fn ioctl(fd: posix.fd_t, request: c_ulong, ...) c_int;
 
 const tiocgwinsz: c_ulong = c.T.IOCGWINSZ;
+// std.c.T has no IOCSWINSZ for Darwin. 0x80087467 is _IOW('t', 103, struct
+// winsize), the value session/pty.zig uses as well.
 const tiocswinsz: c_ulong = if (native_os.isDarwin()) 0x80087467 else c.T.IOCSWINSZ;
 
 const testing = std.testing;

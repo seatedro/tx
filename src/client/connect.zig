@@ -1,3 +1,10 @@
+//! Races QUIC connections to a server's addresses, in the manner of Happy
+//! Eyeballs (RFC 8305). Each attempt has its own Endpoint and starts
+//! attempt_delay_ms after the one before it, or as soon as that one fails.
+//! The first handshake to complete wins, the other attempts stop, and the
+//! winner's events go to Options.handler. session.zig connects through a
+//! Racer, and scan.zig uses one to fetch a host key.
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -14,27 +21,36 @@ const CloseReason = transport.endpoint.CloseReason;
 
 const log = std.log.scoped(.connect);
 
+/// RFC 8305 recommends 250 ms between connection attempts.
 pub const attempt_delay_ms = 250;
 
 pub const Options = struct {
+    /// Tried in order; must not be empty.
     addresses: []const IpAddress,
+    /// The host keys a handshake accepts.
     accept: quic.Client.Accept,
     idle_timeout_ns: u64 = 30 * std.time.ns_per_s,
     handshake_timeout_ns: ?u64 = null,
     keep_alive_ns: ?u64 = null,
     stream_window: u64 = 8 << 20,
     connection_window: u64 = 32 << 20,
+    /// Gets the winner's events. When every attempt fails, closed gets the
+    /// last connection to close and the failure of the last attempt.
     handler: Handler,
 };
 
+/// Attempts and the timer point at the Racer, so it must not move after
+/// init. stop finishes on the loop; deinit once isStopped is true.
 pub const Racer = struct {
     gpa: Allocator,
     io: Io,
     loop: *xev.Loop,
     options: Options,
     attempts: std.ArrayList(*Attempt) = .empty,
+    /// The index of the next address to try.
     next: usize = 0,
     winner: ?*Attempt = null,
+    /// Attempts started and not failed yet.
     live: usize = 0,
     stopping: bool = false,
     timer: xev.Timer,
@@ -58,6 +74,9 @@ pub const Racer = struct {
         }
     };
 
+    /// Starts the first attempt that can start. After error.NoUsableAddress
+    /// the Racer still holds the attempts that failed, and needs stop and
+    /// deinit.
     pub fn init(r: *Racer, gpa: Allocator, io: Io, loop: *xev.Loop, options: Options) !void {
         std.debug.assert(options.addresses.len > 0);
         r.* = .{ .gpa = gpa, .io = io, .loop = loop, .options = options, .timer = try .init() };
@@ -87,6 +106,7 @@ pub const Racer = struct {
         return r.timer_c.state() == .dead and r.timer_reset_c.state() == .dead and r.timer_cancel_c.state() == .dead;
     }
 
+    /// The host key the winner presented.
     pub fn presentedKey(r: *const Racer) ?[32]u8 {
         const winner = r.winner orelse return null;
         return winner.tls.presentedKey();
@@ -97,6 +117,8 @@ pub const Racer = struct {
         return winner.address;
     }
 
+    /// A key that a server presented in a failed handshake and that accept
+    /// doesn't list.
     pub fn refusedKey(r: *const Racer) ?[32]u8 {
         for (r.attempts.items) |a| {
             const failure = a.failure orelse continue;
@@ -116,6 +138,10 @@ pub const Racer = struct {
         };
     }
 
+    /// Starts the next address that can start. closing is the connection
+    /// whose failure led here; with nothing live and no winner, the race
+    /// has failed and closing goes to the handler. init and the timer pass
+    /// null, and init reports a failed race with its error.
     fn startNext(r: *Racer, closing: ?*Conn) void {
         while (r.next < r.options.addresses.len and !r.stopping) {
             const addr = r.options.addresses[r.next];
@@ -144,6 +170,8 @@ pub const Racer = struct {
         a.* = .{ .racer = r, .address = addr, .tls = try .init(r.options.accept), .endpoint = undefined };
         errdefer a.tls.deinit();
 
+        // Each attempt binds its own UDP socket to the wildcard address of
+        // the target's family.
         const local: IpAddress = switch (addr) {
             .ip4 => try .parseIp4("0.0.0.0", 0),
             .ip6 => try .parseIp6("::", 0),
@@ -169,6 +197,8 @@ pub const Racer = struct {
         });
         r.attempts.appendAssumeCapacity(a);
 
+        // The failed attempt stays in the list, and deinit frees its
+        // endpoint.
         _ = a.endpoint.connect(addr) catch |err| {
             a.failure = .failed;
             a.endpoint.stop();
@@ -255,6 +285,9 @@ pub const Racer = struct {
     }
 };
 
+/// Orders addresses to alternate between IPv6 and IPv4, starting with the
+/// family of the first, as RFC 8305 section 4 describes. out must hold
+/// addresses.len entries.
 pub fn interleave(out: []IpAddress, addresses: []const IpAddress) []IpAddress {
     std.debug.assert(out.len >= addresses.len);
     if (addresses.len == 0) return out[0..0];
@@ -273,6 +306,8 @@ pub fn interleave(out: []IpAddress, addresses: []const IpAddress) []IpAddress {
     return out[0..n];
 }
 
+/// firsts and others are cursors through addresses for the first family and
+/// for the other one.
 fn nextOf(
     addresses: []const IpAddress,
     first_family: std.meta.Tag(IpAddress),

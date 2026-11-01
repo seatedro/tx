@@ -1,3 +1,8 @@
+//! Asks the local terminal for its colors before a session starts. Attach
+//! carries them, and session/host.zig's setColors makes them the defaults of
+//! the session's terminal, which answers programs' color queries with them
+//! while no client is attached.
+
 const std = @import("std");
 const posix = std.posix;
 const c = std.c;
@@ -5,18 +10,24 @@ const tty = @import("tty.zig");
 
 pub const Rgb = struct { r: u8, g: u8, b: u8 };
 
+/// Each field is null when the terminal didn't answer for it.
 pub const Colors = struct {
     foreground: ?Rgb = null,
     background: ?Rgb = null,
+    /// The 16 ANSI colors.
     palette: [16]?Rgb = @splat(null),
+    /// From the terminal's color scheme report.
     dark: ?bool = null,
 };
 
+/// 0xRRGGBB, as Attach carries a color.
 pub fn packRgb(rgb: ?Rgb) ?u32 {
     const color = rgb orelse return null;
     return @as(u32, color.r) << 16 | @as(u32, color.g) << 8 | color.b;
 }
 
+/// The known palette entries as 4-byte {index, r, g, b} records, the form
+/// Attach.palette carries. Null when there are none.
 pub fn paletteBytes(colors: *const Colors, buf: *[64]u8) ?[]const u8 {
     var len: usize = 0;
     for (colors.palette, 0..) |entry, i| {
@@ -29,6 +40,9 @@ pub fn paletteBytes(colors: *const Colors, buf: *[64]u8) ?[]const u8 {
 
 const timeout_ms = 300;
 
+// OSC 10 and 11 ask for the foreground and background, OSC 4 for each
+// palette entry, and CSI ? 996 n for the color scheme. Terminals answer DA1
+// (CSI c) and answer in order, so the DA1 reply ends the wait.
 const queries = "\x1b]10;?\x1b\\\x1b]11;?\x1b\\" ++ paletteQueries() ++ "\x1b[?996n\x1b[c";
 
 fn paletteQueries() []const u8 {
@@ -39,6 +53,9 @@ fn paletteQueries() []const u8 {
     }
 }
 
+/// Sends the queries to fd in raw mode and reads replies for up to
+/// timeout_ms. Bytes read outside OSC and CSI sequences are appended to
+/// typed. Returns no colors when fd can't go into raw mode.
 pub fn ask(fd: posix.fd_t, typed: *std.ArrayList(u8), gpa: std.mem.Allocator) !Colors {
     var raw = tty.RawMode.enter(fd) catch return .{};
     defer raw.restore();
@@ -73,9 +90,12 @@ fn nowMs() i64 {
     return @as(i64, ts.sec) * 1000 + @divTrunc(ts.nsec, 1_000_000);
 }
 
+/// Separates the terminal's replies from typed bytes.
 const Parser = struct {
     colors: Colors = .{},
+    /// The DA1 reply arrived; later bytes are typed input.
     done: bool = false,
+    /// An escape sequence still arriving.
     partial: std.ArrayList(u8) = .empty,
 
     fn feed(p: *Parser, gpa: std.mem.Allocator, bytes: []const u8, typed: *std.ArrayList(u8)) !void {
@@ -91,6 +111,8 @@ const Parser = struct {
             try p.partial.append(gpa, byte);
             const seq = p.partial.items;
             switch (seq[1]) {
+                // An OSC reply ends with BEL or ST (ESC \), a CSI reply with
+                // a byte in 0x40...0x7e. Other sequences are typed input.
                 ']' => {
                     const st = seq.len >= 2 and seq[seq.len - 2] == 0x1b and byte == '\\';
                     if (byte != 0x07 and !st) continue;
@@ -118,12 +140,15 @@ const Parser = struct {
     }
 
     fn csi(p: *Parser, body: []const u8) void {
+        // DA1 replies are CSI ? ... c. The color scheme report is
+        // CSI ? 997 ; 1 n for dark and CSI ? 997 ; 2 n for light.
         if (body.len > 0 and body[0] == '?' and body[body.len - 1] == 'c') p.done = true;
         if (std.mem.eql(u8, body, "?997;1n")) p.colors.dark = true;
         if (std.mem.eql(u8, body, "?997;2n")) p.colors.dark = false;
     }
 };
 
+/// X11's rgb:R/G/B, with 1 to 4 hex digits per component, scaled to 8 bits.
 fn parseRgb(text: []const u8) ?Rgb {
     if (!std.mem.startsWith(u8, text, "rgb:")) return null;
     var parts = std.mem.splitScalar(u8, text["rgb:".len..], '/');
