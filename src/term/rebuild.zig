@@ -26,7 +26,6 @@ pub const Kind = enum {
     repaint,
 };
 
-/// Writes the sequences that bring a terminal of t's size to t's state.
 pub fn write(w: *Writer, t: *const Terminal, kind: Kind) Writer.Error!void {
     var r: Rebuild = .{ .w = w, .t = t, .kind = kind, .modes = t.modes.default, .charset = .{} };
     try r.all();
@@ -59,13 +58,10 @@ const Rebuild = struct {
     w: *Writer,
     t: *const Terminal,
     kind: Kind,
-    /// The modes the receiving terminal has, taken to be t's defaults after
-    /// reset().
     modes: ModePacked,
     /// The receiving terminal's charsets. A screen switch carries them to the
     /// other screen, so one copy covers both.
     charset: CharsetState,
-    /// Whether the receiving terminal's pen writes protected cells (DECSCA).
     protected: bool = false,
 
     fn all(r: *Rebuild) Writer.Error!void {
@@ -114,7 +110,6 @@ const Rebuild = struct {
     fn reset(r: *Rebuild) Writer.Error!void {
         try r.w.writeAll("\x1b[?2026l");
 
-        // Leave the alternate screen, whichever mode entered it.
         try r.w.writeAll("\x1b[?1049l\x1b[?1047l\x1b[?47l");
 
         // Kitty keyboard flags belong to each screen, and DECSTR resets the
@@ -125,7 +120,6 @@ const Rebuild = struct {
         if (r.kind == .repaint) try r.w.writeAll("\x1b[?1047h\x1b[<99u\x1b[!p\x1b[?1047l");
         try r.w.writeAll("\x1b[<99u");
 
-        // DECSTR, then the modes it leaves, then LNM (ANSI mode 20).
         try r.w.writeAll("\x1b[!p");
         for (reset_modes) |mode| try r.setMode(mode, false);
         try r.w.writeAll("\x1b[20l");
@@ -246,7 +240,6 @@ const Rebuild = struct {
         r.setTracked(mode, value);
     }
 
-    /// Records a mode change in the receiving terminal without writing it.
     fn setTracked(r: *Rebuild, mode: Mode, value: bool) void {
         switch (mode) {
             inline else => |m| @field(r.modes, @tagName(m)) = value,
@@ -256,14 +249,10 @@ const Rebuild = struct {
     fn scrollingRegion(r: *Rebuild) Writer.Error!void {
         const t = r.t;
         const region = t.scrolling_region;
-        // DECSTBM, then DECSLRM.
         if (region.top != 0 or region.bottom != t.rows - 1) try r.w.print("\x1b[{d};{d}r", .{ region.top + 1, region.bottom + 1 });
         if (region.left != 0 or region.right != t.cols - 1) try r.w.print("\x1b[{d};{d}s", .{ region.left + 1, region.right + 1 });
     }
 
-    /// Puts the receiving terminal's cursor in the saved cursor's state and
-    /// saves it with DECSC. Protection and origin mode are turned off again
-    /// after the save.
     fn savedCursor(r: *Rebuild, key: ScreenKey) Writer.Error!void {
         const saved = r.t.screens.get(key).?.saved_cursor orelse return;
 
@@ -280,9 +269,6 @@ const Rebuild = struct {
         if (saved.origin) try r.setMode(.origin, false);
     }
 
-    /// Writes the screen's cursor position, pen, hyperlink, protection,
-    /// charsets, kitty keyboard flags and cursor shape. With origin set, the
-    /// position counts from the margins.
     fn cursor(r: *Rebuild, key: ScreenKey, origin: bool) Writer.Error!void {
         const s = r.t.screens.get(key).?;
         const region = r.t.scrolling_region;
@@ -370,7 +356,6 @@ const Rebuild = struct {
         have.gr = want.gr;
     }
 
-    /// DECSCA.
     fn setProtected(r: *Rebuild, protected: bool) Writer.Error!void {
         try r.w.writeAll(if (protected) "\x1b[1\"q" else "\x1b[0\"q");
         r.protected = protected;
@@ -399,7 +384,6 @@ const Rebuild = struct {
         r.setTracked(.cursor_blinking, blink);
     }
 
-    /// Writes the palette entries and dynamic colors the program set.
     fn colors(r: *Rebuild) Writer.Error!void {
         const c = &r.t.colors;
         var it = c.palette.mask.iterator(.{});
@@ -470,8 +454,6 @@ fn formatMode(format: MouseFormat) ?Mode {
 const testing = std.testing;
 const state = @import("state.zig");
 
-/// Prefixes of dump lines a rebuild can't match. previous_char is the last
-/// character the rebuild printed.
 const not_rebuilt = [_][]const u8{"previous_char "};
 
 const not_rebuilt_changes = [_][]const u8{
@@ -495,8 +477,6 @@ fn isNotRebuilt(name: []const u8) bool {
     return false;
 }
 
-/// Rebuilds a terminal fed input into a terminal fed before, and compares the
-/// two dumps, printing the lines that differ.
 fn rebuilds(before: []const u8, input: []const u8, kind: Kind) !bool {
     var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 20, .rows = 5 });
     defer t.deinit(testing.allocator);
@@ -593,8 +573,6 @@ const not_reset_changes = [_][]const u8{
     "the cursor hyperlink",
 };
 
-/// Each target creates the alternate screen. A repaint's reset creates one in
-/// the receiving terminal, and the dump lists every screen.
 const repaint_targets = [_]struct { []const u8, []const u8 }{
     .{ "text", "\x1b[?1047h\x1b[?1047lab\r\ncd" },
     .{ "the alternate screen", "\x1b[?1047h\x1b[?1047lab\x1b[?1049h\x1b[2;2Hxy\x1b[?2004h" },
@@ -606,7 +584,6 @@ test "a repaint undoes the state a session left" {
     var failed = false;
     for (repaint_targets) |target| {
         for (state.changes ++ combinations) |change| {
-            // A repaint keeps the receiving terminal's scrollback.
             if (isNotRebuilt(change[0]) or std.mem.indexOf(u8, change[0], "scrollback") != null) continue;
             if (for (not_reset_changes) |name| {
                 if (std.mem.eql(u8, name, change[0])) break true;

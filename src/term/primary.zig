@@ -1,8 +1,3 @@
-//! The terminal a session keeps for its program. A Primary feeds the program's
-//! output through a ghostty-vt TerminalStream into a Terminal and appends each
-//! chunk and each resize to a Log. A client follows the log from a seq, or
-//! starts from a rebuild that ends where the log's next record begins.
-
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const vt = @import("ghostty-vt");
@@ -12,8 +7,6 @@ const rebuild_pkg = @import("rebuild.zig");
 const Log = log_pkg.Log;
 
 pub const Stream = vt.TerminalStream;
-/// Effect callbacks in handler().effects take this, and fromHandler finds the
-/// Primary from it.
 pub const Handler = Stream.Handler;
 
 pub const Options = struct {
@@ -22,7 +15,6 @@ pub const Options = struct {
     max_scrollback_bytes: ?usize = 10_000_000,
     max_scrollback_lines: ?usize = null,
     kitty_image_storage_limit: usize = 320 * 1000 * 1000,
-    /// In bytes. See Log.init.
     log_capacity: usize = 8 * 1024 * 1024,
     /// The longest unfinished sequence, in bytes, that a rebuild can end
     /// inside. Must be above zero. Zero turns off the stream's continuation
@@ -36,7 +28,6 @@ pub const Primary = struct {
     terminal: vt.Terminal,
     stream: Stream,
     log: Log,
-    /// For effect callbacks, which reach it through fromHandler.
     context: ?*anyopaque = null,
 
     pub fn create(gpa: Allocator, io: std.Io, options: Options) !*Primary {
@@ -80,7 +71,6 @@ pub const Primary = struct {
         return &self.stream.handler;
     }
 
-    /// The Primary that owns h, for use inside an effect callback.
     pub fn fromHandler(h: *Handler) *Primary {
         const stream: *Stream = @fieldParentPtr("handler", h);
         return @fieldParentPtr("stream", stream);
@@ -115,14 +105,11 @@ pub const Primary = struct {
         try rebuild_pkg.write(w, &self.terminal, kind);
         self.stream.writeContinuation(w) catch |err| switch (err) {
             error.ContinuationUnavailable => return error.Unfinished,
-            // create turns continuation tracking on.
             error.ContinuationDisabled => unreachable,
             error.WriteFailed => return error.WriteFailed,
         };
     }
 
-    /// Logs size and resizes the terminal. A zero dimension fails with
-    /// error.InvalidValue and logs nothing.
     pub fn resize(self: *Primary, size: log_pkg.Resize) (log_pkg.AppendError || vt.Terminal.ResizeError)!void {
         // Terminal.resize refuses a zero dimension, but it runs after the
         // append.

@@ -46,21 +46,17 @@ pub const AppendError = Allocator.Error || error{
 };
 
 pub const ReadError = error{
-    /// The record was dropped to make room for newer ones.
     Trimmed,
-    /// The record hasn't been appended yet.
     Ahead,
 };
 
 pub const Log = struct {
     gpa: Allocator,
     capacity: usize,
-    /// The total cost of the records held, at most capacity.
     used: usize = 0,
     entries: std.Deque(Entry) = .empty,
     first_seq: u64 = 0,
 
-    /// What each record costs against the capacity on top of its output bytes.
     pub const record_overhead = @sizeOf(Entry);
 
     const Entry = struct {
@@ -86,24 +82,18 @@ pub const Log = struct {
         self.* = undefined;
     }
 
-    /// The longest output one record can hold.
     pub fn maxOutputLen(self: *const Log) usize {
         return self.capacity -| record_overhead;
     }
 
-    /// The seq the next append gets.
     pub fn nextSeq(self: *const Log) u64 {
         return self.first_seq + self.entries.len;
     }
 
-    /// The seq of the oldest record held.
     pub fn firstSeq(self: *const Log) u64 {
         return self.first_seq;
     }
 
-    /// Appends a copy of payload, dropping the oldest records until it fits,
-    /// and returns its seq. A record that costs more than the capacity fails
-    /// with error.RecordTooLarge.
     pub fn append(self: *Log, payload: Payload) AppendError!u64 {
         const owned: Payload = switch (payload) {
             .output => |bytes| owned: {
@@ -132,7 +122,6 @@ pub const Log = struct {
         return .{ .seq = seq, .payload = self.entries.at(@intCast(seq - self.first_seq)).payload };
     }
 
-    /// Iterates from seq, which may be nextSeq(), to the newest record.
     pub fn iterator(self: *const Log, seq: u64) ReadError!Iterator {
         try self.check(seq);
         return .{ .log = self, .seq = seq };

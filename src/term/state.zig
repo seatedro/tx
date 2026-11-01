@@ -1,8 +1,6 @@
 //! Dumps a ghostty-vt Terminal's state as text, so two terminals in the same
 //! state give the same string. Cells name styles and hyperlinks by the order
 //! the dump meets them, which keeps each page's internal ids out of the text.
-//! changes lists inputs that each must change the dump, and rebuild.zig's
-//! tests rebuild them.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -16,7 +14,6 @@ const Style = vt.Style;
 
 pub const Error = Allocator.Error || Writer.Error;
 
-/// Writes t's state to w, using gpa for scratch memory.
 pub fn dump(gpa: Allocator, w: *Writer, t: *const Terminal) Error!void {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
@@ -24,7 +21,6 @@ pub fn dump(gpa: Allocator, w: *Writer, t: *const Terminal) Error!void {
     try d.terminal(t);
 }
 
-/// Returns the dump in memory the caller owns.
 pub fn dumpAlloc(gpa: Allocator, t: *const Terminal) Error![]u8 {
     var out: Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -47,14 +43,10 @@ const StyleContext = struct {
 };
 
 const Dumper = struct {
-    /// Holds the decoded copy of one compressed page at a time.
     gpa: Allocator,
     arena: Allocator,
     w: *Writer,
-    /// Styles in the order the dump first meets them. Cells name them s0, s1
-    /// and so on.
     styles: std.ArrayHashMapUnmanaged(Style, void, StyleContext, true) = .empty,
-    /// Hyperlinks the same way, named l0, l1 and so on.
     links: std.StringArrayHashMapUnmanaged(void) = .empty,
 
     fn print(d: *Dumper, comptime fmt: []const u8, args: anytype) Error!void {
@@ -224,7 +216,6 @@ const Dumper = struct {
             list.limits.bytes.explicit,
             list.limits.lines.explicit,
         });
-        // Rows are numbered from the top of the scrollback.
         var y: usize = 0;
         var node = list.pages.first;
         while (node) |n| : (node = n.next) {
@@ -255,7 +246,6 @@ const Dumper = struct {
         for (page.getCells(r), 0..) |*cell, x| {
             const style: Style = if (cell.style_id == 0) .{} else page.styles.get(page.memory, cell.style_id).*;
             const link: ?usize = if (cell.hyperlink) try d.cellLink(page, cell) else null;
-            // A cell as a fresh page has it.
             const blank = cell.content_tag == .codepoint and cell.content.codepoint.data == 0 and
                 cell.wide == .narrow and !cell.protected and cell.semantic_content == .output and
                 style.eql(.{}) and link == null;
@@ -411,12 +401,8 @@ fn testDump(t: *const Terminal) ![]u8 {
     return dumpAlloc(testing.allocator, t);
 }
 
-/// Fed to each terminal before a change.
 pub const changes_base = "ab\r\n";
 
-/// Named inputs that each change a different part of a terminal's state. The
-/// dump must show each one. rebuild.zig rebuilds each one except those its
-/// not_rebuilt_changes lists.
 pub const changes = [_]struct { []const u8, []const u8 }{
     .{ "primary text", "x" },
     .{ "a wide character", "\u{4E2D}" },
