@@ -1,9 +1,3 @@
-//! txd's main. `txd --session --fd N` runs a session process, as
-//! session/spawn.zig execs it. `--uninstall` removes the service
-//! (install.zig). Otherwise txd loads or creates its host key (keyfile.zig),
-//! then installs the service or runs the server from src/server. Its files
-//! live under the directories in paths.zig.
-
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
@@ -22,7 +16,6 @@ const Scope = server_pkg.addresses.Scope;
 /// is given.
 pub const default_port = 8739;
 
-/// The variables sessions take from txd's environment, besides LC_*.
 const inherited = [_][]const u8{ "HOME", "USER", "LOGNAME", "SHELL", "PATH", "TZ", "LANG" };
 
 pub fn main(init: std.process.Init) !u8 {
@@ -213,8 +206,6 @@ pub fn main(init: std.process.Init) !u8 {
     return 0;
 }
 
-/// The port of a `tailnet` or `tailnet:PORT` argument. null when text is
-/// neither form; an inner null when PORT isn't a valid port.
 fn parseTailnet(text: []const u8) ?(?u16) {
     if (std.mem.eql(u8, text, "tailnet")) return default_port;
     if (!std.mem.startsWith(u8, text, "tailnet:")) return null;

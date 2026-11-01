@@ -6,7 +6,6 @@ const std = @import("std");
 const Io = std.Io;
 const Ed25519 = std.crypto.sign.Ed25519;
 
-/// error.InvalidKeyFile when the file is shorter than a seed.
 pub fn load(io: Io, path: []const u8) !Ed25519.KeyPair {
     var seed: [Ed25519.KeyPair.seed_length]u8 = undefined;
     defer std.crypto.secureZero(u8, &seed);
@@ -14,7 +13,6 @@ pub fn load(io: Io, path: []const u8) !Ed25519.KeyPair {
     return Ed25519.KeyPair.generateDeterministic(seed);
 }
 
-/// Creates the file, and its directory, with a new key when it doesn't exist.
 pub fn loadOrCreate(io: Io, path: []const u8) !Ed25519.KeyPair {
     return load(io, path) catch |err| switch (err) {
         error.FileNotFound => {

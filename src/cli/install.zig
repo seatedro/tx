@@ -1,7 +1,3 @@
-//! `txd --install` and `txd --uninstall`. Install runs txd as a systemd user
-//! service on Linux or a launchd agent on macOS, falling back to a background
-//! process, then waits for the listen address to answer. Uninstall stops txd
-//! and its sessions, then deletes the files txd keeps.
 //! nix/home-module.nix declares the same service for home-manager.
 
 const std = @import("std");
@@ -29,17 +25,12 @@ const pid_file = name ++ ".pid";
 const linger_file = "linger";
 
 pub const Options = struct {
-    /// An absolute path, from exePath.
     exe: []const u8,
     args: []const []const u8,
-    /// install returns once something answers here.
     listen: IpAddress,
     user: []const u8,
 };
 
-/// Starts txd as a service, or as a background process when no service
-/// manager takes it, and waits until options.listen answers. Starts nothing
-/// when something answers there already.
 pub fn install(gpa: Allocator, io: Io, environ: *const Environ.Map, options: Options) !void {
     const start = switch (builtin.os.tag) {
         .macos => try launchd(gpa, io, environ, options) orelse try background(gpa, io, environ, options),
@@ -60,7 +51,6 @@ pub fn install(gpa: Allocator, io: Io, environ: *const Environ.Map, options: Opt
 }
 
 const Start = enum {
-    /// Something answered on the address before anything was started.
     serving,
     started,
 };
@@ -100,8 +90,6 @@ fn isWildcard(address: IpAddress) bool {
     };
 }
 
-/// null when no systemd user manager answers or lingering stays off. The
-/// caller then starts a background process.
 fn systemd(gpa: Allocator, io: Io, environ: *const Environ.Map, options: Options) !?Start {
     if (!try succeeds(gpa, io, &.{ "systemctl", "--user", "--quiet", "show-environment" }, .quiet)) return null;
 
@@ -194,8 +182,6 @@ fn launchd(gpa: Allocator, io: Io, environ: *const Environ.Map, options: Options
     return .started;
 }
 
-/// Runs txd detached, with its output in the state directory's txd.log and
-/// its pid in txd.pid for --uninstall.
 fn background(gpa: Allocator, io: Io, environ: *const Environ.Map, options: Options) !Start {
     if (serving(options.listen)) return .serving;
 
@@ -255,7 +241,6 @@ pub fn uninstall(gpa: Allocator, io: Io, environ: *const Environ.Map, user: []co
     dir.deleteDir(io, state_dir) catch {};
     std.debug.print("txd: removed txd's keys and log\n", .{});
 
-    // txd compiles the terminfo entries clients send under this directory.
     const share = try paths.home(gpa, environ, ".local/share/tx");
     defer gpa.free(share);
     if (exists(io, share)) {
@@ -334,7 +319,6 @@ fn stopBackground(gpa: Allocator, io: Io, environ: *const Environ.Map) !void {
     if (pid != null and try isTxd(gpa, io, pid.?) and std.c.kill(pid.?, .TERM) == 0) {
         var waited: u64 = 0;
 
-        // Signal 0 checks that the process still exists.
         while (std.c.kill(pid.?, @fromBackingInt(@intCast(0))) == 0) : (waited += 50) {
             if (waited >= stop_timeout_ms) {
                 std.debug.print("txd: the server running in the background, pid {d}, didn't stop\n", .{pid.?});
@@ -438,8 +422,6 @@ fn succeeds(gpa: Allocator, io: Io, argv: []const []const u8, errors: Errors) !b
     return true;
 }
 
-/// argv's stdout, owned by the caller, when it exits with status 0. null when
-/// it fails or isn't installed; with .show, its stderr is printed.
 fn output(gpa: Allocator, io: Io, argv: []const []const u8, errors: Errors) !?[]u8 {
     const result = std.process.run(gpa, io, .{
         .argv = argv,
@@ -458,8 +440,6 @@ fn output(gpa: Allocator, io: Io, argv: []const []const u8, errors: Errors) !?[]
     return null;
 }
 
-/// Writes data to path, creating parent directories, unless the file holds it
-/// already. Returns whether it wrote.
 fn writeIfChanged(gpa: Allocator, io: Io, path: []const u8, data: []const u8) !bool {
     const dir = Io.Dir.cwd();
     if (dir.readFileAlloc(io, path, gpa, .limited(1 << 20))) |old| {

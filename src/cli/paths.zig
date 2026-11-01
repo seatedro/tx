@@ -17,7 +17,6 @@ pub fn cache(gpa: Allocator, environ: *const Environ.Map, name: []const u8) Erro
     return xdg(gpa, environ, "XDG_CACHE_HOME", ".cache", name);
 }
 
-/// An empty name gives the directory itself.
 pub fn state(gpa: Allocator, environ: *const Environ.Map, name: []const u8) Error![]u8 {
     return xdg(gpa, environ, "XDG_STATE_HOME", ".local/state", name);
 }
