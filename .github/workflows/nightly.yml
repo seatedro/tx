@@ -1,3 +1,4 @@
+# Publishes main as the latest release, which install.sh downloads by default.
 name: Nightly
 
 on:
@@ -5,6 +6,8 @@ on:
     - cron: "0 4 * * *"
   workflow_dispatch:
 
+# gh needs contents: write to create and delete releases, and actions: read
+# to list ci.yml's runs.
 permissions:
   contents: write
   actions: read
@@ -15,9 +18,13 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
+      # git rev-list resolves the latest release's tag, and a shallow clone has
+      # no tags.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      # Sets version to BASE-nightly.YYYYMMDD, with BASE from build.zig.zon,
+      # when a release is due.
       - id: plan
         run: |
           last=$(gh release list --limit 1 --json tagName --jq '.[0].tagName // ""')
@@ -41,6 +48,9 @@ jobs:
           key: zig-pkg-${{ github.job }}-${{ runner.os }}-${{ hashFiles('build.zig.zon') }}
       - if: steps.plan.outputs.version
         run: zig build release -Dversion=${{ steps.plan.outputs.version }}
+      # install.sh finds its tarball and checksum in SHA256SUMS. tx's install
+      # command downloads install.sh from the latest release. A second run on
+      # one day replaces that day's release.
       - if: steps.plan.outputs.version
         env:
           VERSION: ${{ steps.plan.outputs.version }}

@@ -1,9 +1,21 @@
+//! The build of tx and txd, their tests, the fuzz step and the release
+//! tarballs. Each of the *Module functions makes one module for one target,
+//! and the release step builds the graph again for each of release_targets.
+//! src/build builds ngtcp2 and picotls. ci.yml runs `test` and
+//! `release`, fuzz.yml runs `fuzz --fuzz`, nightly.yml publishes what
+//! `release` writes, and nix/package.nix runs `install`.
+
 const std = @import("std");
 const ngtcp2_build = @import("src/build/ngtcp2.zig");
 const picotls_build = @import("src/build/picotls.zig");
 
+// The version of release builds. Other builds append -dev, and -Dversion
+// replaces either.
 const version = @import("build.zig.zon").version;
 
+// `os` and `arch` name the tarballs, and install.sh maps uname to the same
+// words. nix/package.nix builds the same targets. The Linux builds link musl
+// statically and need no libc on the host.
 const release_targets = [_]struct { query: std.Target.Query, os: []const u8, arch: []const u8 }{
     .{ .query = .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl }, .os = "linux", .arch = "x86_64" },
     .{ .query = .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .musl }, .os = "linux", .arch = "aarch64" },
@@ -28,12 +40,14 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     const test_network_step = b.step("test-network", "Run unit tests, including ones that need the internet");
 
+    // fuzz takes its target and optimize mode from each module that imports it.
     const fuzz = b.createModule(.{ .root_source_file = b.path("src/fuzz.zig") });
 
     const crypto_tests = b.addTest(.{
         .name = "crypto-test",
         .root_module = cryptoModule(b, target, optimize, transport_libs.picotls),
     });
+    // C checks of tx's picotls backend, most of them against minicrypto.
     crypto_tests.root_module.addCSourceFile(.{
         .file = b.path("src/crypto/picotls_backend_test.c"),
         .flags = c_flags,
@@ -95,6 +109,7 @@ pub fn build(b: *std.Build) void {
     }) |entry| {
         const name, const module = entry;
         module.addImport("fuzz", fuzz);
+        // --fuzz needs coverage instrumentation, which the LLVM backend provides.
         const tests = b.addTest(.{ .name = name, .root_module = module, .use_llvm = true });
         fuzz_step.dependOn(&b.addRunArtifact(tests).step);
     }
@@ -156,6 +171,7 @@ pub fn build(b: *std.Build) void {
     e2e.addImport("proto", proto);
     e2e.addImport("auth", auth);
     e2e.addImport("fuzz", fuzz);
+    // e2e-test runs the tx and txd this build emits.
     const e2e_options = b.addOptions();
     e2e_options.addOptionPath("txd_exe", txd_bin.getEmittedBin());
     e2e_options.addOptionPath("tx_exe", tx_bin.getEmittedBin());
@@ -180,6 +196,8 @@ pub fn build(b: *std.Build) void {
         const tx_exe = b.addExecutable(.{ .name = "tx", .root_module = txModule(b, rt_target, .ReleaseSafe, rt_app, release_info) });
         tx_exe.root_module.strip = true;
 
+        // tx-VERSION-OS-ARCH names the asset and its top directory, as
+        // install.sh expects.
         const name = b.fmt("tx-{s}-{s}-{s}", .{ release_version, rt.os, rt.arch });
         const tarball = b.addRunArtifact(tarball_tool);
         const out = tarball.addOutputFileArg(b.fmt("{s}.tar.gz", .{name}));
@@ -196,6 +214,7 @@ pub fn build(b: *std.Build) void {
     }
 }
 
+/// Module `build_options`, with the version tx and txd print.
 fn buildInfo(b: *std.Build, version_text: []const u8) *std.Build.Module {
     const options = b.addOptions();
     options.addOption([]const u8, "version", version_text);
@@ -493,6 +512,8 @@ fn cryptoModule(
     return mod;
 }
 
+/// Runs `tests` in the test step, and in test-network with TX_TEST_NETWORK=1.
+/// Tests that need the internet skip without it.
 fn addTestRuns(
     b: *std.Build,
     tests: *std.Build.Step.Compile,
@@ -518,6 +539,9 @@ fn transportModule(
     optimize: std.builtin.OptimizeMode,
     libs: TransportLibs,
 ) *std.Build.Module {
+    // Module `c` is the translation of src/transport/c.h. A TranslateC step
+    // links no libraries, so ngtcp2's installed headers come from the include
+    // trees the libraries emit.
     const c = b.addTranslateC(.{
         .root_source_file = b.path("src/transport/c.h"),
         .target = target,
@@ -526,6 +550,7 @@ fn transportModule(
     c.addIncludePath(b.path("src/transport/include"));
     c.addIncludePath(libs.ngtcp2.getEmittedIncludeTree());
     c.addIncludePath(libs.ngtcp2_crypto.getEmittedIncludeTree());
+    // NGTCP2_STATICLIB matches how src/build/ngtcp2.zig builds the libraries.
     c.defineCMacro("NGTCP2_STATICLIB", "1");
 
     const mod = b.createModule(.{

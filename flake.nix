@@ -20,6 +20,7 @@
       ...
     }:
     let
+      # The literal dot keeps .minimum_zig_version from matching.
       zonVersion = builtins.head (
         builtins.match ''.*[.]version = "([^"]+)".*'' (builtins.readFile ./build.zig.zon)
       );
@@ -37,6 +38,8 @@
           inherit version;
         };
 
+        # clang-tools has clang-format. Tests that run wl-paste and wl-copy
+        # skip without wl-clipboard.
         devShells.default = pkgs.mkShell {
           packages = [
             zig'

@@ -1,3 +1,8 @@
+//! Writes a release tarball, a gzipped tar with its files under one directory.
+//! build.zig runs it on the host for each release target, with the arguments
+//! OUT.tar.gz DIR [NAME MODE PATH]... Each PATH goes in as DIR/NAME with the
+//! octal MODE. install.sh expects tx and txd under DIR.
+
 const std = @import("std");
 const Io = std.Io;
 const flate = std.compress.flate;

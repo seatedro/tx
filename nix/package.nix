@@ -16,6 +16,7 @@ let
     ];
   };
 
+  # The Zig targets of build.zig's release_targets.
   target =
     {
       aarch64-linux = "aarch64-linux-musl";
@@ -25,16 +26,22 @@ let
     }
     .${stdenvNoCC.hostPlatform.system};
 
+  # build.zig.zon's packages, as Zig fetches them into zig-pkg. A fixed-output
+  # derivation may reach the network; outputHash changes whenever the packages
+  # do.
   deps = stdenvNoCC.mkDerivation {
     name = "tx-zig-pkg";
     inherit src;
     nativeBuildInputs = [ zig ];
 
+    # The sandbox's HOME isn't writable. `zig build -l` builds nothing, and
+    # fetches the packages to run build.zig.
     buildPhase = ''
       export ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig-global-cache
       zig build -l >/dev/null
     '';
     installPhase = "mv zig-pkg $out";
+    # Fixup would edit the fetched files, which must match outputHash.
     dontFixup = true;
 
     outputHashMode = "recursive";
@@ -47,6 +54,8 @@ stdenvNoCC.mkDerivation {
   inherit version src;
   nativeBuildInputs = [ zig ];
 
+  # With the packages in zig-pkg, zig build fetches nothing. It installs into
+  # $out itself.
   buildPhase = ''
     export ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig-global-cache
     cp -r ${deps} zig-pkg

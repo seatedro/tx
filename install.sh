@@ -1,4 +1,7 @@
 #!/bin/sh
+# Installs tx and txd from a release of seatedro/tx into TX_INSTALL_DIR,
+# ~/.local/bin by default. TX_VERSION picks the release; the default is the
+# latest. --txd also runs `txd --install`, and restarts txd if it was running.
 set -eu
 
 releases=https://github.com/seatedro/tx/releases
@@ -25,6 +28,8 @@ main() {
     suffix="-$platform.tar.gz"
     name=$(awk -v suffix="$suffix" 'substr($2, length($2) - length(suffix) + 1) == suffix { print $2 }' "$tmp/SHA256SUMS")
     [ -n "$name" ] || fail "the release has no build for $platform"
+    # The version comes from the asset's name. It names the tarball's top
+    # directory and keeps the download on the release SHA256SUMS came from.
     version=${name#tx-}
     version=${version%"$suffix"}
 
@@ -36,12 +41,16 @@ main() {
 
     mkdir -p "$dir"
     for binary in tx txd; do
+        # cp onto a running txd fails on Linux (ETXTBSY). A rename replaces
+        # it and leaves the running process its old file.
         cp "$tmp/tx-$version-$platform/$binary" "$dir/.$binary.new"
         mv -f "$dir/.$binary.new" "$dir/$binary"
     done
     echo "installed tx and txd $version in $dir"
 
     if [ "$txd" = yes ]; then
+        # txd --install leaves a running server alone. One that was running
+        # before is restarted to run the new binary.
         running=$(service_running)
         "$dir/txd" --install
         if [ "$running" = yes ]; then restart_service; fi
@@ -87,6 +96,8 @@ sha256() {
     fi
 }
 
+# txd --install loads its launchd job into gui/UID when that domain exists,
+# else user/UID.
 launchd_target() {
     uid=$(id -u)
     if launchctl print "gui/$uid" >/dev/null 2>&1; then echo "gui/$uid/txd"; else echo "user/$uid/txd"; fi

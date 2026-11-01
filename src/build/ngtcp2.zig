@@ -1,10 +1,19 @@
+//! Builds libngtcp2 and ngtcp2_crypto_picotls, ngtcp2's glue to picotls, from
+//! the source build.zig.zon fetches. ngtcp2's CMake build generates config.h
+//! and ngtcp2/version.h; configHeader and versionHeader stand in for it.
+//! build.zig links both libraries into module `transport`.
+
 const std = @import("std");
 
+// The ngtcp2 release build.zig.zon pins, for ngtcp2/version.h. version_num has
+// one byte each for major, minor and patch.
 const version = "1.25.0";
 const version_num = 0x011900;
 
 const flags = &[_][]const u8{ "-std=gnu11", "-fno-sanitize=undefined" };
 
+/// libngtcp2. Its installed headers carry the generated ngtcp2/version.h, which
+/// ngtcp2.h includes.
 pub fn core(
     b: *std.Build,
     dep: *std.Build.Dependency,
@@ -36,9 +45,12 @@ pub fn core(
 
 pub const CryptoOptions = struct {
     picotls_include: std.Build.LazyPath,
+    /// Holds a picotls/openssl.h that shadows picotls's own, which needs
+    /// OpenSSL. ngtcp2's picotls glue takes its ciphers from that header.
     backend_include: std.Build.LazyPath,
 };
 
+/// ngtcp2_crypto_picotls. Link it with `core` and with picotls.
 pub fn cryptoPicotls(
     b: *std.Build,
     dep: *std.Build.Dependency,
@@ -55,6 +67,8 @@ pub fn cryptoPicotls(
         }),
     });
     const mod = lib.root_module;
+    // Searched before picotls_include, so <picotls/openssl.h> resolves to the
+    // backend's header.
     mod.addIncludePath(options.backend_include);
     mod.addIncludePath(options.picotls_include);
     mod.addConfigHeader(configHeader(b, target));
@@ -74,8 +88,11 @@ pub fn cryptoPicotls(
     return lib;
 }
 
+/// The config.h ngtcp2's sources read when HAVE_CONFIG_H is set.
 fn configHeader(b: *std.Build, target: std.Build.ResolvedTarget) *std.Build.Step.ConfigHeader {
     const options: std.Build.Step.ConfigHeader.Options = .{ .style = .blank, .include_path = "config.h" };
+    // macOS has no <endian.h>, <byteswap.h>, be64toh or explicit_bzero.
+    // ngtcp2 swaps bytes with OSSwapInt64 there and clears memory with memset_s.
     if (target.result.os.tag.isDarwin()) return b.addConfigHeader(options, .{
         .HAVE_ARPA_INET_H = 1,
         .HAVE_NETINET_IN_H = 1,
@@ -108,6 +125,7 @@ fn versionHeader(b: *std.Build, dep: *std.Build.Dependency) *std.Build.Step.Conf
     });
 }
 
+// Every .c file in ngtcp2's lib directory.
 const lib_files = [_][]const u8{
     "ngtcp2_acktr.c",       "ngtcp2_addr.c",     "ngtcp2_balloc.c",
     "ngtcp2_bbr.c",         "ngtcp2_buf.c",      "ngtcp2_callbacks.c",

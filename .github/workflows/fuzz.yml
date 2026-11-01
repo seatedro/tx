@@ -18,6 +18,9 @@ jobs:
           path: zig-pkg
           key: zig-pkg-${{ github.job }}-${{ runner.os }}-${{ hashFiles('build.zig.zon') }}
 
+      # The fuzzer keeps its corpus in .zig-cache/f and coverage in
+      # .zig-cache/v. A cache key can't be saved twice, so each run saves
+      # under its own run id and restores the newest by prefix.
       - uses: actions/cache/restore@v4
         with:
           path: |
@@ -26,6 +29,10 @@ jobs:
           key: fuzz-${{ github.run_id }}
           restore-keys: fuzz-
 
+      # zig build --fuzz runs until killed, also after a test fails. timeout
+      # exits with 124 when the 30 minutes run out, the expected end. A failure
+      # shows as the input the build runner saves to .zig-cache/f/crash, and
+      # the rm drops one restored from the cache.
       - name: Fuzz
         run: |
           rm -f .zig-cache/f/crash
