@@ -1,11 +1,3 @@
-//! Every message and its body encoding. A message struct declares type_id,
-//! which frame.zig writes in the frame header, and tags, a wire.zig field tag
-//! for each struct field. Its encodedLen, encode and decode derive the body
-//! from tags through bodyLen, encodeBody and decodeBody. Type ids below 1000
-//! pass between tx and txd, and txd forwards some of them to and from session
-//! processes. Ids from 1000 pass only between txd and session processes, on
-//! unix sockets.
-
 const std = @import("std");
 const Writer = std.Io.Writer;
 const wire = @import("wire.zig");
@@ -15,7 +7,6 @@ const DecodeError = wire.DecodeError;
 /// it, each end refuses a peer with another, and the login signature covers it.
 pub const revision: u32 = 0;
 
-/// The client's first message on a connection.
 pub const Hello = struct {
     revision: u32,
     term: []const u8,
@@ -62,7 +53,6 @@ pub fn isLocaleName(name: []const u8) bool {
     return true;
 }
 
-/// txd's answer to Hello.
 pub const HelloReply = struct {
     revision: u32,
 
@@ -93,14 +83,12 @@ pub const Attach = struct {
     /// Runs through txd's shell with -c in a new session. session_id and
     /// reuse must be unset.
     command: ?[]const u8 = null,
-    /// Terminfo source for Hello.term, which txd compiles for a new session.
     terminfo: ?[]const u8 = null,
     /// The client terminal's default colors as 0xRRGGBB.
     foreground: ?u32 = null,
     background: ?u32 = null,
     /// 4-byte {index, r, g, b} entries for palette indexes below 16.
     palette: ?[]const u8 = null,
-    /// Whether the client's terminal reports a dark color scheme.
     dark: ?bool = null,
     /// A new session sends SIGHUP to its program's process group when its
     /// client leaves, or when the client stays lost for
@@ -133,7 +121,6 @@ pub const Attach = struct {
     }
 };
 
-/// The session's answer to Attach or Resume, forwarded by txd.
 pub const Attached = struct {
     session_id: u64,
     /// The secret that a later Resume proves the client holds. Each Attach or
@@ -159,9 +146,7 @@ pub const Attached = struct {
     }
 };
 
-/// Program output, one record of the session's log.
 pub const Output = struct {
-    /// The record's sequence number in the log.
     seq: u64,
     bytes: []const u8,
 
@@ -181,7 +166,6 @@ pub const Output = struct {
     }
 };
 
-/// The client's acknowledgement of the Output with this seq.
 pub const Ack = struct {
     seq: u64,
 
@@ -201,7 +185,6 @@ pub const Ack = struct {
     }
 };
 
-/// Bytes for the program's terminal input, from the client.
 pub const Input = struct {
     bytes: []const u8,
 
@@ -267,7 +250,6 @@ pub const Detach = struct {
     }
 };
 
-/// The session's program, or an Exec command, ended.
 pub const Exit = struct {
     /// The exit status, or 128 plus the signal number, or 255 when the
     /// process's end is unknown.
@@ -291,34 +273,21 @@ pub const Exit = struct {
     }
 };
 
-/// Values of Error.code.
 pub const ErrorCode = enum(u32) {
-    /// A malformed or unexpected message, or a failure with no code of its own.
     protocol = 1,
-    /// The peer has another revision or internal_revision.
     revision = 2,
-    /// The session doesn't exist or has ended.
     no_session = 3,
-    /// The session's log has dropped the output the client needs next.
     log_trimmed = 4,
-    /// A session or command didn't start.
     spawn = 5,
-    /// A login or a resume was refused.
     auth = 6,
-    /// Another client attached to the session.
     attached_elsewhere = 7,
-    /// Attach.reuse found several detached sessions. The message lists their
-    /// ids.
     several_detached = 8,
-    /// The session process's connection closed without an Exit or Error.
     session_lost = 9,
 };
 
 /// A failure. The sender finishes its side of the stream after it.
 pub const Error = struct {
-    /// An ErrorCode value.
     code: u32,
-    /// Text for the user.
     message: []const u8 = "",
 
     pub const type_id = 11;
@@ -342,7 +311,6 @@ pub const Error = struct {
 pub const AuthProbe = struct {
     /// Empty means the account txd runs as.
     user: []const u8,
-    /// An SSH public key blob.
     key: []const u8,
 
     pub const type_id = 12;
@@ -362,7 +330,6 @@ pub const AuthProbe = struct {
 };
 
 pub const AuthProbeReply = struct {
-    /// The probed key, echoed.
     key: []const u8,
     accepted: bool,
 
@@ -470,8 +437,6 @@ pub const Resume = struct {
     }
 };
 
-/// Asks for the sessions. txd sends List to each session process, and answers
-/// the client with their SessionInfo messages and then ListEnd.
 pub const List = struct {
     pub const type_id = 18;
     pub const tags = .{};
@@ -498,7 +463,6 @@ pub const SessionInfo = struct {
     /// The attached client's address. Null while detached.
     attached_from: ?[]const u8 = null,
     title: ?[]const u8 = null,
-    /// The session process's pid.
     pid: ?u64 = null,
 
     pub const type_id = 19;
@@ -534,8 +498,6 @@ pub const ListEnd = struct {
     }
 };
 
-/// Ends a session's program. txd passes it to the session process and
-/// answers with Killed.
 pub const Kill = struct {
     session_id: u64,
 
@@ -595,10 +557,7 @@ pub const Exec = struct {
     }
 };
 
-/// Offers the client's clipboard contents, which txd reads with
-/// ClipboardRequest.
 pub const ClipboardOffer = struct {
-    /// The client clipboard's change count.
     change: u64,
     /// MIME types, each ending in NUL.
     mimes: []const u8,
@@ -622,7 +581,6 @@ pub const ClipboardOffer = struct {
 /// Asks to read the client's clipboard. The client answers on a stream it
 /// opens.
 pub const ClipboardRequest = struct {
-    /// Echoed in the answer's ClipboardData.
     id: u64,
     /// The change count of the offer being read. The client refuses when its
     /// clipboard has changed since.
@@ -699,7 +657,6 @@ pub const internal_revision: u32 = 0;
 /// on a connection to the session's socket, and follows Start on a new
 /// session's inherited socket. Attach or Resume follows.
 pub const Connect = struct {
-    /// The client's address.
     remote: []const u8,
     cols: u16,
     rows: u16,
@@ -726,11 +683,8 @@ pub const Connect = struct {
     }
 };
 
-/// The first message to a new session process, on the socket it inherits.
-/// The process answers with Started.
 pub const Start = struct {
     session_id: u64,
-    /// Where the process listens for connections from txd.
     socket_path: []const u8,
     /// Arguments, each ending in NUL.
     argv: []const u8,
@@ -783,7 +737,6 @@ pub const Start = struct {
 };
 
 pub const Started = struct {
-    /// The session process's pid.
     pid: u64,
 
     pub const type_id = 1002;
@@ -802,7 +755,6 @@ pub const Started = struct {
     }
 };
 
-/// Asks a session process for its terminal's state, answered with DumpReply.
 pub const Dump = struct {
     pub const type_id = 1003;
     pub const tags = .{};
@@ -821,9 +773,7 @@ pub const Dump = struct {
 };
 
 pub const DumpReply = struct {
-    /// term.state.dumpAlloc of the terminal.
     state: []const u8,
-    /// The terminal's contents as plain text.
     text: []const u8,
     cols: u16,
     rows: u16,
@@ -844,7 +794,6 @@ pub const DumpReply = struct {
     }
 };
 
-/// Bytes that a session's program reads as typed input.
 pub const Inject = struct {
     bytes: []const u8,
 
@@ -864,7 +813,6 @@ pub const Inject = struct {
     }
 };
 
-/// Any message. Each payload type's type_id identifies it in a frame.
 pub const Message = union(enum) {
     hello: Hello,
     hello_reply: HelloReply,
@@ -901,8 +849,6 @@ pub const Message = union(enum) {
     inject: Inject,
     unknown: Unknown,
 
-    /// A type id with no message type in this file. Encoding writes body
-    /// unchanged.
     pub const Unknown = struct {
         type_id: u64,
         body: []const u8,
@@ -926,7 +872,6 @@ pub const Message = union(enum) {
         };
     }
 
-    /// Length of the body alone. frame.encodedLen adds the frame header.
     pub fn encodedLen(m: Message) usize {
         return switch (m) {
             .unknown => |u| u.body.len,
@@ -934,7 +879,6 @@ pub const Message = union(enum) {
         };
     }
 
-    /// Writes the body alone. frame.encode adds the frame header.
     pub fn encode(m: Message, w: *Writer) Writer.Error!void {
         return switch (m) {
             .unknown => |u| w.writeAll(u.body),
@@ -961,7 +905,6 @@ fn checkSchema(comptime M: type) void {
         if (tag_names.len != info.field_names.len)
             @compileError(@typeName(M) ++ ".tags must name each field once");
 
-        // decodeBody marks the fields it has seen in a u64.
         if (info.field_names.len > 64)
             @compileError(@typeName(M) ++ " has more than 64 fields");
 
@@ -1049,7 +992,6 @@ fn decodeBody(comptime M: type, bytes: []const u8) DecodeError!M {
     const info = @typeInfo(M).@"struct";
     var m: M = undefined;
 
-    // Bit i is set once field i has a value.
     var seen: u64 = 0;
 
     var it: wire.FieldIterator = .init(bytes);

@@ -20,7 +20,6 @@ pub fn encodedLen(m: Message) usize {
     return wire.varintLen(m.typeId()) + wire.varintLen(body_len) + body_len;
 }
 
-/// Writes m as one frame.
 pub fn encode(w: *Writer, m: Message) Writer.Error!void {
     try wire.writeVarint(w, m.typeId());
     try wire.writeVarint(w, m.encodedLen());
@@ -33,8 +32,6 @@ const Header = struct {
     len: usize,
 };
 
-/// Truncated means bytes end inside the header. Oversize is known from the
-/// header alone, before any of the body arrives.
 fn readHeader(bytes: []const u8, max_body_len: usize) DecodeError!Header {
     const type_id = try wire.readVarint(bytes);
     const body_len = try wire.readVarint(bytes[type_id.len..]);
@@ -66,14 +63,9 @@ pub fn firstMessage(bytes: []const u8, max_body_len: usize) DecodeError!?struct 
 /// assembled in the decoder and stays valid until the next feed or reset.
 pub const Decoder = struct {
     gpa: Allocator,
-    /// A frame whose header declares a longer body fails with Oversize. It
-    /// may change between frames.
     max_body_len: usize,
-    /// The unread rest of the chunk given to feed.
     input: []const u8 = &.{},
-    /// The start of a frame that the next chunk continues.
     pending: std.ArrayList(u8) = .empty,
-    /// The frame most recently assembled in pending, kept until the next feed.
     completed: std.ArrayList(u8) = .empty,
 
     pub const Error = DecodeError || Allocator.Error;
@@ -88,7 +80,6 @@ pub const Decoder = struct {
         d.* = undefined;
     }
 
-    /// Drops a partial frame and the unread input, to start on a new stream.
     pub fn reset(d: *Decoder) void {
         d.input = &.{};
         d.pending.clearRetainingCapacity();
@@ -103,14 +94,11 @@ pub const Decoder = struct {
         d.input = chunk;
     }
 
-    /// Returns the next message, or null when the chunk is used up.
     pub fn next(d: *Decoder) Error!?Message {
         const raw = (try d.nextRaw()) orelse return null;
         return try raw.decode();
     }
 
-    /// A frame with its body not yet decoded. bytes is the whole frame,
-    /// header included, and body is the part after the header.
     pub const Raw = struct {
         type_id: u64,
         bytes: []const u8,
@@ -121,7 +109,6 @@ pub const Decoder = struct {
         }
     };
 
-    /// Returns the next frame, or null when the chunk is used up.
     pub fn nextRaw(d: *Decoder) Error!?Raw {
         const header, const bytes = (try d.nextFrame()) orelse return null;
         return .{ .type_id = header.type_id, .bytes = bytes, .body = bytes[header.len..][0..header.body_len] };
@@ -132,8 +119,6 @@ pub const Decoder = struct {
         if (d.input.len == 0) return null;
 
         const header = readHeader(d.input, d.max_body_len) catch |err| switch (err) {
-            // The chunk ends inside the header, so pending takes fewer than
-            // max_header_len bytes.
             error.Truncated => {
                 try d.pending.appendSlice(d.gpa, d.input);
                 d.input = &.{};
@@ -182,8 +167,6 @@ pub const Decoder = struct {
         // at most one frame here, and that feed emptied completed.
         std.debug.assert(d.completed.items.len == 0);
 
-        // completed holds the frame until the next feed. pending takes
-        // completed's empty buffer.
         std.mem.swap(std.ArrayList(u8), &d.pending, &d.completed);
         return .{ header, d.completed.items };
     }
@@ -385,8 +368,6 @@ fn fuzzStream(_: void, in: fuzz.Input) !void {
     try writeFuzzStream(in, &out.writer);
     const stream = out.written();
 
-    // One chunk holds the whole stream, so every frame points into stream and
-    // stays valid for the comparison below.
     var whole: Decoder = .init(testing.allocator, fuzz_max_body);
     defer whole.deinit();
     var frames: std.ArrayList(Decoder.Raw) = .empty;
@@ -454,8 +435,6 @@ fn writeFuzzStream(in: fuzz.Input, w: *Writer) !void {
             body.end = in.bytes(&body_buf).len;
         }
 
-        // A declared length that differs from the body's misaligns the frames
-        // after it, and one over fuzz_max_body is Oversize.
         const len = if (in.chance(15, 1)) body.end else in.int(u64, 0, fuzz_max_body + 64);
         try wire.writeVarint(w, type_id);
         try wire.writeVarint(w, len);
