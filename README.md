@@ -20,6 +20,21 @@ service for your user. Run it again to upgrade; sessions keep running.
 
     curl -fsSL https://github.com/seatedro/tx/releases/latest/download/install.sh | sh -s -- --txd
 
+With Nix, the flake's package has tx and txd, built from main:
+
+    nix profile install github:seatedro/tx
+
+Its home-manager module runs txd as a service, as `--txd` does. On Linux,
+the service runs from boot only with lingering on:
+`users.users.NAME.linger = true` on NixOS, or `loginctl enable-linger`.
+
+    # inputs.tx.url = "github:seatedro/tx";
+    imports = [ inputs.tx.homeModules.default ];
+    services.txd = {
+      enable = true;
+      listen = "tailnet"; # optional; see Server
+    };
+
 ## Use
 
     tx [USER@]HOST          # attach the detached session, or start one
@@ -97,6 +112,7 @@ Needs Zig 0.17.0, or `nix develop`.
     zig build test
     zig build fuzz --fuzz   # fuzz what a client reaches before it logs in, and Wayland's wire format
     zig build release       # static Linux and macOS builds in zig-out/release
+    nix build               # result/bin/tx and result/bin/txd
 
 ## License
 
