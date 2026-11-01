@@ -1,20 +1,30 @@
+//! Asks Tailscale whether an address belongs to one of the user's own nodes.
+//! When txd's key is new to tx and txd answered from such an address, tx.zig
+//! records the key without asking the user. Ownership comes from
+//! `tailscale status --json`.
+
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const IpAddress = Io.net.IpAddress;
 
+/// On macOS the app bundle holds a copy of the CLI.
 const clis: []const []const u8 = if (builtin.os.tag.isDarwin())
     &.{ "tailscale", "/Applications/Tailscale.app/Contents/MacOS/Tailscale" }
 else
     &.{"tailscale"};
 
+/// The node's DNS name if address is a Tailscale address of this machine or
+/// of an untagged node of the same Tailscale user, else null. The name is in
+/// arena.
 pub fn ownNode(arena: Allocator, io: Io, address: IpAddress) ?[]const u8 {
     if (!isTailnetAddress(address)) return null;
     const output = status(arena, io) orelse return null;
     return ownNodeIn(arena, output, address);
 }
 
+/// The first CLI that starts gives the answer.
 fn status(arena: Allocator, io: Io) ?[]const u8 {
     for (clis) |cli| {
         const result = std.process.run(arena, io, .{
@@ -27,6 +37,7 @@ fn status(arena: Allocator, io: Io) ?[]const u8 {
     return null;
 }
 
+/// The parts of `tailscale status --json` that tx reads. Peer is keyed by node key.
 const Status = struct {
     Self: ?Node = null,
     Peer: ?std.json.ArrayHashMap(Node) = null,
@@ -47,6 +58,7 @@ fn ownNodeIn(arena: Allocator, output: []const u8, address: IpAddress) ?[]const 
     const peers = parsed.Peer orelse return null;
     for (peers.map.values()) |peer| {
         if (!hasAddress(peer, address)) continue;
+        // A tagged node is owned by its tags, whatever its UserID says.
         const tagged = if (peer.Tags) |tags| tags.len > 0 else false;
         if (tagged or peer.UserID != self.UserID) return null;
         return name(peer);
@@ -62,10 +74,12 @@ fn hasAddress(node: Node, address: IpAddress) bool {
     return false;
 }
 
+/// DNSName is fully qualified, with a trailing dot.
 fn name(node: Node) []const u8 {
     return std.mem.trimEnd(u8, node.DNSName, ".");
 }
 
+/// Compares the addresses and ignores the ports.
 fn sameIp(a: IpAddress, b: IpAddress) bool {
     return switch (a) {
         .ip4 => |x| b == .ip4 and std.mem.eql(u8, &x.bytes, &b.ip4.bytes),
@@ -73,6 +87,8 @@ fn sameIp(a: IpAddress, b: IpAddress) bool {
     };
 }
 
+/// Tailscale's ranges, 100.64.0.0/10 and fd7a:115c:a1e0::/48. The IPv6 prefix
+/// is repeated in server/addresses.zig's inTailscaleIp6.
 fn isTailnetAddress(address: IpAddress) bool {
     return switch (address) {
         .ip4 => |a| a.bytes[0] == 100 and a.bytes[1] & 0xc0 == 64,
