@@ -1,14 +1,4 @@
-//! End-to-end tests. Each test runs a Server on a loop thread of its own, with
-//! the built txd as its session process, and drives it with clients. tx's
-//! client runs on a thread, with a pty or pipes for its input and output.
-//! RawClient sends the messages tx's client doesn't. git and rsync run the
-//! built tx. Tests inspect sessions and type into them through control
-//! messages on the sessions' sockets in the runtime directory. Session
-//! processes outlive the Server. A restarted server finds them, and
-//! ServerThread.deinit kills them.
-//!
 //! The fixtures hold pointers into themselves and are initialized in place.
-//! Tests detach a client by typing ~., tx's escape, at the start of a line.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -34,8 +24,6 @@ const timeout_ms = 10_000;
 /// The user name the test servers accept. No account of that name needs to exist.
 const test_user = "tx-test";
 
-/// A user who can log in. It owns a temporary directory with authorized_keys
-/// and the runtime and terminfo directories, and an SSH agent.
 const Login = struct {
     tmp: testing.TmpDir,
     key: Ed25519.KeyPair,
@@ -46,11 +34,8 @@ const Login = struct {
     terminfo_dir: []u8,
     session_exe: []u8,
     session_log: posix.fd_t,
-    /// Backs the identities in the options clientOptions returns.
     identities: [4]client.session.Identity = undefined,
 
-    /// The agent holds agent_keys, or l.key when agent_keys is null.
-    /// authorized_keys lists l.key.
     fn init(l: *Login, agent_keys: ?[]const Ed25519.KeyPair) !void {
         var arena: std.heap.ArenaAllocator = .init(gpa);
         defer arena.deinit();
@@ -92,8 +77,6 @@ const Login = struct {
         try l.tmp.dir.writeFile(testing.io, .{ .sub_path = "authorized_keys", .data = new });
     }
 
-    /// Writes text to name in the temporary directory. Returns the file's
-    /// absolute path, which the caller frees.
     fn writeKeyFile(l: *Login, name: []const u8, text: []const u8) ![]u8 {
         try l.tmp.dir.writeFile(testing.io, .{ .sub_path = name, .data = text });
         var buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -112,8 +95,6 @@ const Login = struct {
         l.tmp.cleanup();
     }
 
-    /// Options for a server on a loopback port the OS picks, with a new host
-    /// key. argv is the program a new session runs.
     fn serverOptions(l: *const Login, environ: *const std.process.Environ.Map, argv: []const []const u8) !server_pkg.Options {
         return .{
             .listen = try .parseIp4("127.0.0.1", 0),
@@ -129,8 +110,6 @@ const Login = struct {
         };
     }
 
-    /// Options for tx's client to log in to st with up to 4 of the agent's
-    /// keys. They point into l and st, which must outlive the client.
     fn clientOptions(l: *Login, st: *const ServerThread, pty: ?*const TestPty, keys: []const auth.Key) client.session.Options {
         for (keys, 0..) |key, i| l.identities[i] = .{ .key = .fromEd25519(key), .source = .agent };
         return .{
@@ -150,7 +129,6 @@ fn nowMs() i64 {
     return Io.Clock.awake.now(testing.io).toMilliseconds();
 }
 
-/// A Server on its own loop and thread.
 const ServerThread = struct {
     loop: xev.Loop,
     server: server_pkg.Server,
@@ -192,8 +170,6 @@ const ServerThread = struct {
         return if (st.stopping) .disarm else .rearm;
     }
 
-    /// Runs req on the loop thread and returns once it has run. Calls must not
-    /// overlap.
     fn call(st: *ServerThread, req: *Request) void {
         st.pending.store(req, .release);
         st.wake.notify() catch {};
@@ -210,7 +186,6 @@ const ServerThread = struct {
         st.loop.deinit();
     }
 
-    /// Stops the server and kills the sessions in its runtime directory.
     fn deinit(st: *ServerThread) void {
         // stopServer leaves st.server undefined.
         var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -220,8 +195,6 @@ const ServerThread = struct {
         killSessions(dir) catch |err| std.debug.panic("ending the sessions: {t}", .{err});
     }
 
-    /// Replaces the server with one on the same address, with the same options
-    /// and host key. The sessions keep running.
     fn restart(st: *ServerThread) !void {
         var options = st.server.options;
         // options.listen can have port 0.
@@ -240,7 +213,6 @@ const ServerThread = struct {
     }
 };
 
-/// A reply from a session. message points into bytes.
 const Answer = struct {
     bytes: std.ArrayList(u8) = .empty,
     message: proto.Message = undefined,
@@ -250,8 +222,6 @@ const Answer = struct {
     }
 };
 
-/// Sends request to session id in dir and returns its first reply, or null
-/// when the session is gone.
 fn askSession(dir: []const u8, id: u64, request: proto.Message) !?Answer {
     const fd = (try tellSession(dir, id, request)) orelse return null;
     defer session.unix.close(fd);
@@ -280,8 +250,6 @@ fn askSession(dir: []const u8, id: u64, request: proto.Message) !?Answer {
     }
 }
 
-/// Connects to session id's socket in dir and sends message. Returns the
-/// connection for the caller to close, or null when no session listens there.
 fn tellSession(dir: []const u8, id: u64, message: proto.Message) !?posix.fd_t {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try server_pkg.runtime_dir.socketPath(&path_buf, dir, id);
@@ -308,7 +276,6 @@ fn tellSession(dir: []const u8, id: u64, message: proto.Message) !?posix.fd_t {
     return fd;
 }
 
-/// Kills each session in dir and waits until their sockets are gone.
 fn killSessions(dir: []const u8) !void {
     const ids = try server_pkg.runtime_dir.ids(gpa, testing.io, dir);
     defer gpa.free(ids);
@@ -333,16 +300,12 @@ fn dumpSession(st: *const ServerThread, id: u64) !?Answer {
     return answer;
 }
 
-/// The session's terminal state as term.state.dump writes it, or null when
-/// the session is gone. The caller frees it.
 fn primaryDump(st: *ServerThread, session_id: u64) !?[]u8 {
     var answer = (try dumpSession(st, session_id)) orelse return null;
     defer answer.deinit();
     return try gpa.dupe(u8, answer.message.dump_reply.state);
 }
 
-/// Types bytes into the session's program with an Inject on its socket, with
-/// no client involved.
 fn typeDetached(st: *ServerThread, session_id: u64, bytes: []const u8) !void {
     const fd = (try tellSession(st.runtimeDir(), session_id, .{ .inject = .{ .bytes = bytes } })) orelse return error.NoSession;
     session.unix.close(fd);
@@ -371,7 +334,6 @@ fn primarySize(st: *ServerThread, session_id: u64) !struct { u16, u16 } {
     return .{ answer.message.dump_reply.cols, answer.message.dump_reply.rows };
 }
 
-/// The pid of session id's session process.
 fn sessionPid(st: *const ServerThread, id: u64) !posix.pid_t {
     var answer = (try askSession(st.runtimeDir(), id, .{ .list = .{} })) orelse return error.NoSession;
     defer answer.deinit();
@@ -387,7 +349,6 @@ const Relay = struct {
     server: c.sockaddr.in,
     pairs: [16]Pair = undefined,
     len: usize = 0,
-    /// Drops all traffic while set.
     dropping: std.atomic.Value(bool) = .init(false),
     block_requested: std.atomic.Value(bool) = .init(false),
     /// Traffic of the pairs below this index is dropped. Only the relay
@@ -396,7 +357,6 @@ const Relay = struct {
     stopping: std.atomic.Value(bool) = .init(false),
     thread: std.Thread = undefined,
 
-    /// A client's address and the socket that carries its traffic to the server.
     const Pair = struct {
         client: c.sockaddr.in,
         fd: posix.fd_t,
@@ -430,8 +390,6 @@ const Relay = struct {
         r.thread = try std.Thread.spawn(.{}, run, .{r});
     }
 
-    /// Drops the traffic of the clients seen so far, and passes clients that
-    /// come later.
     fn blockExisting(r: *Relay) void {
         r.block_requested.store(true, .release);
         while (r.block_requested.load(.acquire)) testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
@@ -476,8 +434,6 @@ const Relay = struct {
         }
     }
 
-    /// The index of the pair for a client's address, made on its first
-    /// datagram. Null when no pair is free or a socket can't be opened.
     fn pairFor(r: *Relay, from: c.sockaddr.in) ?usize {
         for (r.pairs[0..r.len], 0..) |pair, i| {
             if (pair.client.port == from.port and pair.client.addr == from.addr) return i;
@@ -490,8 +446,6 @@ const Relay = struct {
     }
 };
 
-/// A pty pair at 80x24. The client under test uses the slave as its terminal,
-/// and the test types and reads at the master. output collects what was read.
 const TestPty = struct {
     master: posix.fd_t,
     slave: posix.fd_t,
@@ -533,7 +487,6 @@ const TestPty = struct {
         if (c.write(p.master, bytes.ptr, bytes.len) != bytes.len) return error.WriteFailed;
     }
 
-    /// Reads one chunk, if one arrives within ms.
     fn readFor(p: *TestPty, ms: i32) !void {
         var fds = [_]posix.pollfd{.{ .fd = p.master, .events = posix.POLL.IN, .revents = 0 }};
         if (c.poll(&fds, 1, ms) != 1) return;
@@ -560,7 +513,6 @@ const TestPty = struct {
     }
 };
 
-/// Runs tx's client with options on a thread of its own.
 const ClientThread = struct {
     options: client.session.Options,
     result: ?anyerror!client.session.Outcome = null,
@@ -585,8 +537,6 @@ const ClientThread = struct {
     }
 };
 
-/// A client running a command, with pipes for its stdin, stdout and stderr.
-/// out and err collect what the command writes.
 const ExecClient = struct {
     client: ClientThread,
     stdin: [2]posix.fd_t,
@@ -671,7 +621,6 @@ fn testPipe() ![2]posix.fd_t {
     return fds;
 }
 
-/// The number of commands the server runs, read on its loop thread.
 fn execCount(st: *ServerThread) usize {
     const Count = struct {
         req: ServerThread.Request = .{ .run = run },
@@ -782,7 +731,6 @@ test "a command that closes its stdout early, or ends by a signal, is reported" 
     var killed: ExecClient = undefined;
     defer killed.deinit();
     const signaled = try es.run(&killed, "kill -TERM $$", "");
-    // A signal's status is 128 plus its number.
     try testing.expectEqual(128 + 15, signaled.exited.status);
     try testing.expectEqualStrings("TERM", signaled.exited.signal.?.slice());
 }
@@ -834,9 +782,6 @@ test "a command with a terminal runs as a new session, and its status returns" {
     try testing.expect(std.mem.indexOf(u8, pty.output.items, "on-a-terminal") != null);
 }
 
-/// An environment for git and rsync with the built tx as their ssh. It has a
-/// HOME and XDG_CONFIG_HOME of its own, where tx's known_hosts lists the
-/// server's key.
 const Tools = struct {
     tmp: testing.TmpDir,
     dir: []u8,
@@ -891,7 +836,6 @@ const Tools = struct {
             .stdout_limit = .limited(1 << 20),
             .stderr_limit = .limited(1 << 20),
         }) catch |err| switch (err) {
-            // A host without the tool skips the test.
             error.FileNotFound => return error.SkipZigTest,
             else => return err,
         };
@@ -1019,7 +963,6 @@ test "a new session finds the terminfo entry its client sent, or a common one" {
 
     for ([_]struct { []const u8, []const u8 }{
         .{ entry, "found tx-test-term" },
-        // The server sets TERM to its fallback when the entry doesn't compile.
         .{ "not terminfo\n", "found xterm-256color" },
     }) |case| {
         const source, const want = case;
@@ -1083,8 +1026,6 @@ test "a command before the login is refused" {
     try testing.expectEqual(0, execCount(&es.st));
 }
 
-/// Checks that playing bytes, the output a client got, on a fresh 80x24
-/// terminal gives the session's terminal state.
 fn expectMatchesPrimary(st: *ServerThread, session_id: u64, bytes: []const u8) !void {
     const want = (try primaryDump(st, session_id)) orelse return error.NoSession;
     defer gpa.free(want);
@@ -1238,8 +1179,6 @@ test "reattaching inside an unfinished sequence finishes it" {
     _ = try b.join(&second);
 }
 
-/// A server whose program answers each line with "got LINE", after 2000 more
-/// lines for "flood", and a Relay that its clients connect through.
 const EchoSetup = struct {
     environ: std.process.Environ.Map,
     login: Login,
@@ -1294,16 +1233,12 @@ test "a client that loses its connection resumes where it left off" {
     var pty: TestPty = try .open();
     defer pty.close();
     var ct: ClientThread = .{ .options = e.clientOptions(&pty, &keys) };
-    // A client that has shown its notice resumes with a repaint.
     ct.options.notice_delay_ms = 60_000;
     try ct.start();
     try pty.readUntil("ready");
     try pty.type_("one\r");
     try pty.readUntil("got one");
 
-    // During the cut the test types two into the session, and three into the
-    // client. The cut outlasts the client's idle timeout, so the client
-    // resumes on a new connection.
     e.relay.dropping.store(true, .release);
     try testing.io.sleep(.fromMilliseconds(300), .awake);
     try typeDetached(&e.st, 1, "two\r");
@@ -1361,7 +1296,6 @@ test "a resumed client whose output left the log gets a repaint" {
     try ct.start();
     try pty.readUntil("ready");
 
-    // The flood overruns the 4096-byte log while the client is cut off.
     e.relay.dropping.store(true, .release);
     try typeDetached(&e.st, 1, "flood\r");
     try waitForPrimaryText(&e.st, 1, "got flood");
@@ -1397,7 +1331,6 @@ test "a client whose session was attached elsewhere doesn't take it back" {
     try a.start();
     try first.readUntil("ready");
 
-    // b connects directly and attaches session 1 while a is cut off.
     e.relay.dropping.store(true, .release);
     var second: TestPty = try .open();
     defer second.close();
@@ -1430,7 +1363,6 @@ test "a client whose session was attached elsewhere doesn't take it back" {
     _ = try c3.join(&third);
 }
 
-/// A server whose program sets its title to "title ID" and reads a line.
 const TitleSetup = struct {
     environ: std.process.Environ.Map,
     login: Login,
@@ -1458,8 +1390,6 @@ const TitleSetup = struct {
         t.environ.deinit();
     }
 
-    /// Runs a client with command. A client that attaches detaches once its
-    /// program is ready.
     fn run(t: *TitleSetup, command: client.session.Command, session_id: ?u64, reuse: bool) !client.session.Outcome {
         var pty: TestPty = try .open();
         defer pty.close();
@@ -1536,7 +1466,6 @@ test "a client without an ID attaches the one detached session" {
     attached.options.reuse_detached = true;
     try attached.start();
     try pty.readUntil("title 1");
-    // Session 1 is attached, so the client starts session 2.
     try testing.expectEqual(2, (try t.run(.attach, null, true)).detached.?);
     try pty.type_("~.");
     _ = try attached.join(&pty);
@@ -1841,9 +1770,6 @@ test "a session's programs copy and paste through the clipboard server, which a 
     }
 }
 
-/// A clipboard.Provider over memory. The client calls it from its loop
-/// thread, and mutex guards the fields. written collects each item written
-/// as "mime=data\n".
 const TestClipboard = struct {
     mutex: std.Io.Mutex = .init,
     change: u64 = 1,
@@ -1958,7 +1884,6 @@ test "programs read the client's clipboard just after a paste, and their copies 
     try pty.type_("x\r");
     try pty.readUntil("[]");
 
-    // A bracketed paste lets the next read through.
     try pty.type_("\x1b[200~y\x1b[201~\r");
     try pty.readUntil("[from the laptop]");
 
@@ -2167,7 +2092,6 @@ test "past retry_from, a client logs in after a Retry" {
     try testing.expect(@atomicLoad(u64, &st.server.pending.retries, .monotonic) >= 1);
 }
 
-/// An unencrypted OpenSSH Ed25519 private key file.
 const plain_key_file =
     \\-----BEGIN OPENSSH PRIVATE KEY-----
     \\b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
@@ -2178,8 +2102,6 @@ const plain_key_file =
     \\-----END OPENSSH PRIVATE KEY-----
     \\
 ;
-/// An OpenSSH Ed25519 private key file, encrypted with aes256-ctr under a
-/// bcrypt key from the passphrase rightPassphrase gives.
 const encrypted_key_file =
     \\-----BEGIN OPENSSH PRIVATE KEY-----
     \\b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABAm/7i1ie
@@ -2207,8 +2129,6 @@ fn noPassphrase(_: []const u8, _: []u8, _: posix.fd_t) ?[]u8 {
     return null;
 }
 
-/// Logs in offering first an agent key the server refuses, then the key in a
-/// file holding text, whose passphrase comes from ask.
 fn loginWithKeyFile(text: []const u8, ask: *const fn ([]const u8, []u8, posix.fd_t) ?[]u8) !client.session.Outcome {
     transport.crypto.init(testing.io);
     var environ = try testEnviron();
@@ -2308,11 +2228,9 @@ const RawClient = struct {
     logged_in: bool = false,
     attached: ?u64 = null,
     error_code: ?u32 = null,
-    /// The start of the error's message, error_message_len bytes long.
     error_message: [64]u8 = undefined,
     error_message_len: usize = 0,
     closed: bool = false,
-    /// The server has finished its stream.
     finished: bool = false,
     output: std.ArrayList(u8) = .empty,
 
@@ -2373,7 +2291,6 @@ const RawClient = struct {
         }
     }
 
-    /// Signs the login transcript with key, as tx's client does, and attaches.
     fn signIn(rc: *RawClient, stream: *transport.endpoint.Stream) void {
         var transcript: auth.login.Transcript = .{
             .exporter = undefined,
@@ -2557,7 +2474,6 @@ test "a server bounds the terminal size a client sends" {
     }
 }
 
-/// An environment holding PATH alone.
 fn testEnviron() !std.process.Environ.Map {
     var environ: std.process.Environ.Map = .init(gpa);
     errdefer environ.deinit();
@@ -2612,8 +2528,6 @@ test "a session told to stop kills a program that ignores SIGHUP" {
     const id = try rc.waitAttached();
     try rc.waitOutput("ready");
 
-    // SIGTERM stops the session process. It sends its program SIGHUP, and
-    // SIGKILL once session.session.stop_grace_ms have passed.
     const start = nowMs();
     try posix.kill(try sessionPid(&st, id), .TERM);
     try testing.expectEqual(@backingInt(proto.ErrorCode.session_lost), try rc.waitError());
@@ -2668,7 +2582,6 @@ test "a session outlives txd, and its client resumes it on the next txd" {
     try pty.type_("two\r");
     const before = pty.output.items.len;
     try pty.readUntil("got two");
-    // A rebuild writes DECSTR.
     try testing.expect(std.mem.indexOf(u8, pty.output.items[before..], "\x1b[!p") == null);
     try expectMatchesPrimary(&e.st, 1, pty.output.items);
 
