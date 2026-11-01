@@ -1,3 +1,15 @@
+//! End-to-end tests. Each test runs a Server on a loop thread of its own, with
+//! the built txd as its session process, and drives it with clients. tx's
+//! client runs on a thread, with a pty or pipes for its input and output.
+//! RawClient sends the messages tx's client doesn't. git and rsync run the
+//! built tx. Tests inspect sessions and type into them through control
+//! messages on the sessions' sockets in the runtime directory. Session
+//! processes outlive the Server. A restarted server finds them, and
+//! ServerThread.deinit kills them.
+//!
+//! The fixtures hold pointers into themselves and are initialized in place.
+//! Tests detach a client by typing ~., tx's escape, at the start of a line.
+
 const std = @import("std");
 const builtin = @import("builtin");
 const testing = std.testing;
@@ -19,8 +31,11 @@ const fuzz = @import("fuzz");
 const gpa = testing.allocator;
 const timeout_ms = 10_000;
 
+/// The user name the test servers accept. No account of that name needs to exist.
 const test_user = "tx-test";
 
+/// A user who can log in. It owns a temporary directory with authorized_keys
+/// and the runtime and terminfo directories, and an SSH agent.
 const Login = struct {
     tmp: testing.TmpDir,
     key: Ed25519.KeyPair,
@@ -31,8 +46,11 @@ const Login = struct {
     terminfo_dir: []u8,
     session_exe: []u8,
     session_log: posix.fd_t,
+    /// Backs the identities in the options clientOptions returns.
     identities: [4]client.session.Identity = undefined,
 
+    /// The agent holds agent_keys, or l.key when agent_keys is null.
+    /// authorized_keys lists l.key.
     fn init(l: *Login, agent_keys: ?[]const Ed25519.KeyPair) !void {
         var arena: std.heap.ArenaAllocator = .init(gpa);
         defer arena.deinit();
@@ -48,6 +66,7 @@ const Login = struct {
             .authorized_keys = try std.fs.path.join(gpa, &.{ dir, "authorized_keys" }),
             .runtime_dir = try std.fs.path.join(gpa, &.{ dir, "run" }),
             .terminfo_dir = try std.fs.path.join(gpa, &.{ dir, "terminfo" }),
+            // build_options paths can be relative, and spawn runs session_exe after changing to /.
             .session_exe = try std.fs.path.resolve(gpa, &.{ try std.process.currentPathAlloc(testing.io, arena.allocator()), build_options.txd_exe }),
             .session_log = c.open("/dev/null", .{ .ACCMODE = .WRONLY, .CLOEXEC = true }),
         };
@@ -73,6 +92,8 @@ const Login = struct {
         try l.tmp.dir.writeFile(testing.io, .{ .sub_path = "authorized_keys", .data = new });
     }
 
+    /// Writes text to name in the temporary directory. Returns the file's
+    /// absolute path, which the caller frees.
     fn writeKeyFile(l: *Login, name: []const u8, text: []const u8) ![]u8 {
         try l.tmp.dir.writeFile(testing.io, .{ .sub_path = name, .data = text });
         var buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -91,6 +112,8 @@ const Login = struct {
         l.tmp.cleanup();
     }
 
+    /// Options for a server on a loopback port the OS picks, with a new host
+    /// key. argv is the program a new session runs.
     fn serverOptions(l: *const Login, environ: *const std.process.Environ.Map, argv: []const []const u8) !server_pkg.Options {
         return .{
             .listen = try .parseIp4("127.0.0.1", 0),
@@ -106,6 +129,8 @@ const Login = struct {
         };
     }
 
+    /// Options for tx's client to log in to st with up to 4 of the agent's
+    /// keys. They point into l and st, which must outlive the client.
     fn clientOptions(l: *Login, st: *const ServerThread, pty: ?*const TestPty, keys: []const auth.Key) client.session.Options {
         for (keys, 0..) |key, i| l.identities[i] = .{ .key = .fromEd25519(key), .source = .agent };
         return .{
@@ -125,6 +150,7 @@ fn nowMs() i64 {
     return Io.Clock.awake.now(testing.io).toMilliseconds();
 }
 
+/// A Server on its own loop and thread.
 const ServerThread = struct {
     loop: xev.Loop,
     server: server_pkg.Server,
@@ -136,6 +162,8 @@ const ServerThread = struct {
     host_keys: [1][32]u8 = undefined,
     addresses: [1]Io.net.IpAddress = undefined,
 
+    /// A function call into the loop thread. Callers embed a Request and
+    /// reach their own fields from run with @fieldParentPtr.
     const Request = struct {
         run: *const fn (req: *Request, st: *ServerThread) void,
         done: std.atomic.Value(bool) = .init(false),
@@ -160,15 +188,19 @@ const ServerThread = struct {
             req.run(req, st);
             req.done.store(true, .release);
         }
+        // Disarming once the server stops lets loop.run(.until_done) return.
         return if (st.stopping) .disarm else .rearm;
     }
 
+    /// Runs req on the loop thread and returns once it has run. Calls must not
+    /// overlap.
     fn call(st: *ServerThread, req: *Request) void {
         st.pending.store(req, .release);
         st.wake.notify() catch {};
         while (!req.done.load(.acquire)) testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
     }
 
+    /// Stops and frees the server. Its sessions keep running.
     fn stopServer(st: *ServerThread) void {
         var req: Request = .{ .run = stop };
         st.call(&req);
@@ -178,7 +210,9 @@ const ServerThread = struct {
         st.loop.deinit();
     }
 
+    /// Stops the server and kills the sessions in its runtime directory.
     fn deinit(st: *ServerThread) void {
+        // stopServer leaves st.server undefined.
         var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
         const dir = dir_buf[0..st.server.options.runtime_dir.len];
         @memcpy(dir, st.server.options.runtime_dir);
@@ -186,8 +220,11 @@ const ServerThread = struct {
         killSessions(dir) catch |err| std.debug.panic("ending the sessions: {t}", .{err});
     }
 
+    /// Replaces the server with one on the same address, with the same options
+    /// and host key. The sessions keep running.
     fn restart(st: *ServerThread) !void {
         var options = st.server.options;
+        // options.listen can have port 0.
         options.listen = st.addresses[0];
         st.stopServer();
         try st.init(options);
@@ -203,6 +240,7 @@ const ServerThread = struct {
     }
 };
 
+/// A reply from a session. message points into bytes.
 const Answer = struct {
     bytes: std.ArrayList(u8) = .empty,
     message: proto.Message = undefined,
@@ -212,6 +250,8 @@ const Answer = struct {
     }
 };
 
+/// Sends request to session id in dir and returns its first reply, or null
+/// when the session is gone.
 fn askSession(dir: []const u8, id: u64, request: proto.Message) !?Answer {
     const fd = (try tellSession(dir, id, request)) orelse return null;
     defer session.unix.close(fd);
@@ -240,11 +280,14 @@ fn askSession(dir: []const u8, id: u64, request: proto.Message) !?Answer {
     }
 }
 
+/// Connects to session id's socket in dir and sends message. Returns the
+/// connection for the caller to close, or null when no session listens there.
 fn tellSession(dir: []const u8, id: u64, message: proto.Message) !?posix.fd_t {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try server_pkg.runtime_dir.socketPath(&path_buf, dir, id);
     const fd = session.unix.connect(path) catch |err| switch (err) {
         error.FileNotFound => return null,
+        // The socket is left over from a session process that died.
         error.ConnectionRefused => {
             server_pkg.runtime_dir.remove(dir, id);
             return null;
@@ -252,6 +295,7 @@ fn tellSession(dir: []const u8, id: u64, message: proto.Message) !?posix.fd_t {
         else => return err,
     };
     errdefer session.unix.close(fd);
+
     var buf: [64 << 10]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);
     try proto.encode(&w, message);
@@ -264,6 +308,7 @@ fn tellSession(dir: []const u8, id: u64, message: proto.Message) !?posix.fd_t {
     return fd;
 }
 
+/// Kills each session in dir and waits until their sockets are gone.
 fn killSessions(dir: []const u8) !void {
     const ids = try server_pkg.runtime_dir.ids(gpa, testing.io, dir);
     defer gpa.free(ids);
@@ -288,12 +333,16 @@ fn dumpSession(st: *const ServerThread, id: u64) !?Answer {
     return answer;
 }
 
+/// The session's terminal state as term.state.dump writes it, or null when
+/// the session is gone. The caller frees it.
 fn primaryDump(st: *ServerThread, session_id: u64) !?[]u8 {
     var answer = (try dumpSession(st, session_id)) orelse return null;
     defer answer.deinit();
     return try gpa.dupe(u8, answer.message.dump_reply.state);
 }
 
+/// Types bytes into the session's program with an Inject on its socket, with
+/// no client involved.
 fn typeDetached(st: *ServerThread, session_id: u64, bytes: []const u8) !void {
     const fd = (try tellSession(st.runtimeDir(), session_id, .{ .inject = .{ .bytes = bytes } })) orelse return error.NoSession;
     session.unix.close(fd);
@@ -322,24 +371,32 @@ fn primarySize(st: *ServerThread, session_id: u64) !struct { u16, u16 } {
     return .{ answer.message.dump_reply.cols, answer.message.dump_reply.rows };
 }
 
+/// The pid of session id's session process.
 fn sessionPid(st: *const ServerThread, id: u64) !posix.pid_t {
     var answer = (try askSession(st.runtimeDir(), id, .{ .list = .{} })) orelse return error.NoSession;
     defer answer.deinit();
     return @intCast(answer.message.session_info.pid.?);
 }
 
+/// A UDP relay on loopback between clients and a server, for cutting
+/// connections. Each client address gets a socket of its own toward the
+/// server, so the server sees one address per client.
 const Relay = struct {
     fd: posix.fd_t,
     addresses: [1]Io.net.IpAddress,
     server: c.sockaddr.in,
     pairs: [16]Pair = undefined,
     len: usize = 0,
+    /// Drops all traffic while set.
     dropping: std.atomic.Value(bool) = .init(false),
     block_requested: std.atomic.Value(bool) = .init(false),
+    /// Traffic of the pairs below this index is dropped. Only the relay
+    /// thread writes it.
     blocked: usize = 0,
     stopping: std.atomic.Value(bool) = .init(false),
     thread: std.Thread = undefined,
 
+    /// A client's address and the socket that carries its traffic to the server.
     const Pair = struct {
         client: c.sockaddr.in,
         fd: posix.fd_t,
@@ -373,6 +430,8 @@ const Relay = struct {
         r.thread = try std.Thread.spawn(.{}, run, .{r});
     }
 
+    /// Drops the traffic of the clients seen so far, and passes clients that
+    /// come later.
     fn blockExisting(r: *Relay) void {
         r.block_requested.store(true, .release);
         while (r.block_requested.load(.acquire)) testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
@@ -395,6 +454,8 @@ const Relay = struct {
             var fds: [17]posix.pollfd = undefined;
             fds[0] = .{ .fd = r.fd, .events = posix.POLL.IN, .revents = 0 };
             for (r.pairs[0..r.len], 1..) |pair, i| fds[i] = .{ .fd = pair.fd, .events = posix.POLL.IN, .revents = 0 };
+            // The timeout bounds how long stop and blockExisting wait for the
+            // thread.
             if (c.poll(&fds, @intCast(r.len + 1), 20) <= 0) continue;
             const dropping = r.dropping.load(.acquire);
 
@@ -415,6 +476,8 @@ const Relay = struct {
         }
     }
 
+    /// The index of the pair for a client's address, made on its first
+    /// datagram. Null when no pair is free or a socket can't be opened.
     fn pairFor(r: *Relay, from: c.sockaddr.in) ?usize {
         for (r.pairs[0..r.len], 0..) |pair, i| {
             if (pair.client.port == from.port and pair.client.addr == from.addr) return i;
@@ -427,11 +490,15 @@ const Relay = struct {
     }
 };
 
+/// A pty pair at 80x24. The client under test uses the slave as its terminal,
+/// and the test types and reads at the master. output collects what was read.
 const TestPty = struct {
     master: posix.fd_t,
     slave: posix.fd_t,
     output: std.ArrayList(u8) = .empty,
 
+    // std.c has no pty functions, and its ioctl takes the request as a c_int,
+    // which 0x80087467 overflows.
     extern "c" fn posix_openpt(flags: posix.O) c_int;
     extern "c" fn grantpt(fd: posix.fd_t) c_int;
     extern "c" fn unlockpt(fd: posix.fd_t) c_int;
@@ -448,7 +515,9 @@ const TestPty = struct {
         const len = std.mem.indexOfScalar(u8, &name, 0).?;
         const slave = c.open(name[0..len :0], .{ .ACCMODE = .RDWR, .NOCTTY = true });
         if (slave == -1) return error.OpenPtyFailed;
+
         var ws: posix.winsize = .{ .row = 24, .col = 80, .xpixel = 0, .ypixel = 0 };
+        // std.c.T has no IOCSWINSZ for Darwin. 0x80087467 is _IOW('t', 103, struct winsize).
         const tiocswinsz: c_ulong = if (builtin.os.tag.isDarwin()) 0x80087467 else c.T.IOCSWINSZ;
         _ = ioctl(master, tiocswinsz, @intFromPtr(&ws));
         return .{ .master = master, .slave = slave };
@@ -464,6 +533,7 @@ const TestPty = struct {
         if (c.write(p.master, bytes.ptr, bytes.len) != bytes.len) return error.WriteFailed;
     }
 
+    /// Reads one chunk, if one arrives within ms.
     fn readFor(p: *TestPty, ms: i32) !void {
         var fds = [_]posix.pollfd{.{ .fd = p.master, .events = posix.POLL.IN, .revents = 0 }};
         if (c.poll(&fds, 1, ms) != 1) return;
@@ -490,6 +560,7 @@ const TestPty = struct {
     }
 };
 
+/// Runs tx's client with options on a thread of its own.
 const ClientThread = struct {
     options: client.session.Options,
     result: ?anyerror!client.session.Outcome = null,
@@ -505,6 +576,8 @@ const ClientThread = struct {
         ct.done.store(true, .release);
     }
 
+    /// Waits for the client to end. It reads the pty meanwhile, since the
+    /// client drains its terminal output before it returns.
     fn join(ct: *ClientThread, pty: *TestPty) !client.session.Outcome {
         while (!ct.done.load(.acquire)) try pty.readFor(10);
         ct.thread.join();
@@ -512,6 +585,8 @@ const ClientThread = struct {
     }
 };
 
+/// A client running a command, with pipes for its stdin, stdout and stderr.
+/// out and err collect what the command writes.
 const ExecClient = struct {
     client: ClientThread,
     stdin: [2]posix.fd_t,
@@ -522,6 +597,7 @@ const ExecClient = struct {
 
     fn start(ec: *ExecClient, login: *Login, st: *const ServerThread, command: []const u8) !void {
         ec.* = .{ .client = undefined, .stdin = try testPipe(), .stdout = try testPipe(), .stderr = try testPipe() };
+        // Nonblocking read ends let drain read until a pipe is empty.
         for ([_]posix.fd_t{ ec.stdout[0], ec.stderr[0] }) |fd| _ = c.fcntl(fd, posix.F.SETFL, @as(c_int, @bitCast(posix.O{ .NONBLOCK = true })));
         var options = login.clientOptions(st, null, &.{login.key.public_key.toBytes()});
         options.in_fd = ec.stdin[0];
@@ -532,6 +608,8 @@ const ExecClient = struct {
         try ec.client.start();
     }
 
+    /// Writes bytes to the command's stdin and reads its output in between,
+    /// so a command that echoes its input can't stall on full pipes.
     fn write(ec: *ExecClient, bytes: []const u8) !void {
         var rest = bytes;
         while (rest.len > 0) {
@@ -593,6 +671,7 @@ fn testPipe() ![2]posix.fd_t {
     return fds;
 }
 
+/// The number of commands the server runs, read on its loop thread.
 fn execCount(st: *ServerThread) usize {
     const Count = struct {
         req: ServerThread.Request = .{ .run = run },
@@ -703,6 +782,7 @@ test "a command that closes its stdout early, or ends by a signal, is reported" 
     var killed: ExecClient = undefined;
     defer killed.deinit();
     const signaled = try es.run(&killed, "kill -TERM $$", "");
+    // A signal's status is 128 plus its number.
     try testing.expectEqual(128 + 15, signaled.exited.status);
     try testing.expectEqualStrings("TERM", signaled.exited.signal.?.slice());
 }
@@ -715,6 +795,7 @@ test "a client whose stdout closes ends, and the server frees the command" {
     var ec: ExecClient = undefined;
     defer ec.deinit();
     try ec.start(&es.login, &es.st, "cat");
+    // Closing the read end makes the client's next write to stdout fail.
     ExecClient.closeFd(&ec.stdout[0]);
     try ec.write("line\n");
     try testing.expectEqual(.ended, try ec.join());
@@ -753,6 +834,9 @@ test "a command with a terminal runs as a new session, and its status returns" {
     try testing.expect(std.mem.indexOf(u8, pty.output.items, "on-a-terminal") != null);
 }
 
+/// An environment for git and rsync with the built tx as their ssh. It has a
+/// HOME and XDG_CONFIG_HOME of its own, where tx's known_hosts lists the
+/// server's key.
 const Tools = struct {
     tmp: testing.TmpDir,
     dir: []u8,
@@ -774,6 +858,7 @@ const Tools = struct {
         try t.tmp.dir.createDirPath(testing.io, "config/tx");
         try t.tmp.dir.writeFile(testing.io, .{ .sub_path = "config/tx/known_hosts", .data = line });
 
+        // build_options paths can be relative, and git and rsync run tx from t.dir.
         const tx_exe = try std.fs.path.resolve(arena.allocator(), &.{ try std.process.currentPathAlloc(testing.io, arena.allocator()), build_options.tx_exe });
         t.environ = .init(gpa);
         errdefer t.environ.deinit();
@@ -781,10 +866,12 @@ const Tools = struct {
         try t.environ.put("HOME", t.dir);
         try t.environ.put("XDG_CONFIG_HOME", try std.fs.path.join(arena.allocator(), &.{ t.dir, "config" }));
         try t.environ.put("SSH_AUTH_SOCK", es.login.agent_path);
+        // These leave out the system's git config and give commits an author.
         try t.environ.put("GIT_CONFIG_NOSYSTEM", "1");
         for ([_][]const u8{ "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL" }) |name| try t.environ.put(name, "tx");
 
         try t.environ.put("GIT_SSH_COMMAND", tx_exe);
+        // rsync's HOST:PATH names no port or user.
         var rsh_buf: [std.fs.max_path_bytes + 64]u8 = undefined;
         try t.environ.put("RSYNC_RSH", try std.fmt.bufPrint(&rsh_buf, "{s} -p {d} -l " ++ test_user, .{ tx_exe, port }));
         t.port = port;
@@ -804,6 +891,7 @@ const Tools = struct {
             .stdout_limit = .limited(1 << 20),
             .stderr_limit = .limited(1 << 20),
         }) catch |err| switch (err) {
+            // A host without the tool skips the test.
             error.FileNotFound => return error.SkipZigTest,
             else => return err,
         };
@@ -931,6 +1019,7 @@ test "a new session finds the terminfo entry its client sent, or a common one" {
 
     for ([_]struct { []const u8, []const u8 }{
         .{ entry, "found tx-test-term" },
+        // The server sets TERM to its fallback when the entry doesn't compile.
         .{ "not terminfo\n", "found xterm-256color" },
     }) |case| {
         const source, const want = case;
@@ -994,6 +1083,8 @@ test "a command before the login is refused" {
     try testing.expectEqual(0, execCount(&es.st));
 }
 
+/// Checks that playing bytes, the output a client got, on a fresh 80x24
+/// terminal gives the session's terminal state.
 fn expectMatchesPrimary(st: *ServerThread, session_id: u64, bytes: []const u8) !void {
     const want = (try primaryDump(st, session_id)) orelse return error.NoSession;
     defer gpa.free(want);
@@ -1097,6 +1188,7 @@ test "a session whose log was trimmed reattaches with its scrollback" {
     b.options.session_id = session_id;
     try b.start();
     try second.readUntil("ready");
+    // line 0 has left the 4096-byte log. It comes from the terminal's scrollback.
     try testing.expect(std.mem.indexOf(u8, second.output.items, "line 0\r\n") != null);
     try expectMatchesPrimary(&st, session_id, second.output.items);
 
@@ -1146,6 +1238,8 @@ test "reattaching inside an unfinished sequence finishes it" {
     _ = try b.join(&second);
 }
 
+/// A server whose program answers each line with "got LINE", after 2000 more
+/// lines for "flood", and a Relay that its clients connect through.
 const EchoSetup = struct {
     environ: std.process.Environ.Map,
     login: Login,
@@ -1184,6 +1278,7 @@ const EchoSetup = struct {
     fn clientOptions(e: *EchoSetup, pty: *const TestPty, keys: []const auth.Key) client.session.Options {
         var options = e.login.clientOptions(&e.st, pty, keys);
         options.servers = &e.relay.addresses;
+        // A cut connection idles out within a second, and keep-alives hold a quiet one open.
         options.idle_timeout_ns = std.time.ns_per_s;
         options.keep_alive_ns = 200 * std.time.ns_per_ms;
         return options;
@@ -1199,12 +1294,16 @@ test "a client that loses its connection resumes where it left off" {
     var pty: TestPty = try .open();
     defer pty.close();
     var ct: ClientThread = .{ .options = e.clientOptions(&pty, &keys) };
+    // A client that has shown its notice resumes with a repaint.
     ct.options.notice_delay_ms = 60_000;
     try ct.start();
     try pty.readUntil("ready");
     try pty.type_("one\r");
     try pty.readUntil("got one");
 
+    // During the cut the test types two into the session, and three into the
+    // client. The cut outlasts the client's idle timeout, so the client
+    // resumes on a new connection.
     e.relay.dropping.store(true, .release);
     try testing.io.sleep(.fromMilliseconds(300), .awake);
     try typeDetached(&e.st, 1, "two\r");
@@ -1216,6 +1315,7 @@ test "a client that loses its connection resumes where it left off" {
     try pty.readUntil("got three");
     const after = pty.output.items[before..];
     try testing.expect(std.mem.indexOf(u8, after, "got two") != null);
+    // A rebuild writes DECSTR, CSI ! p.
     try testing.expect(std.mem.indexOf(u8, after, "\x1b[!p") == null);
     try expectMatchesPrimary(&e.st, 1, pty.output.items);
 
@@ -1238,6 +1338,8 @@ test "a client gives up on a silent connection before its idle timeout" {
     try ct.start();
     try pty.readUntil("ready");
 
+    // The connection goes silent. The client's next one comes from a new
+    // port, which the relay passes.
     e.relay.blockExisting();
     try pty.type_("one\r");
     try pty.readUntil("got one");
@@ -1259,6 +1361,7 @@ test "a resumed client whose output left the log gets a repaint" {
     try ct.start();
     try pty.readUntil("ready");
 
+    // The flood overruns the 4096-byte log while the client is cut off.
     e.relay.dropping.store(true, .release);
     try typeDetached(&e.st, 1, "flood\r");
     try waitForPrimaryText(&e.st, 1, "got flood");
@@ -1294,6 +1397,7 @@ test "a client whose session was attached elsewhere doesn't take it back" {
     try a.start();
     try first.readUntil("ready");
 
+    // b connects directly and attaches session 1 while a is cut off.
     e.relay.dropping.store(true, .release);
     var second: TestPty = try .open();
     defer second.close();
@@ -1302,6 +1406,8 @@ test "a client whose session was attached elsewhere doesn't take it back" {
     try b.start();
     try second.readUntil("ready");
 
+    // a's connection idles out. Its resume fails, since b's attach gave the
+    // session a new resume key.
     try testing.io.sleep(.fromMilliseconds(1500), .awake);
     e.relay.dropping.store(false, .release);
 
@@ -1324,6 +1430,7 @@ test "a client whose session was attached elsewhere doesn't take it back" {
     _ = try c3.join(&third);
 }
 
+/// A server whose program sets its title to "title ID" and reads a line.
 const TitleSetup = struct {
     environ: std.process.Environ.Map,
     login: Login,
@@ -1351,6 +1458,8 @@ const TitleSetup = struct {
         t.environ.deinit();
     }
 
+    /// Runs a client with command. A client that attaches detaches once its
+    /// program is ready.
     fn run(t: *TitleSetup, command: client.session.Command, session_id: ?u64, reuse: bool) !client.session.Outcome {
         var pty: TestPty = try .open();
         defer pty.close();
@@ -1427,6 +1536,7 @@ test "a client without an ID attaches the one detached session" {
     attached.options.reuse_detached = true;
     try attached.start();
     try pty.readUntil("title 1");
+    // Session 1 is attached, so the client starts session 2.
     try testing.expectEqual(2, (try t.run(.attach, null, true)).detached.?);
     try pty.type_("~.");
     _ = try attached.join(&pty);
@@ -1468,6 +1578,7 @@ test "a client tries the next address when the first doesn't answer" {
     defer st.deinit();
 
     const port = st.server.address().getPort();
+    // Nothing listens on ::1 at the server's port.
     const servers = [_]Io.net.IpAddress{ try .parseIp6("::1", port), st.server.address() };
 
     var pty: TestPty = try .open();
@@ -1678,12 +1789,15 @@ test "a new session gets the client's locale variables in place of the server's"
     }));
     defer st.deinit();
 
+    // OTHER and LC_time aren't locale names, and LC_TIME and LC_ALL have no
+    // value. The server skips them.
     var hello = raw_hello;
     hello.locale = "LANG=en_US.UTF-8\x00LC_CTYPE=UTF-8\x00OTHER=x\x00LC_time=y\x00LC_TIME=\x00LC_ALL\x00";
     var rc: RawClient = undefined;
     try rc.init(&st, login.key, hello);
     defer rc.deinit();
 
+    // The server turns a bare UTF-8 into C.UTF-8 on Linux.
     const ctype = if (builtin.os.tag == .linux) "C.UTF-8" else "UTF-8";
     try rc.waitOutput("lang=en_US.UTF-8 ctype=" ++ ctype ++ " time=C other=unset.");
 }
@@ -1703,6 +1817,9 @@ test "a session's programs copy and paste through the clipboard server, which a 
     try st.init(options);
     defer st.deinit();
 
+    // Status 77 means wl-copy is missing. wl-copy stays in the background to
+    // serve its copy, and its output goes to /dev/null so the command's
+    // output can end.
     const command =
         \\command -v wl-copy >/dev/null || exit 77
         \\wl-copy "$1" </dev/null >/dev/null 2>&1
@@ -1717,12 +1834,16 @@ test "a session's programs copy and paste through the clipboard server, which a 
         const outcome = try ec.join();
         if (outcome.exited.status == 77) return error.SkipZigTest;
         try testing.expectEqual(0, outcome.exited.status);
+        // MPLBACKEND=Agg is one of the server's display defaults.
         try testing.expectEqualStrings(text ++ " Agg unset", ec.out.items);
 
         try st.restart();
     }
 }
 
+/// A clipboard.Provider over memory. The client calls it from its loop
+/// thread, and mutex guards the fields. written collects each item written
+/// as "mime=data\n".
 const TestClipboard = struct {
     mutex: std.Io.Mutex = .init,
     change: u64 = 1,
@@ -1833,9 +1954,11 @@ test "programs read the client's clipboard just after a paste, and their copies 
     try ct.start();
     try pty.readUntil("ready");
 
+    // With no paste in the last clipboard.paste_window_ms, the client refuses the read.
     try pty.type_("x\r");
     try pty.readUntil("[]");
 
+    // A bracketed paste lets the next read through.
     try pty.type_("\x1b[200~y\x1b[201~\r");
     try pty.readUntil("[from the laptop]");
 
@@ -1915,6 +2038,9 @@ fn fuzzLogin(_: void, in: fuzz.Input) !void {
 
     if (!rc.closed) rc.conn.?.close(0);
     try rc.waitClosed();
+
+    // The server's endpoint releases the connection's pending slot when it
+    // frees the connection.
     const deadline = nowMs() + timeout_ms;
     while (@atomicLoad(u32, &st.server.pending.total, .monotonic) > 0) {
         if (nowMs() > deadline) return error.Timeout;
@@ -1922,6 +2048,9 @@ fn fuzzLogin(_: void, in: fuzz.Input) !void {
     }
 }
 
+/// Writes up to 8 messages a client could send before its login, with raw
+/// bytes among them. The user, key and revision are each the real one seven
+/// times in eight, which gets the server past its first checks.
 fn writeFuzzLogin(in: fuzz.Input, w: *Io.Writer, key_blob: []const u8) !void {
     var a: [600]u8 = undefined;
     var b: [600]u8 = undefined;
@@ -2006,6 +2135,7 @@ test "connections from one address past the limit are dropped until one closes" 
     second.login = .idle;
     try second.waitConnected();
 
+    // The server drops third's Initial packets, and third resends them.
     var third: RawClient = undefined;
     try third.init(&st, login.key, raw_hello);
     defer third.deinit();
@@ -2037,6 +2167,7 @@ test "past retry_from, a client logs in after a Retry" {
     try testing.expect(@atomicLoad(u64, &st.server.pending.retries, .monotonic) >= 1);
 }
 
+/// An unencrypted OpenSSH Ed25519 private key file.
 const plain_key_file =
     \\-----BEGIN OPENSSH PRIVATE KEY-----
     \\b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
@@ -2047,6 +2178,8 @@ const plain_key_file =
     \\-----END OPENSSH PRIVATE KEY-----
     \\
 ;
+/// An OpenSSH Ed25519 private key file, encrypted with aes256-ctr under a
+/// bcrypt key from the passphrase rightPassphrase gives.
 const encrypted_key_file =
     \\-----BEGIN OPENSSH PRIVATE KEY-----
     \\b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABAm/7i1ie
@@ -2074,6 +2207,8 @@ fn noPassphrase(_: []const u8, _: []u8, _: posix.fd_t) ?[]u8 {
     return null;
 }
 
+/// Logs in offering first an agent key the server refuses, then the key in a
+/// file holding text, whose passphrase comes from ask.
 fn loginWithKeyFile(text: []const u8, ask: *const fn ([]const u8, []u8, posix.fd_t) ?[]u8) !client.session.Outcome {
     transport.crypto.init(testing.io);
     var environ = try testEnviron();
@@ -2154,6 +2289,8 @@ test "a canceled passphrase prompt fails the login" {
     try testing.expectEqualStrings("login canceled", outcome.refused.message.slice());
 }
 
+/// A client that speaks the protocol by hand, for messages tx's client
+/// doesn't send. Its loop runs on the test thread, in the wait functions.
 const RawClient = struct {
     loop: xev.Loop,
     tls: transport.quic.Client,
@@ -2163,13 +2300,19 @@ const RawClient = struct {
     decoder: proto.Decoder,
     hello: proto.Hello,
     key: Ed25519.KeyPair,
+    /// How far the client goes through the login. normal logs in and
+    /// attaches. wrong_exporter signs a transcript with another exporter
+    /// secret. skip attaches without logging in. idle sends Hello alone.
+    /// scripted sends nothing and leaves the stream to the test.
     login: enum { normal, wrong_exporter, skip, idle, scripted } = .normal,
     logged_in: bool = false,
     attached: ?u64 = null,
     error_code: ?u32 = null,
+    /// The start of the error's message, error_message_len bytes long.
     error_message: [64]u8 = undefined,
     error_message_len: usize = 0,
     closed: bool = false,
+    /// The server has finished its stream.
     finished: bool = false,
     output: std.ArrayList(u8) = .empty,
 
@@ -2199,6 +2342,7 @@ const RawClient = struct {
 
     fn deinit(rc: *RawClient) void {
         rc.endpoint.stop();
+        // The endpoint's completions finish before it is freed.
         rc.loop.run(.until_done) catch {};
         rc.endpoint.deinit();
         rc.decoder.deinit();
@@ -2229,6 +2373,7 @@ const RawClient = struct {
         }
     }
 
+    /// Signs the login transcript with key, as tx's client does, and attaches.
     fn signIn(rc: *RawClient, stream: *transport.endpoint.Stream) void {
         var transcript: auth.login.Transcript = .{
             .exporter = undefined,
@@ -2369,6 +2514,8 @@ test "a server on a wildcard address answers on each address it binds" {
     }
 }
 
+/// Whether a datagram between two sockets on address arrives within 500 ms.
+/// The test skips the addresses where it doesn't.
 fn reachesItself(address: Io.net.IpAddress) !bool {
     var any = address;
     any.setPort(0);
@@ -2410,6 +2557,7 @@ test "a server bounds the terminal size a client sends" {
     }
 }
 
+/// An environment holding PATH alone.
 fn testEnviron() !std.process.Environ.Map {
     var environ: std.process.Environ.Map = .init(gpa);
     errdefer environ.deinit();
@@ -2425,6 +2573,8 @@ test "input larger than the terminal's input queue reaches the program" {
     try login.init(null);
     defer login.deinit();
     var st: ServerThread = undefined;
+    // In canonical mode the terminal holds input for a newline and caps the
+    // length of a line.
     try st.init(try login.serverOptions(&environ, &.{ "/bin/sh", "-c", "stty raw -echo; printf 'ready\\r\\n'; head -c 262144 | wc -c" }));
     defer st.deinit();
 
@@ -2462,6 +2612,8 @@ test "a session told to stop kills a program that ignores SIGHUP" {
     const id = try rc.waitAttached();
     try rc.waitOutput("ready");
 
+    // SIGTERM stops the session process. It sends its program SIGHUP, and
+    // SIGKILL once session.session.stop_grace_ms have passed.
     const start = nowMs();
     try posix.kill(try sessionPid(&st, id), .TERM);
     try testing.expectEqual(@backingInt(proto.ErrorCode.session_lost), try rc.waitError());
@@ -2497,6 +2649,8 @@ test "a session outlives txd, and its client resumes it on the next txd" {
     defer e.deinit();
     const keys = [_]auth.Key{e.login.key.public_key.toBytes()};
 
+    // ServerThread.init overwrites st.addresses and st.host_keys, which the
+    // client reads as it reconnects.
     const servers = e.st.addresses;
     const host_keys = e.st.host_keys;
     var pty: TestPty = try .open();
@@ -2514,6 +2668,7 @@ test "a session outlives txd, and its client resumes it on the next txd" {
     try pty.type_("two\r");
     const before = pty.output.items.len;
     try pty.readUntil("got two");
+    // A rebuild writes DECSTR.
     try testing.expect(std.mem.indexOf(u8, pty.output.items[before..], "\x1b[!p") == null);
     try expectMatchesPrimary(&e.st, 1, pty.output.items);
 
